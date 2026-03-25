@@ -330,11 +330,13 @@ async def gemini_fake_stream_generator(
     model_name_for_log = getattr(gemini_client_instance, 'model_name', 'unknown_gemini_model_object')
     print(f"FAKE STREAMING (Gemini): Prep for '{request_obj.model}' (API model string: '{model_for_api_call}', client obj: '{model_name_for_log}')")
     
+    # 将原来的 API 调用替换为以下带重试引擎的调用
     api_call_task = asyncio.create_task(
-        gemini_client_instance.aio.models.generate_content(
+        execute_with_retry(
+            gemini_client_instance.aio.models.generate_content,
             model=model_for_api_call, 
             contents=prompt_for_api_call, 
-            config=gen_config_dict_for_api_call # Pass the dictionary directly
+            config=gen_config_dict_for_api_call
         )
     )
 
@@ -387,11 +389,14 @@ async def openai_fake_stream_generator(
     print(f"FAKE STREAMING (OpenAI Direct): Prep for '{request_obj.model}' (API model: '{api_model_name}')")
     response_id = f"chatcmpl-openaidirectfake-{int(time.time())}"
     
+    # 将原有的内部函数替换为：
     async def _openai_api_call_task():
         params_for_call = openai_params.copy()
         params_for_call['stream'] = False 
-        return await openai_client.chat.completions.create(**params_for_call, extra_body=openai_extra_body)
-
+        return await execute_with_retry(
+            openai_client.chat.completions.create,
+            **params_for_call, extra_body=openai_extra_body
+        )
     api_call_task = asyncio.create_task(_openai_api_call_task())
     outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
     if outer_keep_alive_interval > 0:
