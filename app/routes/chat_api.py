@@ -104,12 +104,20 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
         # This will now be a dictionary
         gen_config_dict = create_generation_config(request)
 
-        if "gemini-2.5-flash" in base_model_name or "gemini-2.5-pro" in base_model_name:
+        # [全新逻辑：泛型化匹配 2.5、3.0、3.1 甚至未来版本]
+        is_thinking_capable = "gemini-2.5" in base_model_name or "gemini-3" in base_model_name
+        is_lite_model = "flash-lite" in base_model_name
+
+        if is_thinking_capable:
             if "thinking_config" not in gen_config_dict:
                 gen_config_dict["thinking_config"] = {}
+            # 默认给所有具备思考能力的模型开启思考
             gen_config_dict["thinking_config"]["include_thoughts"] = True
 
-        if "gemini-2.5-flash-lite" in base_model_name:
+        if is_lite_model:
+            if "thinking_config" not in gen_config_dict:
+                gen_config_dict["thinking_config"] = {}
+            # lite 版本特判关闭
             gen_config_dict["thinking_config"]["include_thoughts"] = False
 
         client_to_use = None
@@ -259,25 +267,35 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
 
             gen_config_dict["thinking_config"]["include_thoughts"] = True
             
-            if "gemini-2.5-flash-lite" in base_model_name and is_max_thinking_model:
-                gen_config_dict["thinking_config"]["include_thoughts"] = True
-            elif "gemini-2.5-flash-lite" in base_model_name or "image" in base_model_name:
-                gen_config_dict["thinking_config"]["include_thoughts"] = False
-            else:
-                gen_config_dict["thinking_config"]["include_thoughts"] = True
-            # For -nothinking or -max, the thinking_config is already set in create_generation_config
-            # or can be adjusted here if needed, but it's part of the dictionary.
-            # Example: if is_nothinking_model: gen_config_dict["thinking_config"] = {"thinking_budget": 0}
-            # This is already handled by create_generation_config based on current logic.
-            # If specific overrides are needed here, they would modify gen_config_dict.
-            if is_nothinking_model or is_max_thinking_model:
-                if is_nothinking_model:
-                    budget = 128 if ("gemini-2.5-pro" in base_model_name or "gemini-3-pro" in base_model_name) else 0
-                else:  # is_max_thinking_model
-                    budget = 32768 if ("gemini-2.5-pro" in base_model_name or "gemini-3-pro" in base_model_name) else 24576
-                gen_config_dict["thinking_config"]["thinking_budget"] = budget
-                if budget == 0:
+            # [全新逻辑：清理底层思维预算的硬编码]
+            is_thinking_capable = "gemini-2.5" in base_model_name or "gemini-3" in base_model_name
+            is_lite_model = "flash-lite" in base_model_name
+            is_pro_model = "pro" in base_model_name # 通杀 2.5-pro, 3-pro, 3.1-pro
+            
+            if is_thinking_capable:
+                if not isinstance(gen_config_dict.get("thinking_config"), dict):
+                    gen_config_dict["thinking_config"] = {}
+
+                # 基础开关逻辑
+                if is_lite_model and is_max_thinking_model:
+                    gen_config_dict["thinking_config"]["include_thoughts"] = True
+                elif is_lite_model or "image" in base_model_name:
                     gen_config_dict["thinking_config"]["include_thoughts"] = False
+                else:
+                    gen_config_dict["thinking_config"]["include_thoughts"] = True
+
+                # 预算（Budget）精细控制
+                if is_nothinking_model or is_max_thinking_model:
+                    if is_nothinking_model:
+                        # Pro 模型最低预算 128，Flash 是 0
+                        budget = 128 if is_pro_model else 0
+                    else:  # is_max_thinking_model
+                        # Pro 模型最大预算 32768，Flash 是 24576
+                        budget = 32768 if is_pro_model else 24576
+                    
+                    gen_config_dict["thinking_config"]["thinking_budget"] = budget
+                    if budget == 0:
+                        gen_config_dict["thinking_config"]["include_thoughts"] = False
 
             return await execute_gemini_call(client_to_use, base_model_name, current_prompt_func, gen_config_dict, request)
 
