@@ -58,28 +58,36 @@ class ExpressClientWrapper:
         self.chat = self
         self.completions = self
 
-    async def _stream_generator(self, response):
+    async def _stream_generator(self, response: httpx.Response) -> AsyncGenerator[FakeChatCompletionChunk, None]:
         """Generates stream chunks from the httpx response with strict Type-Safe Token sniffing."""
         async for line in response.aiter_lines():
             if not line:
                 continue
+            
+            # 必须剥离前缀，精准捕获数据本体
+            if line.startswith("data:"):
+                json_str = line[len("data: "):].strip()
                 
-            if line.startswith("data: ") and line != "data: [DONE]":
+                # 遇到终止符必须立刻停止，否则会引发解析错误
+                if json_str == "[DONE]":
+                    break
+                    
                 try:
-                    raw_json = json.loads(line[6:])
-                    # [新增核心防御]：必须同时确保 raw_json 是字典，且 usage 也是字典！绝对不给字符串任何可乘之机！
-                    if isinstance(raw_json, dict) and "usage" in raw_json:
-                        usage = raw_json["usage"]
+                    data = json.loads(json_str)
+                    # 强类型 Token 嗅探器
+                    if isinstance(data, dict) and "usage" in data:
+                        usage = data["usage"]
                         if isinstance(usage, dict):
                             prompt_tk = usage.get("prompt_tokens", 0)
                             comp_tk = usage.get("completion_tokens", 0)
                             total_tk = usage.get("total_tokens", prompt_tk + comp_tk)
                             print(f"💰 [算力消耗] 提示词: {prompt_tk} | 模型思考与生成: {comp_tk} | 总计: {total_tk} Tokens")
-                except Exception:
-                    # 遇到任何解析极其畸形的数据包，直接无视，绝不让程序崩溃
-                    pass
-            
-            yield FakeChatCompletionChunk(line)
+                    
+                    # [核心修复]：必须将解析后的纯净字典(data)包装传递！绝不能传原始字符串(line)！
+                    yield FakeChatCompletionChunk(data)
+                    
+                except json.JSONDecodeError:
+                    continue
             
     async def _streaming_create(self, **kwargs) -> AsyncGenerator[FakeChatCompletionChunk, None]:
         """Handles the creation of a streaming request using httpx with built-in retry."""
