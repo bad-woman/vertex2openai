@@ -79,9 +79,13 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
 
 def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
     print("Converting OpenAI messages to Gemini format...")
-    gemini_messages = []
+    raw_gemini_messages = []
     for idx, message in enumerate(messages):
         role = message.role
+        # [新增]: 直接跳过 system 角色，因为它已经在 api_helpers 里被提取进 system_instruction 了
+        if role == "system":
+            continue
+
         parts = []
         current_gemini_role = "" 
 
@@ -104,7 +108,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 ))
                 current_gemini_role = "function"
             else:
-                print(f"Skipping tool message {idx} due to missing name, tool_call_id, or content.")
                 continue
         elif role == "assistant" and message.tool_calls:
             current_gemini_role = "model"
@@ -115,134 +118,74 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 try:
                     parsed_arguments = json.loads(arguments_str)
                 except json.JSONDecodeError:
-                    print(f"Warning: Could not parse tool call arguments for {function_name}: {arguments_str}")
                     parsed_arguments = {} 
-                
                 if function_name:
                     parts.append(types.Part.from_function_call(
                         name=function_name,
                         args=parsed_arguments
                     ))
-            
             if message.content:
                 if isinstance(message.content, str):
-                    # Check for markdown images in assistant content too
                     image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
-                    
-                    if clean_text:
-                        parts.append(types.Part(text=clean_text))
-                    
+                    if clean_text: parts.append(types.Part.from_text(text=clean_text))
                     parts.extend(image_parts)
-                elif isinstance(message.content, list):
-                     for part_item in message.content: 
-                        if isinstance(part_item, dict):
-                            if part_item.get('type') == 'text':
-                                text_content = part_item.get('text', '\n')
-                                # Check for markdown images in assistant's text parts
-                                image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
-                                if clean_text:
-                                    parts.append(types.Part(text=clean_text))
-                                parts.extend(image_parts)
-                            elif part_item.get('type') == 'image_url':
-                                image_url_data = part_item.get('image_url', {})
-                                image_url = image_url_data.get('url', '')
-                                if image_url.startswith('data:'):
-                                    mime_match = re.match(r'data:([^;]+);base64,(.+)', image_url)
-                                    if mime_match:
-                                        mime_type, b64_data = mime_match.groups()
-                                        image_bytes = base64.b64decode(b64_data)
-                                        parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-                        elif isinstance(part_item, ContentPartText):
-                             parts.append(types.Part(text=part_item.text))
-                        elif isinstance(part_item, ContentPartImage):
-                            image_url = part_item.image_url.url
-                            if image_url.startswith('data:'):
-                                mime_match = re.match(r'data:([^;]+);base64,(.+)', image_url)
-                                if mime_match:
-                                    mime_type, b64_data = mime_match.groups()
-                                    image_bytes = base64.b64decode(b64_data)
-                                    parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-            if not parts: 
-                print(f"Skipping assistant message {idx} with empty/invalid tool_calls and no content.")
-                continue
         else: 
-            if message.content is None:
-                print(f"Skipping message {idx} (Role: {role}) due to None content.")
-                continue
-            if not message.content and isinstance(message.content, (str, list)) and not len(message.content):
-                 print(f"Skipping message {idx} (Role: {role}) due to empty content string or list.")
-                 continue
-
-            current_gemini_role = role
-            if current_gemini_role == "system": current_gemini_role = "user"
-            elif current_gemini_role == "assistant": current_gemini_role = "model"
+            if message.content is None: continue
             
+            current_gemini_role = role
+            if current_gemini_role == "assistant": current_gemini_role = "model"
             if current_gemini_role not in SUPPORTED_ROLES:
-                print(f"Warning: Role '{current_gemini_role}' (from original '{role}') is not in SUPPORTED_ROLES {SUPPORTED_ROLES}. Mapping to 'user'.")
                 current_gemini_role = "user"
 
             if isinstance(message.content, str):
-                # Check for markdown images in the content
                 image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
-                
-                # Add text part if there's any remaining text
-                if clean_text:
-                    parts.append(types.Part(text=clean_text))
-                
-                # Add extracted image parts
+                if clean_text: parts.append(types.Part.from_text(text=clean_text))
                 parts.extend(image_parts)
             elif isinstance(message.content, list):
                 for part_item in message.content:
                     if isinstance(part_item, dict):
                         if part_item.get('type') == 'text':
                             text_content = part_item.get('text', '\n')
-                            # Check for markdown images in text parts
                             image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
-                            if clean_text:
-                                parts.append(types.Part(text=clean_text))
+                            if clean_text: parts.append(types.Part.from_text(text=clean_text))
                             parts.extend(image_parts)
                         elif part_item.get('type') == 'image_url':
-                            image_url_data = part_item.get('image_url', {})
-                            image_url = image_url_data.get('url', '')
+                            image_url = part_item.get('image_url', {}).get('url', '')
                             if image_url.startswith('data:'):
                                 mime_match = re.match(r'data:([^;]+);base64,(.+)', image_url)
                                 if mime_match:
                                     mime_type, b64_data = mime_match.groups()
-                                    image_bytes = base64.b64decode(b64_data)
-                                    parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-                    elif isinstance(part_item, ContentPartText):
-                        parts.append(types.Part(text=part_item.text))
-                    elif isinstance(part_item, ContentPartImage):
-                        image_url = part_item.image_url.url
-                        if image_url.startswith('data:'):
-                            mime_match = re.match(r'data:([^;]+);base64,(.+)', image_url)
-                            if mime_match:
-                                mime_type, b64_data = mime_match.groups()
-                                image_bytes = base64.b64decode(b64_data)
-                                parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
-            elif message.content is not None: 
-                parts.append(types.Part(text=str(message.content)))
-            
-            if not parts:
-                 print(f"Skipping message {idx} (Role: {role}) as it resulted in no processable parts.")
-                 continue
+                                    parts.append(types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type))
+                            # [新增]: 补全常规公网 HTTP 图片拉取逻辑
+                            elif image_url.startswith('http'):
+                                try:
+                                    req = urllib.request.Request(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+                                    with urllib.request.urlopen(req, timeout=10) as response:
+                                        img_bytes = response.read()
+                                        mime_type = response.headers.get_content_type()
+                                        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+                                except Exception as e:
+                                    print(f"Warning: Failed to fetch remote image {image_url}: {e}")
+                    elif hasattr(part_item, 'text'):
+                        parts.append(types.Part.from_text(text=part_item.text))
 
-        if not current_gemini_role:
-            print(f"Error: current_gemini_role not set for message {idx}. Original role: {message.role}. Defaulting to 'user'.")
-            current_gemini_role = "user"
+        if not parts: continue
+        raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
 
-        if not parts:
-            print(f"Skipping message {idx} (Original role: {message.role}, Mapped Gemini role: {current_gemini_role}) as it resulted in no parts after processing.")
-            continue
-            
-        gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
+    # [新增核心逻辑]: 强制合并连续相同角色的消息 (Merge Adjacent Roles)
+    # 彻底解决 OpenAI 允许多个 user 连发，而 Gemini 严格要求交替的问题
+    merged_messages = []
+    for msg in raw_gemini_messages:
+        if merged_messages and merged_messages[-1].role == msg.role:
+            merged_messages[-1].parts.extend(msg.parts)
+        else:
+            merged_messages.append(msg)
 
-    print(f"Converted to {len(gemini_messages)} Gemini messages")
-    if not gemini_messages:
-        print("Warning: No messages were converted. Returning a dummy user prompt to prevent API errors.")
-        return [types.Content(role="user", parts=[types.Part(text="Placeholder prompt: No valid input messages provided.")])]
-    
-    return gemini_messages
+    # 如果历史里只传了一个 system 导致合并后数组全空，必须兜底一个 user
+    if not merged_messages:
+        merged_messages.append(types.Content(role="user", parts=[types.Part.from_text(text="继续")]))
+
+    return merged_messages
 
 def create_encrypted_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
     print("Creating encrypted Gemini prompt...")
