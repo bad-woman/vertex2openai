@@ -124,37 +124,38 @@ def create_openai_error_response(status_code: int, message: str, error_type: str
         }
     }
 
-async def execute_with_retry(func, *args, max_retries=5, **kwargs):
+async def execute_with_retry(func, *args, max_retries=25, **kwargs):
     """
-    智能网络容错引擎：拦截 429/503 等瞬时网络错误，并执行指数退避重试。
-    适用于流式握手、非流式请求及 Fake Stream 的底层生成。
+    智能网络容错引擎：拦截 429/503 等瞬时网络错误。
+    当前策略：5轮波浪式重试 (5x5=25次)，每次波浪 [1s, 2s, 4s, 8s, 16s]。
     """
     last_exception = None
     for attempt in range(max_retries):
         try:
-            # 尝试执行真正的网络请求
             return await func(*args, **kwargs)
         except Exception as e:
             last_exception = e
             is_retryable = False
             error_str = str(e).lower()
             
-            # 捕获 HTTPX 异常 (Direct 模式)
             if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in [429, 503, 502]:
                 is_retryable = True
-            # 捕获 Gemini SDK 异常
             elif hasattr(e, 'code') and e.code in [429, 503, 502]:
                 is_retryable = True
-            # 泛型文本匹配兜底
             elif "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str:
                 is_retryable = True
 
             if is_retryable and attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # 指数退避: 1秒, 2秒, 4秒...
-                print(f"⚠️ 触发神性护盾 (API {e.__class__.__name__}): 遇到速率限制或服务器过载。正在进行第 {attempt + 1}/{max_retries} 次重试，等待 {wait_time} 秒...")
+                # 核心黑科技：取模运算实现波浪退避
+                wave_index = attempt % 5
+                round_num = (attempt // 5) + 1
+                wait_time = 2 ** wave_index
+                
+                print(f"⚠️ 触发神性护盾 (API {e.__class__.__name__}): 遇到速率限制。正在进行第 {round_num} 轮第 {wave_index + 1} 次重试，等待 {wait_time} 秒...")
                 await asyncio.sleep(wait_time)
             else:
-                print(f"❌ 容错极限到达: 已穷尽 {max_retries} 次重试，抛出异常。")
+                if is_retryable:
+                    print(f"❌ 容错极限到达: 已穷尽 {max_retries} 次重试，额度已彻底枯竭。")
                 raise e
     raise last_exception
     
