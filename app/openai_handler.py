@@ -296,7 +296,7 @@ class OpenAIDirectHandler:
             # Ensure stream=True is explicitly passed for real streaming
             openai_params_for_stream = {**openai_params, "stream": True}
             
-            # [核心修改]: 用 execute_with_retry 包裹原始的 create 方法
+            # 用 execute_with_retry 包裹原始的 create 方法
             stream_response = await execute_with_retry(
                 openai_client.chat.completions.create,
                 **openai_params_for_stream,
@@ -313,12 +313,17 @@ class OpenAIDirectHandler:
                 try:
                     chunk_as_dict = chunk.model_dump(exclude_unset=True, exclude_none=True)
                     
+                    # ========================================================
+                    # [绝对防御]: 防止 Google 传回非字典的畸形字符串引发 'str' 崩溃！
+                    # ========================================================
+                    if not isinstance(chunk_as_dict, dict):
+                        continue
+                    
                     choices = chunk_as_dict.get('choices')
                     if choices and isinstance(choices, list) and len(choices) > 0:
                         delta = choices[0].get('delta')
                         if delta and isinstance(delta, dict):
                             # Always remove extra_content if present
-                            
                             if 'extra_content' in delta:
                                 del delta['extra_content']
                             
@@ -362,7 +367,7 @@ class OpenAIDirectHandler:
                                     yield f"data: {json.dumps(content_payload)}\n\n"
                                     has_sent_content = True
                                 
-                            elif original_choice.get('finish_reason'): # Check original_choice for finish_reason
+                            elif original_choice.get('finish_reason'): 
                                 yield f"data: {json.dumps(chunk_as_dict)}\n\n"
                             elif not content and not original_choice.get('finish_reason') :
                                 yield f"data: {json.dumps(chunk_as_dict)}\n\n"
@@ -379,6 +384,55 @@ class OpenAIDirectHandler:
                     yield f"data: {json.dumps(error_response)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
+            
+            # Flush any remaining buffered content
+            remaining_content, remaining_reasoning = reasoning_processor.flush_remaining()
+            
+            # Send any remaining reasoning first
+            if remaining_reasoning:
+                reasoning_flush_payload = {
+                    "id": f"chatcmpl-flush-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": remaining_reasoning}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(reasoning_flush_payload)}\n\n"
+            
+            # Send any remaining content
+            if remaining_content:
+                content_flush_payload = {
+                    "id": f"chatcmpl-flush-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "delta": {"content": remaining_content}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(content_flush_payload)}\n\n"
+                has_sent_content = True
+            
+            # Always send a finish reason chunk
+            finish_payload = {
+                "id": f"chatcmpl-final-{int(time.time())}", 
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(finish_payload)}\n\n"
+            
+            yield "data: [DONE]\n\n"
+            
+        except Exception as stream_error:
+            error_msg = str(stream_error)
+            if len(error_msg) > 1024:
+                error_msg = error_msg[:1024] + "..."
+            error_msg_full = f"Error during OpenAI streaming for {request.model}: {error_msg}"
+            print(f"ERROR: {error_msg_full}")
+            error_response = create_openai_error_response(500, error_msg_full, "server_error")
+            yield f"data: {json.dumps(error_response)}\n\n"
+            yield "data: [DONE]\n\n"             
+            return
             
             # Debug logging for buffer state and chunk count
             # print(f"DEBUG: Stream ended after {chunk_count} chunks. Buffer state - tag_buffer: '{reasoning_processor.tag_buffer}', "
