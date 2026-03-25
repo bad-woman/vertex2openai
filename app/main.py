@@ -5,6 +5,10 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 
+from routes import chat_api, models_api
+from credentials_manager import CredentialManager
+from express_key_manager import ExpressKeyManager
+
 # [重要新增] 导入刚刚写的拦截器，只要导入就会自动接管 print
 from logger import rt_logger 
 import config
