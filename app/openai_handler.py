@@ -2,6 +2,7 @@
 OpenAI handler module for creating clients and processing OpenAI Direct mode responses.
 This module encapsulates all OpenAI-specific logic that was previously in chat_api.py.
 """
+import asyncio
 import json
 import time
 import httpx
@@ -72,7 +73,7 @@ class ExpressClientWrapper:
                     continue
 
     async def _streaming_create(self, **kwargs) -> AsyncGenerator[FakeChatCompletionChunk, None]:
-        """Handles the creation of a streaming request using httpx."""
+        """Handles the creation of a streaming request using httpx with built-in retry."""
         endpoint = f"{self.base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
         params = {"key": self.api_key}
@@ -93,18 +94,27 @@ class ExpressClientWrapper:
             client_args['proxies'] = proxies
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
+            
         async with httpx.AsyncClient(**client_args) as client:
-            async with client.stream("POST", endpoint, headers=headers, params=params, json=payload, timeout=None) as response:
-                response.raise_for_status()
-                async for chunk in self._stream_generator(response):
-                    yield chunk
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    # 这就是 429 真正爆炸的案发现场！我们将护盾直接笼罩在这里！
+                    async with client.stream("POST", endpoint, headers=headers, params=params, json=payload, timeout=None) as response:
+                        response.raise_for_status() 
+                        async for chunk in self._stream_generator(response):
+                            yield chunk
+                    break # 如果没有任何异常地 yield 完毕，跳出重试循环
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in [429, 503, 502] and attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        print(f"⚠️ [Express Stream] 遭遇 HTTP {e.response.status_code}. 底层护盾已激活，等待 {wait_time}s 后重试...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise e
 
     async def create(self, **kwargs) -> Any:
-        """
-        Mimics the 'create' method of the OpenAI client.
-        It builds and sends a direct HTTP request using httpx, delegating
-        to the appropriate streaming or non-streaming handler.
-        """
+        """Mimics the 'create' method of the OpenAI client with built-in retry."""
         is_streaming = kwargs.get("stream", False)
 
         if is_streaming:
@@ -131,12 +141,22 @@ class ExpressClientWrapper:
             client_args['proxies'] = proxies
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
+            
         async with httpx.AsyncClient(**client_args) as client:
-            response = await client.post(endpoint, headers=headers, params=params, json=payload, timeout=None)
-            response.raise_for_status()
-            return FakeChatCompletion(response.json())
-
-
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    response = await client.post(endpoint, headers=headers, params=params, json=payload, timeout=None)
+                    response.raise_for_status()
+                    return FakeChatCompletion(response.json())
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in [429, 503, 502] and attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        print(f"⚠️ [Express Non-Stream] 遭遇 HTTP {e.response.status_code}. 底层护盾已激活，等待 {wait_time}s 后重试...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise e
+    
 class OpenAIDirectHandler:
     """Handles OpenAI Direct mode operations including client creation and response processing."""
     
