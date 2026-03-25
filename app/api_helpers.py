@@ -461,27 +461,32 @@ async def execute_gemini_call(
     client_model_name_for_log = getattr(current_client, 'model_name', 'unknown_direct_client_object')
     print(f"INFO: execute_gemini_call for requested API model '{model_to_call}', using client object with internal name '{client_model_name_for_log}'. Original request model: '{request_obj.model}'")
     
+    # 在 execute_gemini_call 函数内部：
+
     if request_obj.stream:
         if app_config.FAKE_STREAMING_ENABLED:
+            # Fake streaming 内部已经有独立 task，这里直接返回
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
-                    gen_config_dict, 
-                    request_obj, is_auto_attempt
+                    gen_config_dict, request_obj, is_auto_attempt
                 ), media_type="text/event-stream"
             )
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
                 try:
-                    stream_gen_obj = await current_client.aio.models.generate_content_stream(
+                    # 【重试缝合点 1】：包装流式对象的获取过程
+                    stream_gen_obj = await execute_with_retry(
+                        current_client.aio.models.generate_content_stream,
                         model=model_to_call, 
                         contents=actual_prompt_for_call,
-                        config=gen_config_dict # Pass the dictionary directly
+                        config=gen_config_dict
                     )
                     async for chunk_item_call in stream_gen_obj:
                         yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
                     yield "data: [DONE]\n\n"
+                # ... 保持原有的 except ...
                 except Exception as e_stream_call:
                     err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
                     print(f"ERROR: {err_msg_detail_stream}")
@@ -494,11 +499,14 @@ async def execute_gemini_call(
                     raise e_stream_call
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
-        response_obj_call = await current_client.aio.models.generate_content(
+        # 【重试缝合点 2】：包装非流式请求
+        response_obj_call = await execute_with_retry(
+            current_client.aio.models.generate_content,
             model=model_to_call, 
             contents=actual_prompt_for_call,
-            config=gen_config_dict # Pass the dictionary directly
+            config=gen_config_dict
         )
+        # ... 保持原有的 block_reason 检查 ...
         if hasattr(response_obj_call, 'prompt_feedback') and \
            hasattr(response_obj_call.prompt_feedback, 'block_reason') and \
            response_obj_call.prompt_feedback.block_reason:
