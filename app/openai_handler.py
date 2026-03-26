@@ -206,14 +206,16 @@ class OpenAIDirectHandler:
     
     
     def prepare_extra_body(self) -> Dict[str, Any]:
-        """Prepare extra body parameters for OpenAI API call."""
+    def prepare_extra_body(self) -> Dict[str, Any]:
+        """Prepare extra body parameters for OpenAI API call with strict CamelCase for Google."""
         return {
             "extra_body": {
                 'google': {
-                    'safety_settings': self.safety_settings,
-                    'thought_tag_marker': VERTEX_REASONING_TAG,
-                    "thinking_config": {
-                        "include_thoughts": True
+                    # 必须是小驼峰，否则 Google 后端会静默丢弃！
+                    'safetySettings': self.safety_settings,
+                    'thoughtTagMarker': VERTEX_REASONING_TAG,
+                    "thinkingConfig": {
+                        "includeThoughts": True
                     }
                 }
             }
