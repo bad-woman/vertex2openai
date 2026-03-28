@@ -473,27 +473,52 @@ async def execute_gemini_call(
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
-                try:
-                    stream_gen_obj = await execute_with_retry(
-                        current_client.aio.models.generate_content_stream,
-                        model=model_to_call, 
-                        contents=actual_prompt_for_call,
-                        config=gen_config_dict
-                    )
-                    async for chunk_item_call in stream_gen_obj:
-                        yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
-                    yield "data: [DONE]\n\n"
-                except Exception as e_stream_call:
-                    err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
-                    print(f"ERROR: {err_msg_detail_stream}")
-                    s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
-                    err_resp = create_openai_error_response(500,s_err,"server_error")
-                    j_err = json.dumps(err_resp)
-                    if not is_auto_attempt: 
-                        yield f"data: {j_err}\n\n"
+                # [核心修复]: 为原生 SDK 注入全包裹式的 20 次波浪退避护盾！
+                max_retries = 20
+                for attempt in range(max_retries):
+                    try:
+                        # 惰性调用：此时可能不报错
+                        stream_gen_obj = await current_client.aio.models.generate_content_stream(
+                            model=model_to_call, 
+                            contents=actual_prompt_for_call,
+                            config=gen_config_dict
+                        )
+                        # 真正的深水区：在这里迭代时随时会引爆 429
+                        async for chunk_item_call in stream_gen_obj:
+                            yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
+                        
+                        # 顺利迭代完毕，安全跳出重试循环
                         yield "data: [DONE]\n\n"
-                    else:
-                        raise e_stream_call
+                        break 
+                        
+                    except Exception as e_stream_call:
+                        error_str = str(e_stream_call).lower()
+                        is_retryable = False
+                        
+                        # 极速嗅探网络堵塞与算力拒绝
+                        if "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str or "resource exhausted" in error_str:
+                            is_retryable = True
+                            
+                        if is_retryable and attempt < max_retries - 1:
+                            wave_index = attempt % 4
+                            round_num = (attempt // 4) + 1
+                            wait_time = 2 ** wave_index
+                            print(f"⚠️ [Gemini SDK Stream] 遭遇算力天花板/速率限制. 第 {round_num} 轮/第 {wave_index + 1} 次护盾激活，等待 {wait_time}s 后重试...")
+                            await asyncio.sleep(wait_time)
+                            continue # 进入深层休眠，随后重试
+                            
+                        # 如果不是 429 或者是死局，向下传递死亡通知
+                        err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
+                        print(f"ERROR: {err_msg_detail_stream}")
+                        s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
+                        err_resp = create_openai_error_response(500,s_err,"server_error")
+                        j_err = json.dumps(err_resp)
+                        if not is_auto_attempt: 
+                            yield f"data: {j_err}\n\n"
+                            yield "data: [DONE]\n\n"
+                        else:
+                            raise e_stream_call
+            
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
         response_obj_call = await execute_with_retry(
