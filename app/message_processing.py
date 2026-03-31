@@ -41,7 +41,8 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
     # Pattern to match markdown images with data URLs
     # Matches: ![alt text](data:image/...;base64,data)
     # Only matches image MIME types to avoid extracting other base64 data
-pattern = r'!\[([^\]]*)\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)'
+    # 修正代码：精准锁定 Base64 字符集，拒绝无效回溯，且保持原有捕获组索引不变
+    pattern = r'!\[[^\]]*\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)'
     
     matches = list(re.finditer(pattern, text))
     
@@ -72,7 +73,7 @@ pattern = r'!\[([^\]]*)\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)
         # Reverse parts list since we processed matches in reverse
         parts.reverse()
     
-# Clean up any extra whitespace that might be left
+    # Clean up any extra whitespace that might be left
     # 修正代码：精确限制替换范围，确保不伤及换行符
     remaining_text = re.sub(r'[ \t]+', ' ', remaining_text).strip()
     
