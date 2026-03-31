@@ -73,7 +73,8 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
         parts.reverse()
     
     # Clean up any extra whitespace that might be left
-    remaining_text = re.sub(r'\s+', ' ', remaining_text).strip()
+    # 修正代码：精确限制替换范围，确保不伤及换行符
+remaining_text = re.sub(r'[ \t]+', ' ', remaining_text).strip()
     
     return parts, remaining_text
 
@@ -174,12 +175,15 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
 
     # [新增核心逻辑]: 强制合并连续相同角色的消息 (Merge Adjacent Roles)
     # 彻底解决 OpenAI 允许多个 user 连发，而 Gemini 严格要求交替的问题
-    merged_messages = []
-    for msg in raw_gemini_messages:
-        if merged_messages and merged_messages[-1].role == msg.role:
-            merged_messages[-1].parts.extend(msg.parts)
-        else:
-            merged_messages.append(msg)
+    # 修正代码：在连续消息体之间植入逻辑换行屏障
+merged_messages = []
+for msg in raw_gemini_messages:
+    if merged_messages and merged_messages[-1].role == msg.role:
+        # 显式注入换行符阻断物理粘连
+        merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
+        merged_messages[-1].parts.extend(msg.parts)
+    else:
+        merged_messages.append(msg)
 
     # 如果历史里只传了一个 system 导致合并后数组全空，必须兜底一个 user
     if not merged_messages:
