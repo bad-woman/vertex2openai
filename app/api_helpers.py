@@ -369,6 +369,9 @@ async def gemini_fake_stream_generator(
         ):
             yield chunk_sse
 
+    except asyncio.CancelledError:
+        print(f"INFO: Client disconnected during Fake Stream (Gemini: {request_obj.model}). Cleaning up.")
+        raise
     except Exception as e_outer_gemini:
         err_msg_detail = f"Error in gemini_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
         print(f"ERROR: {err_msg_detail}")
@@ -443,7 +446,10 @@ async def openai_fake_stream_generator(
         ):
             yield chunk_sse
             
-    except Exception as e_outer: 
+    except asyncio.CancelledError:
+        print(f"INFO: Client disconnected during Fake Stream (OpenAI: {request_obj.model}). Cleaning up.")
+        raise
+    except Exception as e_outer:
         err_msg_detail = f"Error in openai_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer).__name__} - {str(e_outer)}"
         print(f"ERROR: {err_msg_detail}")
         sse_err_msg_display = str(e_outer)
@@ -511,8 +517,11 @@ async def execute_gemini_call(
                         yield "data: [DONE]\n\n"
                         break 
                         
-                    except Exception as e_stream_call:
-                        error_str = str(e_stream_call).lower()
+                    except asyncio.CancelledError:
+                            print(f"INFO: Client disconnected during Real Stream ({model_to_call}). Clean abort.")
+                            raise
+                        except Exception as e_stream_call:
+                            error_str = str(e_stream_call).lower()
                         is_retryable = False
                         
                         # 极速嗅探网络堵塞与算力拒绝
