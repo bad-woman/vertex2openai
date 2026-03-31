@@ -343,6 +343,16 @@ async def gemini_fake_stream_generator(
     
     try:
         raw_gemini_response = await api_call_task 
+        
+        # --- 新增开始：拦截假流式的 Token 消耗 ---
+        if hasattr(raw_gemini_response, 'usage_metadata') and raw_gemini_response.usage_metadata:
+            um = raw_gemini_response.usage_metadata
+            p_tk = getattr(um, 'prompt_token_count', 0) or 0
+            c_tk = getattr(um, 'candidates_token_count', 0) or 0
+            t_tk = getattr(um, 'total_token_count', p_tk + c_tk) or (p_tk + c_tk)
+            print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+        # --- 新增结束 ---
+
         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
         
         if hasattr(raw_gemini_response, 'prompt_feedback') and \
@@ -485,6 +495,16 @@ async def execute_gemini_call(
                         )
                         # 真正的深水区：在这里迭代时随时会引爆 429
                         async for chunk_item_call in stream_gen_obj:
+                            # --- 新增开始：嗅探流式最后一个 Chunk 的算力消耗 ---
+                            if hasattr(chunk_item_call, 'usage_metadata') and chunk_item_call.usage_metadata:
+                                um = chunk_item_call.usage_metadata
+                                p_tk = getattr(um, 'prompt_token_count', 0) or 0
+                                c_tk = getattr(um, 'candidates_token_count', 0) or 0
+                                t_tk = getattr(um, 'total_token_count', p_tk + c_tk) or (p_tk + c_tk)
+                                if p_tk > 0 or c_tk > 0:
+                                    print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+                            # --- 新增结束 ---
+                            
                             yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
                         
                         # 顺利迭代完毕，安全跳出重试循环
@@ -556,6 +576,14 @@ async def execute_gemini_call(
             else:
                 error_details += f"Response type: {type(response_obj_call).__name__}"
             raise ValueError(error_details)
-        
+                # --- 新增开始：拦截非流式的 Token 消耗 ---
+        if hasattr(response_obj_call, 'usage_metadata') and response_obj_call.usage_metadata:
+            um = response_obj_call.usage_metadata
+            p_tk = getattr(um, 'prompt_token_count', 0) or 0
+            c_tk = getattr(um, 'candidates_token_count', 0) or 0
+            t_tk = getattr(um, 'total_token_count', p_tk + c_tk) or (p_tk + c_tk)
+            print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+        # --- 新增结束 ---
+
         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
         return JSONResponse(content=openai_response_content)
