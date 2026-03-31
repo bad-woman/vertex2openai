@@ -297,7 +297,7 @@ async def _chunk_openai_response_dict_for_sse(
             if reasoning_content:
                 delta_reasoning = {"reasoning_content": reasoning_content}
                 yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': delta_reasoning, 'finish_reason': None}]})}\n\n"
-                if actual_content is not None: await asyncio.sleep(0.05)
+                if actual_content is not None: await asyncio.sleep(0.01)
 
             content_to_chunk = actual_content if actual_content is not None else ""
             if actual_content is not None:
@@ -307,7 +307,7 @@ async def _chunk_openai_response_dict_for_sse(
                 else:
                     for i in range(0, len(content_to_chunk), chunk_size):
                         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'content': content_to_chunk[i:i+chunk_size]}, 'finish_reason': None}]})}\n\n"
-                        if len(content_to_chunk) > chunk_size: await asyncio.sleep(0.05)
+                        if len(content_to_chunk) > chunk_size: await asyncio.sleep(0.01)
         
         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"
 
