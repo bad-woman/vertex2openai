@@ -383,6 +383,8 @@ class OpenAIDirectHandler:
                         # Yield chunks without choices too (they might contain metadata)
                         yield f"data: {json.dumps(chunk_as_dict)}\n\n"
 
+                except asyncio.CancelledError:
+                    raise  # 内部循环直接向上抛出，由外层接管
                 except Exception as chunk_error:
                     error_msg = f"Error processing OpenAI chunk for {request.model}: {str(chunk_error)}"
                     print(f"ERROR: {error_msg}")
@@ -431,6 +433,9 @@ class OpenAIDirectHandler:
             
             yield "data: [DONE]\n\n"
             
+        except asyncio.CancelledError:
+            print(f"INFO: Client disconnected during OpenAI Direct Stream ({request.model}). Releasing resources.")
+            raise
         except Exception as stream_error:
             error_msg = str(stream_error)
             if len(error_msg) > 1024:
