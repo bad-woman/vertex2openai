@@ -41,7 +41,7 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
     # Pattern to match markdown images with data URLs
     # Matches: ![alt text](data:image/...;base64,data)
     # Only matches image MIME types to avoid extracting other base64 data
-    pattern = r'!\[[^\]]*\]\(data:(image/[^;]+);base64,([^)]+)\)'
+    pattern = r'!\[([^\]]*)\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)’
     
     matches = list(re.finditer(pattern, text))
     
