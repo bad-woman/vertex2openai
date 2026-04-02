@@ -188,11 +188,10 @@ class OpenAIDirectHandler:
         self.credential_manager = credential_manager
         self.express_key_manager = express_key_manager
         
-        # 启用全域终极断电与严重性覆盖
-        safety_threshold = "OFF"
-        safety_method = "SEVERITY"
+        # 设定高门槛拦截与概率评估法
+        safety_threshold = "BLOCK_ONLY_HIGH"
+        safety_method = "PROBABILITY"
         
-        # 注意：OpenAI Direct 接口必须使用小驼峰 keys
         self.safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": safety_threshold, "method": safety_method},
