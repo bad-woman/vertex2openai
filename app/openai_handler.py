@@ -189,7 +189,7 @@ class OpenAIDirectHandler:
         self.express_key_manager = express_key_manager
         
         # 设定高门槛拦截与概率评估法
-        safety_threshold = "BLOCK_ONLY_HIGH"
+        safety_threshold = "BLOCK_NONE"
         safety_method = "PROBABILITY"
         
         self.safety_settings = [
@@ -197,8 +197,6 @@ class OpenAIDirectHandler:
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": safety_threshold, "method": safety_method},
-            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": safety_threshold, "method": safety_method},
-            {"category": "HARM_CATEGORY_UNSPECIFIED", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": safety_threshold, "method": safety_method},
