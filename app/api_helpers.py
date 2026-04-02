@@ -175,7 +175,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     if request.n is not None: config["candidate_count"] = request.n
     
     # 设定高门槛拦截与概率评估法
-    safety_threshold = "BLOCK_ONLY_HIGH"
+    safety_threshold = "BLOCK_NONE"
     safety_method = "PROBABILITY"
     
     config["safety_settings"] = [
@@ -184,8 +184,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_CIVIC_INTEGRITY", threshold=safety_threshold, method=safety_method),
-            types.SafetySetting(category="HARM_CATEGORY_UNSPECIFIED", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_HATE", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_HARASSMENT", threshold=safety_threshold, method=safety_method),
