@@ -187,21 +187,25 @@ class OpenAIDirectHandler:
     def __init__(self, credential_manager=None, express_key_manager=None):
         self.credential_manager = credential_manager
         self.express_key_manager = express_key_manager
-        safety_threshold = "BLOCK_NONE"
+        
+        # 启用全域终极断电与严重性覆盖
+        safety_threshold = "OFF"
+        safety_method = "SEVERITY"
+        
+        # 注意：OpenAI Direct 接口必须使用小驼峰 keys
         self.safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": safety_threshold},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": safety_threshold},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": safety_threshold},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": safety_threshold},
-            {"category": 'HARM_CATEGORY_CIVIC_INTEGRITY', "threshold": safety_threshold},
-            {"category": "HARM_CATEGORY_UNSPECIFIED", "threshold": safety_threshold},
-            {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": safety_threshold},
-            {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": safety_threshold},
-            {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": safety_threshold},
-            {"category": 'HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT', "threshold": safety_threshold},
-            {"category": 'HARM_CATEGORY_JAILBREAK', "threshold": safety_threshold}
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_UNSPECIFIED", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_JAILBREAK", "threshold": safety_threshold, "method": safety_method}
         ]
-
     def create_openai_client(self, project_id: str, gcp_token: str, location: str = "global") -> openai.AsyncOpenAI:
         """Create an OpenAI client configured for Vertex AI endpoint."""
         endpoint_url = (
