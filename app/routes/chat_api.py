@@ -12,7 +12,6 @@ from models import OpenAIRequest
 from auth import get_api_key
 from message_processing import (
     create_gemini_prompt,
-    ENCRYPTION_INSTRUCTIONS,
 )
 from api_helpers import (
     create_generation_config,
