@@ -186,6 +186,7 @@ class OpenAIDirectHandler:
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": safety_threshold, "method": safety_method},
+            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": safety_threshold, "method": safety_method},
             {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": safety_threshold, "method": safety_method},
@@ -226,6 +227,12 @@ class OpenAIDirectHandler:
         if is_openai_search:
             params['web_search_options'] = {}
             
+        # 兼容最新版 OpenAI 客户端传入的 max_completion_tokens，防止直连云端网关抛出不支持参数异常
+        if "max_completion_tokens" in params:
+            if "max_tokens" not in params:
+                params["max_tokens"] = params["max_completion_tokens"]
+            del params["max_completion_tokens"]
+            
         openai_params = {k: v for k, v in params.items() if v is not None}
         if "reasoning_effort" in openai_params and openai_params["reasoning_effort"] not in ["low", "medium", "high"]:
             del openai_params["reasoning_effort"]
@@ -240,7 +247,6 @@ class OpenAIDirectHandler:
         is_gemini_2_5 = False
         is_gemini_3_or_above = False
         
-        # 兼容最新 3.x/3.5 的代系识别逻辑
         version_match = re.search(r'gemini-(\d+)\.(\d+)|gemini-(\d+)', base_model_name.lower())
         if version_match:
             groups = version_match.groups()
@@ -267,7 +273,6 @@ class OpenAIDirectHandler:
             thinking_config = {"includeThoughts": True}
             
             if is_gemini_3_or_above:
-                # 兼容 3.x 的 Level 推理强度 (注意直连通道采用驼峰命名)
                 if reasoning_effort == "low":
                     thinking_config["thinkingLevel"] = "LOW"
                 elif reasoning_effort == "medium":
@@ -275,7 +280,6 @@ class OpenAIDirectHandler:
                 else:
                     thinking_config["thinkingLevel"] = "HIGH"
             elif is_gemini_2_5:
-                # 兼容 2.5 的 Budget 预算强度
                 if reasoning_effort == "low":
                     thinking_config["thinkingBudget"] = 1024
                 else:
@@ -551,7 +555,6 @@ class OpenAIDirectHandler:
 
             model_id = f"google/{base_model_name}"
             
-            # 提取 reasoning_effort 参数
             reasoning_effort = getattr(request, "reasoning_effort", None)
             if not reasoning_effort and hasattr(request, "model_extra") and request.model_extra:
                 reasoning_effort = request.model_extra.get("reasoning_effort")

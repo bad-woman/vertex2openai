@@ -180,12 +180,36 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         config["system_instruction"] = "\n".join(system_texts)
     
     if request.temperature is not None: config["temperature"] = request.temperature
-    if request.max_tokens is not None: config["max_output_tokens"] = request.max_tokens
+    # 兼容新版大模型客户端的 max_completion_tokens
+    if request.max_tokens is not None: 
+        config["max_output_tokens"] = request.max_tokens
+    elif getattr(request, "max_completion_tokens", None) is not None:
+        config["max_output_tokens"] = request.max_completion_tokens
+        
     if request.top_p is not None: config["top_p"] = request.top_p
     if request.top_k is not None: config["top_k"] = request.top_k
     if request.stop is not None: config["stop_sequences"] = request.stop
     if request.seed is not None: config["seed"] = request.seed
     if request.n is not None: config["candidate_count"] = request.n
+    
+    # 补全原生参数中的惩罚项映射
+    if getattr(request, "presence_penalty", None) is not None: 
+        config["presence_penalty"] = request.presence_penalty
+    if getattr(request, "frequency_penalty", None) is not None: 
+        config["frequency_penalty"] = request.frequency_penalty
+        
+    # 补全对 logprobs 的底层解析
+    if getattr(request, "response_logprobs", None) is not None: 
+        config["response_logprobs"] = request.response_logprobs
+    if getattr(request, "logprobs", None) is not None: 
+        config["logprobs"] = request.logprobs
+
+    # 兼容 JSON 化输出指令
+    if getattr(request, "response_format", None) is not None:
+        fmt = request.response_format
+        fmt_type = fmt.get("type", "") if isinstance(fmt, dict) else getattr(fmt, "type", "")
+        if fmt_type == "json_object":
+            config["response_mime_type"] = "application/json"
     
     safety_threshold = "BLOCK_NONE"
     safety_method = "PROBABILITY"
@@ -195,6 +219,8 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold=safety_threshold, method=safety_method),
+            # 【重要补全】：关闭政治与公民选举过滤拦截
+            types.SafetySetting(category="HARM_CATEGORY_CIVIC_INTEGRITY", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_HATE", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", threshold=safety_threshold, method=safety_method),
             types.SafetySetting(category="HARM_CATEGORY_IMAGE_HARASSMENT", threshold=safety_threshold, method=safety_method),
@@ -203,7 +229,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     ]
 
     tools_list = []
-    # 【Bug 修复】：解析 OpenAI tools 时，深度提取 nested 的 function 内容，防止 name/parameters 获取为 None
     if request.tools:
         function_declarations = []
         for tool in request.tools:
@@ -230,7 +255,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     is_image_model = "image" in request.model.lower()
     
     if is_image_model:
-        # 必须包含 TEXT 模态，否则生图模型无法输出思考过程，直接 400 报错！
         config["response_modalities"] = ["TEXT", "IMAGE"]
         
         target_ar = "1:1"
@@ -252,17 +276,18 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                     target_ar = ar_match.group(1).replace("：", ":")
                 break
                 
-        # 使用官方原生的 image_config 结构，强制 4K 级别大图
         config["image_config"] = types.ImageConfig(
             aspect_ratio=target_ar,
             image_size="4K"
         )
-        
-        # 挂载 Google Search 工具，让 AI 生图前自己去查设定，绝不限制任何生图题材！
         tools_list.append({"google_search": {}})
 
-        # 【Bug 修复】：移除生图模型不支持的普通文本生成控制参数，防止 400 (INVALID_ARGUMENT) 报错
-        unsupported_keys = ["temperature", "top_p", "top_k", "stop_sequences", "seed", "candidate_count"]
+        # 【同步清理】：生图不支持新增的任何文本属性，一并剥离防止 400 崩溃
+        unsupported_keys = [
+            "temperature", "top_p", "top_k", "stop_sequences", "seed", 
+            "candidate_count", "presence_penalty", "frequency_penalty", 
+            "response_mime_type", "response_logprobs", "logprobs"
+        ]
         for key in unsupported_keys:
             config.pop(key, None)
     # ==============================================================================
@@ -359,13 +384,10 @@ async def _chunk_openai_response_dict_for_sse(
 
             content_to_chunk = actual_content if actual_content is not None else ""
             if actual_content is not None:
-                
-                # --- 生图护盾：拦截 Base64 图片，拒绝切片 ---
                 if "![Image](data:image/" in content_to_chunk:
-                    chunk_size = len(content_to_chunk) # 一次性全量发送，拯救前端解析器
+                    chunk_size = len(content_to_chunk) 
                 else:
                     chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
-                # --------------------------------------------------------
 
                 if not content_to_chunk and not reasoning_content : 
                     yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'content': ''}, 'finish_reason': None}]})}\n\n"
