@@ -26,24 +26,35 @@ def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     return reasoning_content.strip(), normal_text.strip()
 
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
+    """
+    Extract markdown images from text and convert them to Gemini Parts.
+    Returns a tuple of (image_parts, text_without_images)
+    """
     parts = []
     remaining_text = text
+    
+    # Pattern to match markdown images with data URLs
     pattern = r'!\[[^\]]*\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)'
+    
     matches = list(re.finditer(pattern, text))
     
     if matches:
         for match in reversed(matches):
             mime_type = match.group(1)
             b64_data = match.group(2)
+            
             if not mime_type.startswith('image/'):
                 continue
+            
             try:
                 image_bytes = base64.b64decode(b64_data)
                 parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
+                
                 start, end = match.span()
                 remaining_text = remaining_text[:start] + remaining_text[end:]
             except Exception as e:
                 print(f"Error extracting markdown image: {e}")
+        
         parts.reverse()
     
     remaining_text = re.sub(r'[ \t]+', ' ', remaining_text).strip()
@@ -73,22 +84,26 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 except json.JSONDecodeError:
                     tool_output_data = {"result": str(message.content)}
 
-                resp_part = types.Part.from_function_response(
-                    name=message.name,
-                    response=tool_output_data
-                )
-                
-                # 【防 400 核心修复】：向 FunctionResponse 重新注入底层签名
-                if hasattr(resp_part, 'function_response') and resp_part.function_response is not None:
-                    try: resp_part.function_response.id = message.tool_call_id
-                    except Exception: pass
-                    try: resp_part.function_response.thought_signature = message.tool_call_id
-                    except Exception: pass
+                # 【防 400 核心修复】：使用 kwargs 硬注入 id，避免 Pydantic 拦截
+                func_resp_kwargs = {
+                    "name": message.name,
+                    "response": tool_output_data,
+                }
+                if message.tool_call_id:
+                    func_resp_kwargs["id"] = message.tool_call_id
+                    
+                try:
+                    # 原生构造函数注入，确保底层生成标准的 JSON 序列化
+                    resp_part = types.Part(function_response=types.FunctionResponse(**func_resp_kwargs))
+                except Exception as e:
+                    print(f"Warning: Failed to inject FunctionResponse ID: {e}")
+                    resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
 
                 parts.append(resp_part)
                 current_gemini_role = "function"
             else:
                 continue
+                
         elif role == "assistant" and message.tool_calls:
             current_gemini_role = "model"
             for tool_call in message.tool_calls:
@@ -103,17 +118,19 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                     parsed_arguments = {} 
                     
                 if function_name:
-                    fc_part = types.Part.from_function_call(
-                        name=function_name,
-                        args=parsed_arguments
-                    )
-                    
-                    # 【防 400 核心修复】：向 FunctionCall 重新注入防伪 thought_signature
-                    if tool_call_id and hasattr(fc_part, 'function_call') and fc_part.function_call is not None:
-                        try: fc_part.function_call.id = tool_call_id
-                        except Exception: pass
-                        try: fc_part.function_call.thought_signature = tool_call_id
-                        except Exception: pass
+                    # 【防 400 核心修复】：历史消息回传时，硬注入 thought_signature (id)
+                    fc_kwargs = {
+                        "name": function_name,
+                        "args": parsed_arguments
+                    }
+                    if tool_call_id:
+                        fc_kwargs["id"] = tool_call_id
+                        
+                    try:
+                        fc_part = types.Part(function_call=types.FunctionCall(**fc_kwargs))
+                    except Exception as e:
+                        print(f"Warning: Failed to inject FunctionCall ID: {e}")
+                        fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
                         
                     parts.append(fc_part)
                     
@@ -121,6 +138,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 if isinstance(message.content, str):
                     image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
                     if clean_text: parts.append(types.Part.from_text(text=clean_text))
+                    
         else: 
             if message.content is None: continue
             
@@ -331,7 +349,6 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                     if hasattr(part, 'function_call') and part.function_call is not None: 
                         fc = part.function_call
                         
-                        # 【防 400 核心修复】：拦截出云端返回的原生 thought_signature 或 id，原路封送！
                         real_id = getattr(fc, 'id', None)
                         if not real_id: real_id = getattr(fc, 'thought_signature', None)
                         
