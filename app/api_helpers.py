@@ -144,8 +144,6 @@ def is_retryable_exception(e):
 def log_retry_attempt(retry_state):
     attempt = retry_state.attempt_number
     e = retry_state.outcome.exception()
-    
-    # 仅增加重试次数，不计入致命错误
     stats.add_retry()
     print(f"⚠️ [API 自动重试] 遇到上游拥堵或短暂拒绝 ({e.__class__.__name__})。正在进行第 {attempt} 次护盾退避重试...")
 
@@ -205,17 +203,18 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     ]
 
     tools_list = []
+    # 【Bug 修复】：解析 OpenAI tools 时，深度提取 nested 的 function 内容，防止 name/parameters 获取为 None
     if request.tools:
         function_declarations = []
         for tool in request.tools:
             if tool.get("type") == "function":
-                func_def = tool
-                if func_def:
+                func_data = tool.get("function")
+                if func_data:
                     declaration = {
-                        "name": func_def.get("name"),
-                        "description": func_def.get("description"),
+                        "name": func_data.get("name"),
+                        "description": func_data.get("description"),
                     }
-                    parameters = func_def.get("parameters")
+                    parameters = func_data.get("parameters")
                     if isinstance(parameters, dict) and "$schema" in parameters:
                         parameters = parameters.copy()
                         del parameters["$schema"]
@@ -231,7 +230,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     is_image_model = "image" in request.model.lower()
     
     if is_image_model:
-        # 【致崩 Bug 修复】：必须包含 TEXT 模态，否则生图模型无法输出思考过程，直接 400 报错！
+        # 必须包含 TEXT 模态，否则生图模型无法输出思考过程，直接 400 报错！
         config["response_modalities"] = ["TEXT", "IMAGE"]
         
         target_ar = "1:1"
@@ -259,8 +258,13 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             image_size="4K"
         )
         
-        # 原生挂载 Google Search 工具，让 AI 生图前自己去查设定，绝不限制任何生图题材！
-        tools_list.append(types.Tool(google_search=types.GoogleSearch()))
+        # 挂载 Google Search 工具，让 AI 生图前自己去查设定，绝不限制任何生图题材！
+        tools_list.append({"google_search": {}})
+
+        # 【Bug 修复】：移除生图模型不支持的普通文本生成控制参数，防止 400 (INVALID_ARGUMENT) 报错
+        unsupported_keys = ["temperature", "top_p", "top_k", "stop_sequences", "seed", "candidate_count"]
+        for key in unsupported_keys:
+            config.pop(key, None)
     # ==============================================================================
 
     if tools_list:
@@ -368,7 +372,6 @@ async def _chunk_openai_response_dict_for_sse(
                 else:
                     for i in range(0, len(content_to_chunk), chunk_size):
                         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {'content': content_to_chunk[i:i+chunk_size]}, 'finish_reason': None}]})}\n\n"
-                        # 图片单次发送后无需睡眠，直接跳过
                         if len(content_to_chunk) > chunk_size: await asyncio.sleep(0.01)
         
         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"

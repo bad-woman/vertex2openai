@@ -45,15 +45,14 @@ app.state.express_key_manager = express_key_manager
 @app.middleware("http")
 async def stats_tracker_middleware(request: Request, call_next):
     if "chat/completions" in request.url.path:
+        stats.increment_total()  # 进站时：增加总请求计数
         try:
             response = await call_next(request)
             if response.status_code >= 400:
-                stats.add_request(success=False, is_error=True)
-            else:
-                stats.add_request(success=True, is_error=False)
+                stats.add_error()  # 出站时：如果是异常状态码，登记错误响应
             return response
         except Exception as e:
-            stats.add_request(success=False, is_error=True)
+            stats.add_error()  # 出站时：如果执行崩溃，登记错误响应
             raise e
     return await call_next(request)
 
@@ -239,7 +238,6 @@ DASHBOARD_HTML = """
 
         function renderChart(success, error, retries) {
             const ctx = document.getElementById('successChart').getContext('2d');
-            // 环形图数据：绿（成功）、红（失败）、黄（重试事件）。如果全 0 则用个灰色的代替。
             let dataArr = [success, error, retries];
             let colorArr = ['#10B981', '#E11D48', '#F59E0B'];
             if (success === 0 && error === 0 && retries === 0) {
@@ -296,7 +294,6 @@ DASHBOARD_HTML = """
             isAutoScroll = logWindow.scrollHeight - logWindow.scrollTop - logWindow.clientHeight < 50;
         });
 
-        // 彻底优化的浅色 UI 日志分色
         function formatLogText(text) {
             let color = "#475569"; // 默认灰
             let bgColor = "transparent";

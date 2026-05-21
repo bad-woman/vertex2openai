@@ -153,7 +153,15 @@ class ExpressClientWrapper:
                 try:
                     response = await client.post(endpoint, headers=headers, params=params, json=payload, timeout=None)
                     response.raise_for_status()
-                    return FakeChatCompletion(response.json())
+                    # 补充算力打印，使得非流式 Express 也能纳入准确统计
+                    resp_json = response.json()
+                    if isinstance(resp_json, dict) and "usage" in resp_json and resp_json["usage"]:
+                        usage = resp_json["usage"]
+                        p_tk = usage.get("prompt_tokens", 0)
+                        c_tk = usage.get("completion_tokens", 0)
+                        t_tk = usage.get("total_tokens", p_tk + c_tk)
+                        print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+                    return FakeChatCompletion(resp_json)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code in [429, 503, 502] and attempt < max_retries - 1:
                         wave_index = attempt % 4
@@ -223,16 +231,22 @@ class OpenAIDirectHandler:
             del openai_params["reasoning_effort"]
         return openai_params
     
-    def prepare_extra_body(self) -> Dict[str, Any]:
-        # 移除了干扰性的 thoughtTagMarker，强迫其使用原生的 <think>
+    def prepare_extra_body(self, base_model_name: str) -> Dict[str, Any]:
+        google_config = {
+            "safetySettings": self.safety_settings
+        }
+        
+        # 【致崩 Bug 修复】：只有在 Pro 推理系列才默认加入 thinkingConfig
+        # 从而彻底解决 Flash 系列带 -openai 引起的 400 (INVALID_ARGUMENT) 崩溃
+        is_pro_model = "pro" in base_model_name.lower()
+        if is_pro_model:
+            google_config["thinkingConfig"] = {
+                "includeThoughts": True
+            }
+            
         return {
             "extra_body": {
-                'google': {
-                    'safetySettings': self.safety_settings,
-                    "thinkingConfig": {
-                        "includeThoughts": True
-                    }
-                }
+                "google": google_config
             }
         }
     
@@ -285,6 +299,14 @@ class OpenAIDirectHandler:
                     if not isinstance(chunk_as_dict, dict):
                         continue
                     
+                    # 补齐官方通道流式数据捕获，使得带 -openai 模型的流式消费也能正常并准确录入
+                    usage = chunk_as_dict.get('usage')
+                    if usage:
+                        p_tk = usage.get("prompt_tokens", 0)
+                        c_tk = usage.get("completion_tokens", 0)
+                        t_tk = usage.get("total_tokens", p_tk + c_tk)
+                        print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+
                     choices = chunk_as_dict.get('choices')
                     if choices and isinstance(choices, list) and len(choices) > 0:
                         delta = choices[0].get('delta')
@@ -412,6 +434,14 @@ class OpenAIDirectHandler:
             )
             response_dict = response.model_dump(exclude_unset=True, exclude_none=True)
             
+            # 补齐直连通道非流式 Token 指标打印，确保统计准确性
+            usage = response_dict.get('usage')
+            if usage:
+                p_tk = usage.get("prompt_tokens", 0)
+                c_tk = usage.get("completion_tokens", 0)
+                t_tk = usage.get("total_tokens", p_tk + c_tk)
+                print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+
             try:
                 choices = response_dict.get('choices')
                 if choices and isinstance(choices, list) and len(choices) > 0:
@@ -424,7 +454,6 @@ class OpenAIDirectHandler:
                         actual_content = full_content if isinstance(full_content, str) else ""
                         
                         if actual_content:
-                            # 固定为提取 think 标签
                             reasoning_text, actual_content = extract_reasoning_by_tags(actual_content, "think")
                             message_dict['content'] = actual_content
                             if reasoning_text:
@@ -481,7 +510,9 @@ class OpenAIDirectHandler:
 
             model_id = f"google/{base_model_name}"
             openai_params = self.prepare_openai_params(request, model_id, is_openai_search)
-            openai_extra_body = self.prepare_extra_body()
+            
+            # 【Bug 修复】：传入 base_model_name 动态调配
+            openai_extra_body = self.prepare_extra_body(base_model_name)
             
             if request.stream:
                 return await self.handle_streaming_response(
