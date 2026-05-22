@@ -89,16 +89,10 @@ class ExpressClientWrapper:
 
         payload["stream_options"] = {"include_usage": True}
 
-        proxies = None
+        # 完美自适应所有 httpx >= 0.25 的统一写法
+        client_args = {'timeout': 300.0}
         if app_config.PROXY_URL:
-            if app_config.PROXY_URL.startswith("socks"):
-                proxies = {"all://": app_config.PROXY_URL}
-            else:
-                proxies = {"https://": app_config.PROXY_URL}
-
-        client_args = {'timeout': 300}
-        if proxies:
-            client_args['proxies'] = proxies
+            client_args['proxy'] = app_config.PROXY_URL
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
             
@@ -135,16 +129,10 @@ class ExpressClientWrapper:
         if 'extra_body' in payload:
             payload.update(payload.pop('extra_body'))
 
-        proxies = None
+        # 完美自适应所有 httpx >= 0.25 的统一写法
+        client_args = {'timeout': 300.0}
         if app_config.PROXY_URL:
-            if app_config.PROXY_URL.startswith("socks"):
-                proxies = {"all://": app_config.PROXY_URL}
-            else:
-                proxies = {"https://": app_config.PROXY_URL}
-
-        client_args = {'timeout': 300}
-        if proxies:
-            client_args['proxies'] = proxies
+            client_args['proxy'] = app_config.PROXY_URL
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
             
@@ -200,16 +188,9 @@ class OpenAIDirectHandler:
             f"projects/{project_id}/locations/{location}/endpoints/openapi"
         )
         
-        proxies = None
-        if app_config.PROXY_URL:
-            if app_config.PROXY_URL.startswith("socks"):
-                proxies = {"all://": app_config.PROXY_URL}
-            else:
-                proxies = {"https://": app_config.PROXY_URL}
-
         client_args = {}
-        if proxies:
-            client_args['proxies'] = proxies
+        if app_config.PROXY_URL:
+            client_args['proxy'] = app_config.PROXY_URL
         if app_config.SSL_CERT_FILE:
             client_args['verify'] = app_config.SSL_CERT_FILE
         
@@ -227,7 +208,6 @@ class OpenAIDirectHandler:
         if is_openai_search:
             params['web_search_options'] = {}
             
-        # 兼容最新版 OpenAI 客户端传入的 max_completion_tokens，防止直连云端网关抛出不支持参数异常
         if "max_completion_tokens" in params:
             if "max_tokens" not in params:
                 params["max_tokens"] = params["max_completion_tokens"]

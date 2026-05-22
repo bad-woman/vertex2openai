@@ -4,44 +4,29 @@ import json
 from typing import Dict, Optional
 import config
 
-# 全局项目 ID 缓存
 PROJECT_ID_CACHE: Dict[str, str] = {}
-
-def _get_proxy_url() -> Optional[str]:
-    return config.PROXY_URL
 
 async def discover_project_id(api_key: str) -> str:
     """
-    通过 httpx 发现项目 ID，完美兼容 SOCKS5/HTTP 代理并共享 SSL 配置
+    通过 httpx 发现项目 ID，采用全版本兼容的 proxy 参数
     """
     if api_key in PROJECT_ID_CACHE:
         print(f"INFO: 使用缓存的项目 ID: {PROJECT_ID_CACHE[api_key]}")
         return PROJECT_ID_CACHE[api_key]
     
-    # 故意请求一个不存在的模型以触发错误并提取 Project ID
     error_url = "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.7-pro-preview-05-06:streamGenerateContent"
     payload = {
         "contents": [{"role": "user", "parts": [{"text": "test"}]}]
     }
     
-    # 适配代理
-    proxies = None
-    proxy_url = _get_proxy_url()
-    if proxy_url:
-        if proxy_url.startswith("socks"):
-            proxies = {"all://": proxy_url}
-        else:
-            proxies = {"https://": proxy_url}
-            
-    client_args = {'timeout': 20}
-    if proxies:
-        client_args['proxies'] = proxies
+    client_args = {'timeout': 20.0}
+    if config.PROXY_URL:
+        client_args['proxy'] = config.PROXY_URL
     if getattr(config, "SSL_CERT_FILE", None):
         client_args['verify'] = config.SSL_CERT_FILE
         
     async with httpx.AsyncClient(**client_args) as client:
         try:
-            # 发起请求
             response = await client.post(error_url, params={"key": api_key}, json=payload)
             response_text = response.text
             

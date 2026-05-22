@@ -3,8 +3,6 @@ import re
 import json
 import time
 import random 
-import urllib.parse
-import urllib.request
 import concurrent.futures
 from typing import List, Dict, Any, Tuple
 import config as app_config
@@ -26,10 +24,6 @@ def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     return reasoning_content.strip(), normal_text.strip()
 
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
-    """
-    Extract markdown images from text and convert them to Gemini Parts.
-    Returns a tuple of (image_parts, text_without_images)
-    """
     parts = []
     remaining_text = text
     pattern = r'!\[[^\]]*\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)'
@@ -77,19 +71,9 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 except json.JSONDecodeError:
                     tool_output_data = {"result": str(message.content)}
 
-                # ---- 🔄【解包 thought_signature】 极其关键的步骤 ----
+                # 脱除我们之前添加的 __thought__ 后缀（如果存在），提取出最纯粹的底层 ID 
                 tool_call_id_str = message.tool_call_id or ""
-                thought_sig_bytes = None
-                real_tool_id = tool_call_id_str
-
-                if "__thought__" in tool_call_id_str:
-                    parts_id = tool_call_id_str.split("__thought__")
-                    real_tool_id = parts_id[0]
-                    b64_sig = parts_id[1]
-                    try:
-                        thought_sig_bytes = base64.b64decode(b64_sig)
-                    except Exception:
-                        pass
+                real_tool_id = tool_call_id_str.split("__thought__")[0] if "__thought__" in tool_call_id_str else tool_call_id_str
 
                 func_resp_kwargs = {
                     "name": message.name,
@@ -99,14 +83,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                     func_resp_kwargs["id"] = real_tool_id
                     
                 try:
-                    part_kwargs = {
-                        "function_response": types.FunctionResponse(**func_resp_kwargs)
-                    }
-                    if thought_sig_bytes:
-                        part_kwargs["thought_signature"] = thought_sig_bytes
-                    resp_part = types.Part(**part_kwargs)
+                    # 使用原生构造函数硬编码注入 id，绝对绕开 400 校验错误
+                    resp_part = types.Part(function_response=types.FunctionResponse(**func_resp_kwargs))
                 except Exception as e:
-                    print(f"Warning: Failed to inject FunctionResponse ID or thought_signature: {e}")
+                    print(f"Warning: Failed to inject FunctionResponse ID: {e}")
                     resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
 
                 parts.append(resp_part)
@@ -128,19 +108,9 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                     parsed_arguments = {} 
                     
                 if function_name:
-                    # ---- 🔄【解包 thought_signature】 极其关键的步骤 ----
+                    # 同理脱除 __thought__ 并把 ID 原样塞入
                     tool_call_id_str = tool_call_id or ""
-                    thought_sig_bytes = None
-                    real_tool_id = tool_call_id_str
-
-                    if "__thought__" in tool_call_id_str:
-                        parts_id = tool_call_id_str.split("__thought__")
-                        real_tool_id = parts_id[0]
-                        b64_sig = parts_id[1]
-                        try:
-                            thought_sig_bytes = base64.b64decode(b64_sig)
-                        except Exception:
-                            pass
+                    real_tool_id = tool_call_id_str.split("__thought__")[0] if "__thought__" in tool_call_id_str else tool_call_id_str
 
                     fc_kwargs = {
                         "name": function_name,
@@ -150,14 +120,9 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                         fc_kwargs["id"] = real_tool_id
                         
                     try:
-                        part_kwargs = {
-                            "function_call": types.FunctionCall(**fc_kwargs)
-                        }
-                        if thought_sig_bytes:
-                            part_kwargs["thought_signature"] = thought_sig_bytes
-                        fc_part = types.Part(**part_kwargs)
+                        fc_part = types.Part(function_call=types.FunctionCall(**fc_kwargs))
                     except Exception as e:
-                        print(f"Warning: Failed to inject FunctionCall ID or thought_signature: {e}")
+                        print(f"Warning: Failed to inject FunctionCall ID: {e}")
                         fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
                         
                     parts.append(fc_part)
@@ -166,7 +131,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 if isinstance(message.content, str):
                     image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
                     if clean_text: parts.append(types.Part.from_text(text=clean_text))
-                    
         else: 
             if message.content is None: continue
             
@@ -207,10 +171,18 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                                         parts.append(types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type))
                                 elif image_url.startswith('http'):
                                     try:
+                                        # 【漏洞修复】：使用 httpx 替代 urllib，完美套用客户端的 PROXY_URL 代理，防止网络泄漏超时
                                         def fetch_img():
-                                            req = urllib.request.Request(image_url, headers={'User-Agent': 'Mozilla/5.0'})
-                                            with urllib.request.urlopen(req, timeout=10) as response:
-                                                return response.read(), response.headers.get_content_type()
+                                            import httpx
+                                            client_args = {"timeout": 10.0, "follow_redirects": True}
+                                            if app_config.PROXY_URL:
+                                                client_args["proxy"] = app_config.PROXY_URL
+                                            if getattr(app_config, "SSL_CERT_FILE", None):
+                                                client_args["verify"] = app_config.SSL_CERT_FILE
+                                            with httpx.Client(**client_args) as client:
+                                                resp = client.get(image_url)
+                                                resp.raise_for_status()
+                                                return resp.content, resp.headers.get("content-type", "image/jpeg")
                                         with concurrent.futures.ThreadPoolExecutor() as pool:
                                             future = pool.submit(fetch_img)
                                             img_bytes, mime_type = future.result(timeout=12) 
@@ -234,10 +206,18 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                                     parts.append(types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type))
                             elif url_str.startswith('http'):
                                 try:
+                                    # 【漏洞修复】：同样使用全局 httpx 抓图
                                     def fetch_img():
-                                        req = urllib.request.Request(url_str, headers={'User-Agent': 'Mozilla/5.0'})
-                                        with urllib.request.urlopen(req, timeout=10) as response:
-                                            return response.read(), response.headers.get_content_type()
+                                        import httpx
+                                        client_args = {"timeout": 10.0, "follow_redirects": True}
+                                        if app_config.PROXY_URL:
+                                            client_args["proxy"] = app_config.PROXY_URL
+                                        if getattr(app_config, "SSL_CERT_FILE", None):
+                                            client_args["verify"] = app_config.SSL_CERT_FILE
+                                        with httpx.Client(**client_args) as client:
+                                            resp = client.get(url_str)
+                                            resp.raise_for_status()
+                                            return resp.content, resp.headers.get("content-type", "image/jpeg")
                                     with concurrent.futures.ThreadPoolExecutor() as pool:
                                         future = pool.submit(fetch_img)
                                         img_bytes, mime_type = future.result(timeout=12) 
@@ -377,30 +357,13 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                     if hasattr(part, 'function_call') and part.function_call is not None: 
                         fc = part.function_call
                         
-                        # ---- 📦【打包 thought_signature】 极其关键的步骤 ----
                         real_id = getattr(fc, 'id', None)
                         if not real_id: real_id = getattr(fc, 'thought_signature', None)
                         
-                        # 同时捕获属于此 Part 的加密 thought_signature 
-                        thought_sig = getattr(part, 'thought_signature', None)
-                        thought_sig_b64 = ""
-                        if thought_sig:
-                            if isinstance(thought_sig, bytes):
-                                thought_sig_b64 = base64.b64encode(thought_sig).decode('utf-8')
-                            elif isinstance(thought_sig, str):
-                                thought_sig_b64 = thought_sig
-
-                        # 完美缝合原生签名，拼装成 OpenAI ID 返回
                         if real_id:
-                            if thought_sig_b64:
-                                tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
-                            else:
-                                tool_call_id = real_id
+                            tool_call_id = real_id
                         else:
-                            if thought_sig_b64:
-                                tool_call_id = f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}__thought__{thought_sig_b64}"
-                            else:
-                                tool_call_id = f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
+                            tool_call_id = f"call_{base_id}_{i}_{fc.name.replace(' ', '_')}_{int(time.time()*10000 + random.randint(0,9999))}"
                         
                         if "tool_calls" not in message_payload:
                             message_payload["tool_calls"] = []

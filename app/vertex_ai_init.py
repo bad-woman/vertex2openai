@@ -8,32 +8,26 @@ from model_loader import refresh_models_config_cache
 
 def get_http_options(base_url: Optional[str] = None) -> Optional[types.HttpOptions]:
     """
-    获取包含代理和基础URL的HttpOptions配置，统一适配 httpx
+    获取包含代理和基础URL的HttpOptions配置，采用 httpx 全版本通用的单数 proxy 参数
     """
     client_args = {}
-    async_client_args = {}
-    
     if app_config.PROXY_URL:
         client_args['proxy'] = app_config.PROXY_URL
-        async_client_args['proxy'] = app_config.PROXY_URL
         
     if base_url:
         return types.HttpOptions(
             base_url=base_url,
             client_args=client_args if client_args else None,
-            async_client_args=async_client_args if async_client_args else None
+            async_client_args=client_args if client_args else None
         )
-    elif client_args or async_client_args:
+    elif client_args:
         return types.HttpOptions(
             client_args=client_args,
-            async_client_args=async_client_args
+            async_client_args=client_args
         )
     return None
 
 async def init_vertex_ai(credential_manager_instance: CredentialManager) -> bool:
-    """
-    初始化凭据管理器并校验。
-    """
     try:
         credentials_json_str = app_config.GOOGLE_CREDENTIALS_JSON_STR
         env_creds_loaded_into_manager = False
@@ -85,7 +79,6 @@ async def init_vertex_ai(credential_manager_instance: CredentialManager) -> bool
             temp_creds_val, temp_project_id_val = credential_manager_instance.get_credentials()
             if temp_creds_val and temp_project_id_val:
                 try:
-                    # 使用封装后的统一 Proxy 选项
                     _ = genai.Client(
                         vertexai=True, 
                         credentials=temp_creds_val, 

@@ -17,15 +17,10 @@ class AppSettings(BaseSettings):
     PROXY_URL: Optional[str] = None
     SSL_CERT_FILE: Optional[str] = None
 
-    # 自动读取 .env 文件，忽略多余配置
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-# 实例化配置中心
 _settings = AppSettings()
 
-# ==========================================
-# 向下兼容：映射回旧变量名，确保其他文件 import 不报错！
-# ==========================================
 API_KEY = _settings.API_KEY
 HUGGINGFACE = _settings.HUGGINGFACE
 HUGGINGFACE_API_KEY = _settings.HUGGINGFACE_API_KEY

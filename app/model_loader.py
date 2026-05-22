@@ -9,26 +9,15 @@ _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
 
 async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
-    """
-    Fetches the model configuration JSON from the URL specified in app_config.
-    """
     if not app_config.MODELS_CONFIG_URL:
         print("ERROR: MODELS_CONFIG_URL is not set in the environment/config.")
         return None
 
     print(f"Fetching model configuration from: {app_config.MODELS_CONFIG_URL}")
     
-    # 【Bug 修复】：适配本地或受限环境下的 GitHub 拉取，应用全局代理与证书配置
-    proxies = None
+    client_args = {'timeout': 20.0}
     if app_config.PROXY_URL:
-        if app_config.PROXY_URL.startswith("socks"):
-            proxies = {"all://": app_config.PROXY_URL}
-        else:
-            proxies = {"https://": app_config.PROXY_URL}
-            
-    client_args = {}
-    if proxies:
-        client_args['proxies'] = proxies
+        client_args['proxy'] = app_config.PROXY_URL
     if app_config.SSL_CERT_FILE:
         client_args['verify'] = app_config.SSL_CERT_FILE
 
@@ -60,9 +49,6 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
         return None
 
 async def get_models_config() -> Dict[str, List[str]]:
-    """
-    Returns the cached model configuration.
-    """
     global _model_cache
     async with _cache_lock:
         if _model_cache is None:
@@ -82,9 +68,6 @@ async def get_vertex_express_models() -> List[str]:
     return config.get("vertex_express_models", [])
 
 async def refresh_models_config_cache() -> bool:
-    """
-    Forces a refresh of the model configuration cache.
-    """
     global _model_cache
     print("Attempting to refresh model configuration cache...")
     async with _cache_lock:
