@@ -4,7 +4,7 @@ import httpx
 import asyncio
 import secrets
 from fastapi import FastAPI, Depends, Request, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -18,10 +18,6 @@ from routes import models_api, chat_api
 # 引入重写后的日志模块
 from logger import rt_logger, stats
 import config
-
-# ================= 新增引入：读取临时内存图片 =================
-from api_helpers import IMAGE_CACHE
-# =======================================================
 
 credential_manager = CredentialManager()
 express_key_manager = ExpressKeyManager()
@@ -65,19 +61,6 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
     if not secrets.compare_digest(credentials.password, config.API_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
-
-# ================= 新增：阅后即焚本地图片路由 =================
-@app.get("/api/temp-images/{img_id}")
-async def get_temp_image(img_id: str):
-    """供前端直接请求，加载 4K 原始内存图片二进制"""
-    if img_id in IMAGE_CACHE:
-        img_data = IMAGE_CACHE[img_id]["data"]
-        mime = IMAGE_CACHE[img_id]["mime"]
-        return Response(content=img_data, media_type=mime)
-    else:
-        # 图片过期或不存在
-        return Response(status_code=404, content="Image expired or not found")
-# =========================================================
 
 # ==========================================
 # 💎 现代流行感大屏 - Light Mode 精修版
@@ -221,7 +204,7 @@ DASHBOARD_HTML = """
                 </div>
             </div>
 
-            <!-- 视图 2：运行日志终端 -->
+            <!-- 视图 2：运行日志终端 (浅色轻量版) -->
             <div id="view-logs" class="hidden h-full max-w-6xl mx-auto flex flex-col glass-panel rounded-2xl overflow-hidden">
                 <div class="bg-white px-4 py-3 border-b border-slate-200 flex items-center gap-2.5">
                     <div class="flex gap-1.5">

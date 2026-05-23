@@ -6,7 +6,6 @@ import httpx
 import re
 import random 
 import base64
-import uuid
 from typing import List, Dict, Any, Callable, Union, Optional
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -26,26 +25,6 @@ from config import VERTEX_REASONING_TAG
 
 # 引入报错统计器
 from logger import stats
-
-# ================= 全局内存图片缓存，防 OOM 与卡死 =================
-IMAGE_CACHE = {}
-
-def save_to_memory_cache(img_bytes, mime_type):
-    current_time = time.time()
-    # 1. 自动清理超出 10 分钟的图片缓存，防止内存泄露
-    keys_to_delete = [k for k, v in IMAGE_CACHE.items() if current_time - v['time'] > 600]
-    for k in keys_to_delete:
-        del IMAGE_CACHE[k]
-        
-    # 2. 保护机制：如果高频生图，最多保留最新 15 张图
-    if len(IMAGE_CACHE) >= 15:
-        oldest_key = min(IMAGE_CACHE.keys(), key=lambda k: IMAGE_CACHE[k]['time'])
-        del IMAGE_CACHE[oldest_key]
-
-    img_id = str(uuid.uuid4())
-    IMAGE_CACHE[img_id] = {"data": img_bytes, "mime": mime_type, "time": current_time}
-    return img_id
-# ===============================================================
 
 class StreamingReasoningProcessor:
     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
@@ -225,6 +204,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if fmt_type == "json_object":
             config["response_mime_type"] = "application/json"
     
+    # 官方 2026 最新基准配置
     safety_threshold = "BLOCK_NONE"
     
     config["safety_settings"] = [
@@ -262,6 +242,8 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     
     if is_image_model:
         config["response_modalities"] = ["TEXT", "IMAGE"]
+        
+        # 默认不指定比例，开启 API 原生智能自动决策机制
         target_ar = None
         
         req_dict = request.model_dump()
@@ -278,14 +260,18 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                 if isinstance(msg.content, str): content = msg.content
                 elif isinstance(msg.content, list): content = " ".join([p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"])
                 
+                # 优先匹配标准生图 --ar，其次匹配独立比例，防非比例数字干扰
                 ar_match = re.search(r"(?i)--ar\s*(\d+[:：]\d+)", content)
                 if not ar_match:
                     ar_match = re.search(r"\b(\d+[:：]\d+)\b", content)
                     
                 if ar_match:
                     parsed_ar = ar_match.group(1).replace("：", ":")
+                    
+                    # 定义生图模型的比例安全白名单
                     pro_supported = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
                     flash_supported = pro_supported | {"1:4", "4:1", "1:8", "8:1"}
+                    
                     is_flash_img = "3.1-flash" in request.model.lower()
                     allowed_set = flash_supported if is_flash_img else pro_supported
                     
@@ -296,6 +282,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                         target_ar = None
                 break
                 
+        # 封装 image_config 结构，强制 4K 级别分辨率
         image_config_args = {"image_size": "4K"}
         if target_ar:
             image_config_args["aspect_ratio"] = target_ar
@@ -336,6 +323,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         
     return config
 
+
 def is_gemini_response_valid(response: Any) -> bool:
     if response is None: return False
     if hasattr(response, "text") and isinstance(response.text, str) and response.text.strip(): return True
@@ -347,6 +335,7 @@ def is_gemini_response_valid(response: Any) -> bool:
                     if hasattr(part, "function_call"): return True 
                     if hasattr(part, "text") and isinstance(getattr(part, "text", None), str) and getattr(part, "text", "").strip(): return True
     return False
+
 
 def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0) -> str:
     from message_processing import parse_gemini_response_for_reasoning_and_content
@@ -499,6 +488,7 @@ async def _chunk_openai_response_dict_for_sse(
 
             content_to_chunk = actual_content if actual_content is not None else ""
             if actual_content is not None:
+                # 【回滚】：恢复原版图片传输方案（一次性全量发送），彻底拯救前端解析器不卡死
                 if "![Image](data:image/" in content_to_chunk:
                     chunk_size = max(1, len(content_to_chunk))
                 else:
@@ -670,94 +660,18 @@ async def execute_gemini_call(
     prompt_func: Callable[[List[OpenAIMessage]], List[types.Content]], 
     gen_config_dict: Dict[str, Any], 
     request_obj: OpenAIRequest, 
-    is_auto_attempt: bool = False,
-    base_url_str: str = "" # 新增，接收传入的动态域名
+    is_auto_attempt: bool = False
 ):
     actual_prompt_for_call = prompt_func(request_obj.messages)
     client_model_name_for_log = getattr(current_client, "model_name", "unknown_direct_client_object")
     print(f"INFO: execute_gemini_call for requested API model '{model_to_call}', using client object with internal name '{client_model_name_for_log}'. Original request model: '{request_obj.model}'")
     
-    # ================= 终极链路：生图模型完全拦截，本地内存代理防卡死 =================
-    is_image_request = "image" in request_obj.model.lower()
-    
-    if is_image_request:
-        print(f"INFO: 触发生图安全协议 —— 拦截请求并在本地搭建高速内存隧道 (Model: {model_to_call})")
-        try:
-            response_obj_call = await execute_with_retry(
-                current_client.aio.models.generate_content,
-                model=model_to_call, 
-                contents=actual_prompt_for_call,
-                config=gen_config_dict
-            )
-            
-            p_tk, c_tk, t_tk = 0, 0, 0
-            if hasattr(response_obj_call, "usage_metadata") and response_obj_call.usage_metadata:
-                um = response_obj_call.usage_metadata
-                p_tk = getattr(um, "prompt_token_count", 0) or 0
-                c_tk = getattr(um, "candidates_token_count", 0) or 0
-                t_tk = getattr(um, "total_token_count", p_tk + c_tk) or (p_tk + c_tk)
-            
-            if hasattr(response_obj_call, "candidates") and response_obj_call.candidates:
-                for cand in response_obj_call.candidates:
-                    if hasattr(cand, "content") and hasattr(cand.content, "parts"):
-                        for part in cand.content.parts:
-                            if hasattr(part, "inline_data") and part.inline_data:
-                                img_bytes = part.inline_data.data
-                                mime_type = getattr(part.inline_data, "mime_type", "image/png")
-                                if not mime_type: mime_type = "image/png"
-                                
-                                # 将 4K 二进制存入内存，生成一个读取 ID
-                                img_id = save_to_memory_cache(img_bytes, mime_type)
-                                image_url = f"{base_url_str}api/temp-images/{img_id}"
-                                
-                                # 构建短 Markdown，欺骗前端直接通过 URL 拉取内存里的 4K 原图
-                                markdown_content = f"![Image]({image_url})\n\n*(🎨 4K 原图已成功生成，通过服务器高速内存专线免转码直达，十分钟内有效。)*"
-                                
-                                if p_tk > 0 or c_tk > 0:
-                                    print(f"💰 [算力消耗] 提示词: {p_tk} | 模型思考与生成: {c_tk} | 总计: {t_tk} Tokens")
-                                img_kb = len(img_bytes) / 1024
-                                print(f"✅ [生图成功] 大小: {img_kb:.2f} KB。通过内部内存代理直达 RikkaHub，避免崩溃。")
-                                
-                                # 兼容 RikkaHub 的两种消费方式（流式 / JSON）
-                                if request_obj.stream:
-                                    async def mock_stream():
-                                        resp_id = f"chatcmpl-{int(time.time())}"
-                                        chunk_payload = {
-                                            "id": resp_id, "object": "chat.completion.chunk", "created": int(time.time()),
-                                            "model": request_obj.model, "choices": [{"index": 0, "delta": {"content": markdown_content}, "finish_reason": None}]
-                                        }
-                                        yield f"data: {json.dumps(chunk_payload)}\n\n"
-                                        
-                                        finish_payload = {
-                                            "id": resp_id, "object": "chat.completion.chunk", "created": int(time.time()),
-                                            "model": request_obj.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                                        }
-                                        yield f"data: {json.dumps(finish_payload)}\n\n"
-                                        yield "data: [DONE]\n\n"
-                                        
-                                    return StreamingResponse(mock_stream(), media_type="text/event-stream")
-                                else:
-                                    resp_json = {
-                                        "id": f"chatcmpl-{int(time.time())}",
-                                        "object": "chat.completion",
-                                        "created": int(time.time()),
-                                        "model": request_obj.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "message": {"role": "assistant", "content": markdown_content},
-                                            "finish_reason": "stop"
-                                        }],
-                                        "usage": {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
-                                    }
-                                    return JSONResponse(content=resp_json)
-                                    
-            return JSONResponse(status_code=500, content=create_openai_error_response(500, "生图失败，未从模型返回中提取到有效的图片数据。", "server_error"))
-        except Exception as e:
-            return JSONResponse(status_code=500, content=create_openai_error_response(500, f"生图请求发生异常: {str(e)}", "server_error"))
-    # =========================================================================
-
     if request_obj.stream:
-        if app_config.FAKE_STREAMING_ENABLED:
+        is_image_request = "image" in request_obj.model.lower()
+        
+        if app_config.FAKE_STREAMING_ENABLED or is_image_request:
+            if is_image_request:
+                 print("INFO: 触发生图保护机制 —— 已强制切换为假流式输出以避开 Google 报错限制！")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,

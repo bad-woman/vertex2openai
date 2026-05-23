@@ -18,17 +18,17 @@ except ImportError:
     Image = None
 
 def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: int = int(1.5 * 1024 * 1024)) -> Tuple[bytes, str]:
-    """激进且高画质的输入图片压缩方案：超过1.5MB的图强制限制边长至1536，防卡死防爆栈"""
+    """激进且高画质的输入图片压缩方案：超过1.5MB的图强制限制边长至1536，斩断上下文体积恶性膨胀循环"""
     if Image is None:
         return image_data, original_mime
     
-    # 只要在 1.5MB 以内，直接放行不破坏画质
+    # 只要在 1.5MB 以内，直接原样放行，确保画质绝对保真
     if len(image_data) <= max_size_bytes:
         return image_data, original_mime
         
     try:
         with Image.open(io.BytesIO(image_data)) as img:
-            # 抹平透明通道以防转码报错
+            # 抹平透明通道以防 JPEG 转换报错
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 if img.mode == 'RGBA' or img.mode == 'LA':
@@ -39,17 +39,17 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
             
-            # 强势降维：大模型识别语义 1536px 绰绰有余，强行卡死最大边长
+            # 强势降维：修图参考无需 4K 像素流，1536px 已经超越绝大多数 OCR 和细节识别需求
             max_dim = 1536
             if img.width > max_dim or img.height > max_dim:
                 img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
             
             output = io.BytesIO()
-            # 首选 85 高画质
+            # 首选 Q=85 极致画质
             img.save(output, format='JPEG', quality=85, optimize=True)
             opt_data = output.getvalue()
             
-            # 若依然是超重，执行无情地二次压缩（通常 1536px 在 70 质量下很少超过 500KB）
+            # 若由于细节过于繁复依然超重，执行二次压缩降至 Q=70（文件大小将锁定在 500KB 上下）
             if len(opt_data) > max_size_bytes:
                 output = io.BytesIO()
                 img.save(output, format='JPEG', quality=70, optimize=True)
