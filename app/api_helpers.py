@@ -204,7 +204,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if fmt_type == "json_object":
             config["response_mime_type"] = "application/json"
     
-    # 官方 2026 最新基准配置：废弃了政治项，正式加入了 JAILBREAK
+    # 官方 2026 最新基准配置
     safety_threshold = "BLOCK_NONE"
     
     config["safety_settings"] = [
@@ -260,7 +260,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                 if isinstance(msg.content, str): content = msg.content
                 elif isinstance(msg.content, list): content = " ".join([p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"])
                 
-                # 【比例精准过滤重构】：优先匹配标准生图 --ar，其次匹配独立比例，防非比例数字干扰
+                # 优先匹配标准生图 --ar，其次匹配独立比例，防非比例数字干扰
                 ar_match = re.search(r"(?i)--ar\s*(\d+[:：]\d+)", content)
                 if not ar_match:
                     ar_match = re.search(r"\b(\d+[:：]\d+)\b", content)
@@ -278,7 +278,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                     if parsed_ar in allowed_set:
                         target_ar = parsed_ar
                     else:
-                        # 触发白名单安全保护，不在白名单则不强传，直接交给大模型决策，彻底免疫 400 崩溃
                         print(f"WARNING: Model {request.model} does not support '{parsed_ar}'. Auto-decide triggered.")
                         target_ar = None
                 break
@@ -372,7 +371,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                         elif isinstance(thought_sig, str):
                             thought_sig_b64 = thought_sig
                     
-                    # 修复语法截断隐患：拆分长行
                     safe_name = fc.name.replace(" ", "_")
                     rand_num = int(time.time() * 10000 + random.randint(0, 9999))
                     
@@ -490,9 +488,9 @@ async def _chunk_openai_response_dict_for_sse(
 
             content_to_chunk = actual_content if actual_content is not None else ""
             if actual_content is not None:
-                # --- 生图护盾：拦截 Base64 图片，采用 128KB 黄金分片流式发送，根治 ClientPayloadError ---
+                # 【回滚】：恢复原版图片传输方案（一次性全量发送），彻底拯救前端解析器不卡死
                 if "![Image](data:image/" in content_to_chunk:
-                    chunk_size = 131072
+                    chunk_size = max(1, len(content_to_chunk))
                 else:
                     chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
 
@@ -646,7 +644,7 @@ async def openai_fake_stream_generator(
         raise
     except Exception as e_outer: 
         err_msg_detail = f"Error in openai_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer).__name__} - {str(e_outer)}"
-        print(f"ERROR: {img_url_data.get('url', '') if isinstance(img_url_data, dict) else ''}")
+        print(f"ERROR: {err_msg_detail}")
         sse_err_msg_display = str(e_outer)
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
         err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
@@ -730,7 +728,7 @@ async def execute_gemini_call(
                         err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"ERROR: {err_msg_detail_stream}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
-                        err_resp = create_openai_error_response(500, s_err, "server_error")
+                        err_resp = create_openai_error_response(500,s_err,"server_error")
                         j_err = json.dumps(err_resp)
                         if not is_auto_attempt: 
                             yield f"data: {j_err}\n\n"
