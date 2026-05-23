@@ -66,7 +66,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
             
         gen_config_dict = create_generation_config(request)
 
-        # =============== 🧠 推理模型检测 ===============
+        # =============== 🧠 更加鲁棒的、面向未来的推理模型检测与代系提取 ===============
         is_thinking_capable = False
         is_gemini_2_5 = False
         is_gemini_3_or_above = False
@@ -93,7 +93,9 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 is_gemini_2_5 = True
             elif major >= 3:
                 is_gemini_3_or_above = True
+        # ==============================================================================================
 
+        # 提取客户端可能传入的推理强度参数
         reasoning_effort = getattr(request, "reasoning_effort", None)
         if not reasoning_effort and hasattr(request, "model_extra") and request.model_extra:
             reasoning_effort = request.model_extra.get("reasoning_effort")
@@ -102,6 +104,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
             thinking_config = {"include_thoughts": True}
             
             if is_gemini_3_or_above:
+                # 【防崩溃探针优化】：
                 import google.genai
                 genai_version_str = getattr(google.genai, '__version__', '1.0.0')
                 try:
@@ -121,6 +124,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                     print(f"⚠️ [防崩溃降级机制已激活] 当前 google-genai 运行库版本 ({genai_version_str}) 过低，已自动剥离 thinking_level。请更新依赖并重新构建容器！")
                     
             elif is_gemini_2_5:
+                # 2.5 系列严格使用预算制
                 if reasoning_effort == "low":
                     thinking_config["thinking_budget"] = 1024
                 else:
@@ -202,20 +206,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
                 else:
                     gen_config_dict["tools"] = [search_tool]
 
-            # ================= 新增提取绝对 URL 逻辑 =================
-            host = fastapi_request.headers.get("x-forwarded-host") or fastapi_request.headers.get("host") or "localhost:8050"
-            scheme = fastapi_request.headers.get("x-forwarded-proto") or fastapi_request.url.scheme
-            base_url_str = f"{scheme}://{host}/"
-            # ========================================================
-
-            return await execute_gemini_call(
-                current_client=client_to_use, 
-                model_to_call=base_model_name, 
-                prompt_func=current_prompt_func, 
-                gen_config_dict=gen_config_dict, 
-                request_obj=request,
-                base_url_str=base_url_str # 注入新参数，用于生成图片 Markdown
-            )
+            return await execute_gemini_call(client_to_use, base_model_name, current_prompt_func, gen_config_dict, request)
 
     except Exception as e:
         error_msg = f"Unexpected error in chat_completions endpoint: {str(e)}"
