@@ -1,81 +1,103 @@
 import httpx
 import asyncio
 import json
-from typing import List, Dict, Optional, Any
+from pathlib import Path
+from typing import List, Dict, Optional
 
-import config as app_config 
+import config as app_config
 
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
+_LOCAL_MODELS_FILE = Path(__file__).resolve().parent.parent / "vertexModels.json"
+
+
+def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
+    if not isinstance(data, dict):
+        return None
+
+    models = data.get("models")
+    if isinstance(models, list):
+        return {"models": [str(model) for model in models if isinstance(model, str) and model.strip()]}
+
+    legacy_express_models = data.get("vertex_express_models")
+    if isinstance(legacy_express_models, list):
+        return {"models": [str(model) for model in legacy_express_models if isinstance(model, str) and model.strip()]}
+
+    return None
+
+
+def _load_local_models_config() -> Dict[str, List[str]]:
+    try:
+        data = json.loads(_LOCAL_MODELS_FILE.read_text(encoding="utf-8"))
+        normalized = _normalize_models_config(data)
+        if normalized is not None:
+            print(f"📦 [模型配置] 已使用本地模型配置文件：{_LOCAL_MODELS_FILE.name}。")
+            return normalized
+        print(f"❌ [模型配置] 本地模型配置结构无效：{_LOCAL_MODELS_FILE}。")
+    except Exception as exc:
+        print(f"❌ [模型配置] 读取本地模型配置失败：{exc}")
+    return {"models": []}
+
 
 async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
     if not app_config.MODELS_CONFIG_URL:
-        print("ERROR: MODELS_CONFIG_URL is not set in the environment/config.")
-        return None
+        print("📦 [模型配置] MODELS_CONFIG_URL 未设置，直接使用本地 vertexModels.json。")
+        return _load_local_models_config()
 
-    print(f"Fetching model configuration from: {app_config.MODELS_CONFIG_URL}")
-    
-    client_args = {'timeout': 20.0}
+    print(f"🌐 [模型配置] 正在获取远程模型配置：{app_config.MODELS_CONFIG_URL}")
+
+    client_args = {"timeout": 20.0}
     if app_config.PROXY_URL:
-        client_args['proxy'] = app_config.PROXY_URL
+        client_args["proxy"] = app_config.PROXY_URL
     if app_config.SSL_CERT_FILE:
-        client_args['verify'] = app_config.SSL_CERT_FILE
+        client_args["verify"] = app_config.SSL_CERT_FILE
 
     try:
         async with httpx.AsyncClient(**client_args) as client:
             response = await client.get(app_config.MODELS_CONFIG_URL)
-            response.raise_for_status() 
-            data = response.json()
-            
-            if isinstance(data, dict) and \
-               "vertex_models" in data and isinstance(data["vertex_models"], list) and \
-               "vertex_express_models" in data and isinstance(data["vertex_express_models"], list):
-                print("Successfully fetched and parsed model configuration.")
-                return {
-                    "vertex_models": data["vertex_models"],
-                    "vertex_express_models": data["vertex_express_models"]
-                }
-            else:
-                print(f"ERROR: Fetched model configuration has an invalid structure: {data}")
-                return None
-    except httpx.RequestError as e:
-        print(f"ERROR: HTTP request failed while fetching model configuration: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Failed to decode JSON from model configuration: {e}")
-        return None
-    except Exception as e:
-        print(f"ERROR: An unexpected error occurred while fetching/parsing model configuration: {e}")
-        return None
+            response.raise_for_status()
+            normalized = _normalize_models_config(response.json())
+            if normalized is not None:
+                print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
+                return normalized
+            print("❌ [模型配置] 远程模型配置结构无效，将回退到本地配置。")
+            return _load_local_models_config()
+    except httpx.RequestError as exc:
+        print(f"⚠️ [模型配置] 获取远程模型配置失败，将回退到本地配置。网络错误：{exc}")
+        return _load_local_models_config()
+    except json.JSONDecodeError as exc:
+        print(f"⚠️ [模型配置] 远程模型配置不是有效 JSON，将回退到本地配置。解析错误：{exc}")
+        return _load_local_models_config()
+    except Exception as exc:
+        print(f"⚠️ [模型配置] 加载远程模型配置时出现异常，将回退到本地配置：{exc}")
+        return _load_local_models_config()
+
 
 async def get_models_config() -> Dict[str, List[str]]:
     global _model_cache
     async with _cache_lock:
         if _model_cache is None:
-            print("Model cache is empty. Fetching configuration...")
+            print("📦 [模型配置] 缓存为空，正在初始化模型列表。")
             _model_cache = await fetch_and_parse_models_config()
-            if _model_cache is None: 
-                print("WARNING: Using default empty model configuration due to fetch/parse failure.")
-                _model_cache = {"vertex_models": [], "vertex_express_models": []}
+            if _model_cache is None:
+                print("⚠️ [模型配置] 模型配置初始化失败，当前模型列表为空。")
+                _model_cache = {"models": []}
     return _model_cache
 
-async def get_vertex_models() -> List[str]:
-    config = await get_models_config()
-    return config.get("vertex_models", [])
 
-async def get_vertex_express_models() -> List[str]:
+async def get_express_models() -> List[str]:
     config = await get_models_config()
-    return config.get("vertex_express_models", [])
+    return config.get("models", [])
+
 
 async def refresh_models_config_cache() -> bool:
     global _model_cache
-    print("Attempting to refresh model configuration cache...")
+    print("🔄 [模型配置] 正在刷新模型配置缓存。")
     async with _cache_lock:
         new_config = await fetch_and_parse_models_config()
         if new_config is not None:
             _model_cache = new_config
-            print("Model configuration cache refreshed successfully.")
+            print("✅ [模型配置] 模型配置缓存刷新成功。")
             return True
-        else:
-            print("ERROR: Failed to refresh model configuration cache.")
-            return False
+        print("❌ [模型配置] 模型配置缓存刷新失败。")
+        return False

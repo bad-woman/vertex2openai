@@ -6,12 +6,10 @@ import httpx
 import re
 import random 
 import base64
-from typing import List, Dict, Any, Callable, Union, Optional
+from typing import List, Dict, Any, Callable, Optional
 
 from fastapi.responses import JSONResponse, StreamingResponse
-from google.auth.transport.requests import Request as AuthRequest
 from google.genai import types
-from openai import AsyncOpenAI 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from models import OpenAIRequest, OpenAIMessage
@@ -146,7 +144,7 @@ def log_retry_attempt(retry_state):
     attempt = retry_state.attempt_number
     e = retry_state.outcome.exception()
     stats.add_retry() # 核心：自动退避重试精准计入大盘
-    print(f"⚠️ [API 自动重试] 遇到上游短暂拥堵或频率超限 ({e.__class__.__name__})。正在进行第 {attempt} 次退避重试...")
+    print(f"⚠️ [自动重试] 上游暂时繁忙或触发 Express Mode 配额限制（{e.__class__.__name__}）。正在进行第 {attempt} 次退避重试。")
 
 @retry(
     stop=stop_after_attempt(20),
@@ -278,7 +276,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                     if parsed_ar in allowed_set:
                         target_ar = parsed_ar
                     else:
-                        print(f"WARNING: Model {request.model} does not support '{parsed_ar}'. Auto-decide triggered.")
+                        print(f"⚠️ [生图配置] 模型 {request.model} 不支持比例 {parsed_ar}，已交由 Gemini 自动选择比例。")
                         target_ar = None
                 break
                 
@@ -513,8 +511,7 @@ async def gemini_fake_stream_generator(
     request_obj: OpenAIRequest,
     is_auto_attempt: bool
 ):
-    model_name_for_log = getattr(gemini_client_instance, "model_name", "unknown_gemini_model_object")
-    print(f"FAKE STREAMING (Gemini): Prep for '{request_obj.model}' (API model string: '{model_for_api_call}', client obj: '{model_name_for_log}')")
+    print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
     
     api_call_task = asyncio.create_task(
         execute_with_retry(
@@ -559,12 +556,12 @@ async def gemini_fake_stream_generator(
             yield chunk_sse
 
     except asyncio.CancelledError:
-        print(f"INFO: Client disconnected during Fake Stream (Gemini: {request_obj.model}). Cleaning up.")
+        print(f"ℹ️ [客户端断开] 假流式响应期间客户端已断开，正在清理模型 {request_obj.model} 的后台任务。")
         if "api_call_task" in locals() and not api_call_task.done():
             api_call_task.cancel()
         raise
     except Exception as e_outer_gemini:
-        err_msg_detail = f"Error in gemini_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
+        err_msg_detail = f"Gemini 假流式生成器异常（模型：{request_obj.model}）：{type(e_outer_gemini).__name__} - {str(e_outer_gemini)}"
         print(f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
         sse_err_msg_display = str(e_outer_gemini)
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
@@ -575,85 +572,6 @@ async def gemini_fake_stream_generator(
             yield "data: [DONE]\n\n"
         if is_auto_attempt: raise
             
-async def openai_fake_stream_generator( 
-    openai_client: Union[AsyncOpenAI, Any], 
-    openai_params: Dict[str, Any],
-    openai_extra_body: Dict[str, Any],
-    request_obj: OpenAIRequest,
-    is_auto_attempt: bool
-):
-    api_model_name = openai_params.get("model", "unknown-openai-model")
-    print(f"FAKE STREAMING (OpenAI Direct): Prep for '{request_obj.model}' (API model: '{api_model_name}')")
-    response_id = f"chatcmpl-openaidirectfake-{int(time.time())}"
-    
-    async def _openai_api_call_task():
-        params_for_call = openai_params.copy()
-        params_for_call["stream"] = False 
-        return await execute_with_retry(
-            openai_client.chat.completions.create,
-            **params_for_call, extra_body=openai_extra_body
-        )
-    api_call_task = asyncio.create_task(_openai_api_call_task())
-    outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
-    if outer_keep_alive_interval > 0:
-        while not api_call_task.done():
-            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
-            yield f"data: {json.dumps(keep_alive_data)}\n\n"
-            await asyncio.sleep(outer_keep_alive_interval)
-
-    try:
-        raw_response_obj = await api_call_task 
-        openai_response_dict = raw_response_obj.model_dump(exclude_unset=True, exclude_none=True)
-
-        if app_config.SAFETY_SCORE and hasattr(raw_response_obj, "choices") and raw_response_obj.choices:
-            for i, choice_obj in enumerate(raw_response_obj.choices):
-                if hasattr(choice_obj, "safety_ratings") and choice_obj.safety_ratings:
-                    safety_html = _create_safety_ratings_html(choice_obj.safety_ratings)
-                    if i < len(openai_response_dict.get("choices", [])):
-                        choice_dict = openai_response_dict["choices"][i]
-                        message_dict = choice_dict.get("message")
-                        if message_dict:
-                            current_content = message_dict.get("content") or ""
-                            message_dict["content"] = current_content + safety_html
-
-        if openai_response_dict.get("choices") and \
-           isinstance(openai_response_dict["choices"], list) and \
-           len(openai_response_dict["choices"]) > 0:
-            
-            first_choice_dict_item = openai_response_dict["choices"][0]
-            if first_choice_dict_item and isinstance(first_choice_dict_item, dict) :
-                choice_message_ref = first_choice_dict_item.get("message", {})
-                original_content = choice_message_ref.get("content")
-                if isinstance(original_content, str):
-                    reasoning_text, actual_content = extract_reasoning_by_tags(original_content, VERTEX_REASONING_TAG)
-                    choice_message_ref["content"] = actual_content
-                    if reasoning_text:
-                        choice_message_ref["reasoning_content"] = reasoning_text
-        
-        async for chunk_sse in _chunk_openai_response_dict_for_sse(
-            openai_response_dict=openai_response_dict,
-            response_id_override=response_id, 
-            model_name_override=request_obj.model
-        ):
-            yield chunk_sse
-            
-    except asyncio.CancelledError:
-        print(f"INFO: Client disconnected during Fake Stream (OpenAI: {request_obj.model}). Cleaning up.")
-        if "api_call_task" in locals() and not api_call_task.done():
-            api_call_task.cancel()
-        raise
-    except Exception as e_outer: 
-        err_msg_detail = f"Error in openai_fake_stream_generator (model: '{request_obj.model}'): {type(e_outer).__name__} - {str(e_outer)}"
-        print(f"❌ [API 错误响应] OpenAI 直连假流运行错误 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
-        sse_err_msg_display = str(e_outer)
-        if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
-        err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
-        json_payload_error = json.dumps(err_resp_sse)
-        if not is_auto_attempt:
-            yield f"data: {json_payload_error}\n\n"
-            yield "data: [DONE]\n\n"
-        if is_auto_attempt: raise
-
 async def execute_gemini_call(
     current_client: Any, 
     model_to_call: str,  
@@ -664,14 +582,14 @@ async def execute_gemini_call(
 ):
     actual_prompt_for_call = prompt_func(request_obj.messages)
     client_model_name_for_log = getattr(current_client, "model_name", "unknown_direct_client_object")
-    print(f"INFO: execute_gemini_call for requested API model '{model_to_call}', using client object with internal name '{client_model_name_for_log}'. Original request model: '{request_obj.model}'")
+    print(f"🚀 [上游请求] 正在调用 Gemini Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
     
     if request_obj.stream:
         is_image_request = "image" in request_obj.model.lower()
         
         if app_config.FAKE_STREAMING_ENABLED or is_image_request:
             if is_image_request:
-                 print("INFO: 触发生图保护机制 —— 已强制切换为假流式输出以避开 Google 报错限制！")
+                 print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
@@ -708,7 +626,7 @@ async def execute_gemini_call(
                         break 
                         
                     except asyncio.CancelledError:
-                        print(f"INFO: Client disconnected during Real Stream ({model_to_call}). Clean abort.")
+                        print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
                         error_str = str(e_stream_call).lower()
@@ -722,11 +640,11 @@ async def execute_gemini_call(
                             round_num = (attempt // 4) + 1
                             wait_time = 2 ** wave_index
                             stats.add_retry() # 核心：手动重试计入大盘
-                            print(f"⚠️ [API 自动重试] 遭遇 SDK 限制或算力瓶颈(Gemini SDK Stream)。正在激活第 {round_num} 轮/第 {wave_index + 1} 次退避，等待 {wait_time}s 后重试...")
+                            print(f"⚠️ [自动重试] Gemini Express Mode 流式请求返回 429/503 或配额繁忙。第 {round_num} 轮第 {wave_index + 1} 次重试，等待 {wait_time} 秒。")
                             await asyncio.sleep(wait_time)
                             continue 
                             
-                        err_msg_detail_stream = f"Streaming Error (Gemini API, model string: '{model_to_call}'): {type(e_stream_call).__name__} - {str(e_stream_call)}"
+                        err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
                         err_resp = create_openai_error_response(500,s_err,"server_error")
@@ -748,14 +666,14 @@ async def execute_gemini_call(
         if hasattr(response_obj_call, "prompt_feedback") and \
            hasattr(response_obj_call.prompt_feedback, "block_reason") and \
            response_obj_call.prompt_feedback.block_reason:
-            block_msg = f"Blocked (Gemini): {response_obj_call.prompt_feedback.block_reason}"
+            block_msg = f"Gemini 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
             if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
                response_obj_call.prompt_feedback.block_reason_message: 
-                block_msg+=f" ({response_obj_call.prompt_feedback.block_reason_message})"
+                block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
             raise ValueError(block_msg)
         
         if not is_gemini_response_valid(response_obj_call):
-            error_details = f"Invalid non-streaming Gemini response for model string '{model_to_call}'. "
+            error_details = f"Gemini 非流式响应无有效内容，模型：{model_to_call}。"
             if hasattr(response_obj_call, "candidates"):
                 error_details += f"Candidates: {len(response_obj_call.candidates) if response_obj_call.candidates else 0}. "
                 if response_obj_call.candidates and len(response_obj_call.candidates) > 0:

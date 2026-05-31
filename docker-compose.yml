@@ -5,17 +5,15 @@ services:
     image: ghcr.io/gzzhongqi/vertex2openai:latest
     container_name: vertex2openai
     ports:
-      # Map host port 8050 to container port 7860 (for Hugging Face compatibility)
       - "8050:7860"
-    volumes:
-      - ./credentials:/app/credentials
     environment:
-      # Directory where credential files are stored (used by credential manager)
-      - CREDENTIALS_DIR=/app/credentials
-      # API key for authentication (default: 123456)
+      # Protect this adapter's OpenAI-compatible API.
       - API_KEY=123456
-      # Enable/disable fake streaming (default: false)
+      # Required: one or more Gemini Express Mode API keys, separated by commas.
+      - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
+      # Optional: set true to rotate Express keys in order instead of random selection.
+      - ROUNDROBIN=false
+      # Optional: fake streaming keeps client connections alive while waiting for non-streaming Gemini responses.
       - FAKE_STREAMING=false
-      # Interval for fake streaming keep-alive messages (default: 1.0)
       - FAKE_STREAMING_INTERVAL=1.0
     restart: unless-stopped

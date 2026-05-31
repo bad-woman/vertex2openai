@@ -1,7 +1,7 @@
 from fastapi import HTTPException, Header, Depends
 from fastapi.security import APIKeyHeader
 from typing import Optional
-from config import API_KEY, HUGGINGFACE_API_KEY, HUGGINGFACE # Import API_KEY, HUGGINGFACE_API_KEY, HUGGINGFACE
+from config import API_KEY, HUGGINGFACE_API_KEY, HUGGINGFACE
 import os
 import json
 import base64
@@ -45,13 +45,13 @@ async def get_api_key(
             payload = json.loads(decoded_payload_bytes.decode('utf-8'))
         except ValueError as ve:
             # Log server-side for debugging, but return a generic client error
-            print(f"ValueError processing x-ip-token: {ve}")
+            print(f"❌ [鉴权失败] 解析 Hugging Face x-ip-token 时格式无效：{ve}")
             raise HTTPException(status_code=400, detail=f"Invalid JWT format in x-ip-token: {str(ve)}")
         except (json.JSONDecodeError, base64.binascii.Error, UnicodeDecodeError) as e:
-            print(f"Error decoding/parsing x-ip-token payload: {e}")
+            print(f"❌ [鉴权失败] 解码 Hugging Face x-ip-token 载荷失败：{e}")
             raise HTTPException(status_code=400, detail=f"Malformed x-ip-token payload: {str(e)}")
         except Exception as e: # Catch any other unexpected errors during token processing
-            print(f"Unexpected error processing x-ip-token: {e}")
+            print(f"❌ [鉴权异常] 处理 Hugging Face x-ip-token 时发生未预期异常：{e}")
             raise HTTPException(status_code=500, detail="Internal error processing x-ip-token.")
 
         error_in_token = payload.get("error")
@@ -63,7 +63,7 @@ async def get_api_key(
             )
         elif error_in_token is None:  # JSON 'null' is Python's None
             # If error is null, auth is successful. Now check if HUGGINGFACE_API_KEY is configured.
-            print(f"HuggingFace authentication successful via x-ip-token (error field was null).")
+            print("✅ [鉴权成功] Hugging Face x-ip-token 校验通过。")
             return HUGGINGFACE_API_KEY # Return the configured HUGGINGFACE_API_KEY
         else:
             # Any other non-null, non-"InvalidAccessToken" value in 'error' field

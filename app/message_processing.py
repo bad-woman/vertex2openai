@@ -57,7 +57,7 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
                 
             return opt_data, "image/jpeg"
     except Exception as e:
-        print(f"警告: 输入图片极致压缩失败，已回退为原图传输: {e}")
+        print(f"⚠️ [图片处理] 输入图片压缩失败，已回退为原图传输：{e}")
         return image_data, original_mime
 
 SUPPORTED_ROLES = ["user", "model", "function"] 
@@ -92,14 +92,14 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
                 start, end = match.span()
                 remaining_text = remaining_text[:start] + remaining_text[end:]
             except Exception as e:
-                print(f"Error extracting markdown image: {e}")
+                print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
         parts.reverse()
     
     remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
     return parts, remaining_text
 
 def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
-    print("Converting OpenAI messages to Gemini format...")
+    print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     raw_gemini_messages = []
     for idx, message in enumerate(messages):
         role = message.role
@@ -148,7 +148,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                             part_kwargs["thought_signature"] = thought_sig_bytes
                         resp_part = types.Part(**part_kwargs)
                     except Exception as e:
-                        print(f"Warning: Failed to inject FunctionResponse signature: {e}")
+                        print(f"⚠️ [工具调用] 注入 FunctionResponse 思考签名失败，将继续处理：{e}")
                         resp_part = types.Part.from_function_response(name=message.name, response=tool_output_data)
 
                     parts.append(resp_part)
@@ -190,7 +190,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                             part_kwargs["thought_signature"] = thought_sig_bytes
                         fc_part = types.Part(**part_kwargs)
                     except Exception as e:
-                        print(f"Warning: Failed to inject FunctionCall signature: {e}")
+                        print(f"⚠️ [工具调用] 注入 FunctionCall 思考签名失败，将继续处理：{e}")
                         fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
                         
                     parts.append(fc_part)
@@ -249,7 +249,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                                         opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
                                         parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
                                 except Exception as e:
-                                    print(f"Warning: Failed to fetch remote image {image_url}: {e}")
+                                    print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{image_url}，原因：{e}")
 
                     elif hasattr(part_item, "type") and getattr(part_item, "type") == "image_url":
                         img_url_data = part_item.image_url
@@ -280,7 +280,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                                     opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
                                     parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
                             except Exception as e:
-                                print(f"Warning: Failed to fetch remote image {url_str}: {e}")
+                                print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url_str}，原因：{e}")
                                 
                     elif hasattr(part_item, "text"):
                         parts.append(types.Part.from_text(text=part_item.text))
@@ -342,7 +342,7 @@ def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
         data_url = f"data:{mime_type};base64,{b64_data}"
         return f"![Image]({data_url})"
     except Exception as e:
-        print(f"Error converting image to markdown: {e}")
+        print(f"⚠️ [图片处理] 将 Gemini 图片转换为 Markdown 失败：{e}")
         return "[Image could not be displayed]"
 
 def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: Any) -> Tuple[str, str]:

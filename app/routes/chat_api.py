@@ -1,10 +1,6 @@
-import asyncio
-import json
 import re
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-
-from google.genai import types
+from fastapi.responses import JSONResponse
 from google import genai
 
 from models import OpenAIRequest
@@ -15,200 +11,159 @@ from api_helpers import (
     create_openai_error_response,
     execute_gemini_call,
 )
-from openai_handler import OpenAIDirectHandler
-from project_id_discovery import discover_project_id
-from vertex_ai_init import get_http_options
+from http_options import get_http_options
 
 router = APIRouter()
+
+LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
+LEGACY_PAY_PREFIX = "[PAY]"
+OPENAI_DIRECT_SUFFIX = "-openai"
+OPENAI_SEARCH_SUFFIX = "-openaisearch"
+
+
+def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
+    base_model_name = model_name
+
+    if base_model_name.startswith(LEGACY_EXPRESS_PREFIX):
+        base_model_name = base_model_name[len(LEGACY_EXPRESS_PREFIX):]
+
+    if base_model_name.startswith(LEGACY_PAY_PREFIX):
+        return base_model_name, False, "当前版本已经移除 Pay/Service Account 模式，请改用 Express Mode 模型名称。"
+
+    if base_model_name.endswith(OPENAI_SEARCH_SUFFIX) or base_model_name.endswith(OPENAI_DIRECT_SUFFIX):
+        return base_model_name, False, "当前版本已经移除 -openai/-openaisearch 直连上游路径，请直接使用普通模型名或 -search 模型名。"
+
+    is_grounded_search = base_model_name.endswith("-search")
+    if is_grounded_search:
+        base_model_name = base_model_name[:-len("-search")]
+
+    return base_model_name, is_grounded_search, None
+
+
+def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool) -> dict | None:
+    if is_image_model:
+        return None
+
+    is_thinking_capable = False
+    is_gemini_2_5 = False
+    is_gemini_3_or_above = False
+
+    version_match = re.search(r"gemini-(\d+)\.(\d+)|gemini-(\d+)", base_model_name.lower())
+    if version_match:
+        groups = version_match.groups()
+        major = 0
+        minor_val = 0.0
+
+        if groups[2]:
+            major = int(groups[2])
+        elif groups[0] and groups[1]:
+            major = int(groups[0])
+            try:
+                minor_val = float(groups[1])
+            except ValueError:
+                pass
+
+        if major > 2 or (major == 2 and minor_val >= 5.0):
+            is_thinking_capable = True
+        if major == 2 and minor_val == 5.0:
+            is_gemini_2_5 = True
+        elif major >= 3:
+            is_gemini_3_or_above = True
+
+    if not is_thinking_capable:
+        return None
+
+    reasoning_effort = getattr(request, "reasoning_effort", None)
+    if not reasoning_effort and hasattr(request, "model_extra") and request.model_extra:
+        reasoning_effort = request.model_extra.get("reasoning_effort")
+
+    thinking_config = {"include_thoughts": True}
+
+    if is_gemini_3_or_above:
+        import google.genai
+        genai_version_str = getattr(google.genai, "__version__", "1.0.0")
+        try:
+            parts = genai_version_str.split(".")
+            sdk_supports_level = (int(parts[0]) >= 2) or (int(parts[0]) == 1 and int(parts[1]) >= 51)
+        except Exception:
+            sdk_supports_level = False
+
+        if sdk_supports_level:
+            if reasoning_effort == "low":
+                thinking_config["thinking_level"] = "low"
+            elif reasoning_effort == "medium":
+                thinking_config["thinking_level"] = "medium"
+            else:
+                thinking_config["thinking_level"] = "high"
+        else:
+            print(f"⚠️ [推理配置] 当前 google-genai 版本 {genai_version_str} 不支持 thinking_level，已自动跳过该参数。")
+    elif is_gemini_2_5:
+        if reasoning_effort == "low":
+            thinking_config["thinking_budget"] = 1024
+        else:
+            thinking_config["thinking_budget"] = -1
+
+    return thinking_config
+
 
 @router.post("/v1/chat/completions")
 async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api_key: str = Depends(get_api_key)):
     try:
-        credential_manager_instance = fastapi_request.app.state.credential_manager
         express_key_manager_instance = fastapi_request.app.state.express_key_manager
-        
-        OPENAI_DIRECT_SUFFIX = "-openai"
-        OPENAI_SEARCH_SUFFIX = "-openaisearch"
-        EXPERIMENTAL_MARKER = "-exp-"
-        PAY_PREFIX = "[PAY]"
-        EXPRESS_PREFIX = "[EXPRESS] " 
-        
-        base_model_name = request.model 
-        
-        is_express_model_request = False
-        if base_model_name.startswith(EXPRESS_PREFIX):
-            is_express_model_request = True
-            base_model_name = base_model_name[len(EXPRESS_PREFIX):]
 
-        if base_model_name.startswith(PAY_PREFIX):
-            base_model_name = base_model_name[len(PAY_PREFIX):]
+        base_model_name, is_grounded_search, model_error = _normalize_model_name(request.model)
+        if model_error:
+            print(f"❌ [模型名称] {model_error} 收到的模型名：{request.model}")
+            return JSONResponse(
+                status_code=400,
+                content=create_openai_error_response(400, model_error, "invalid_request_error"),
+            )
 
-        is_openai_direct_model = False
-        is_openai_search_model = False
-        
-        if base_model_name.endswith(OPENAI_SEARCH_SUFFIX):
-            is_openai_search_model = True
-            is_openai_direct_model = True
-            base_model_name = base_model_name[:-len(OPENAI_SEARCH_SUFFIX)]
-        elif base_model_name.endswith(OPENAI_DIRECT_SUFFIX):
-            is_openai_direct_model = True
-            base_model_name = base_model_name[:-len(OPENAI_DIRECT_SUFFIX)]
-            
-        if EXPERIMENTAL_MARKER in base_model_name:
-            is_openai_direct_model = True
+        if express_key_manager_instance.get_total_keys() == 0:
+            error_msg = "未配置 VERTEX_EXPRESS_API_KEY，无法调用 Gemini Express Mode。"
+            print(f"❌ [密钥配置] {error_msg}")
+            return JSONResponse(
+                status_code=401,
+                content=create_openai_error_response(401, error_msg, "authentication_error"),
+            )
 
-        is_grounded_search = base_model_name.endswith("-search")
-        if is_grounded_search: base_model_name = base_model_name[:-len("-search")]
+        key_tuple = express_key_manager_instance.get_express_api_key()
+        if not key_tuple:
+            error_msg = "没有可用的 Express API Key。"
+            print(f"❌ [密钥配置] {error_msg}")
+            return JSONResponse(
+                status_code=401,
+                content=create_openai_error_response(401, error_msg, "authentication_error"),
+            )
+
+        _, express_api_key = key_tuple
+        client_to_use = genai.Client(
+            vertexai=True,
+            api_key=express_api_key,
+            http_options=get_http_options(),
+        )
+        print(f"🌐 [上游端点] 使用官方 Gemini Express Mode SDK 调用模型 {base_model_name}，不拼接 project/location。")
 
         is_image_model = "image" in request.model.lower()
-        if is_image_model:
-            is_openai_direct_model = False
-            
         gen_config_dict = create_generation_config(request)
-
-        # =============== 🧠 更加鲁棒的、面向未来的推理模型检测与代系提取 ===============
-        is_thinking_capable = False
-        is_gemini_2_5 = False
-        is_gemini_3_or_above = False
-        
-        version_match = re.search(r'gemini-(\d+)\.(\d+)|gemini-(\d+)', base_model_name.lower())
-        if version_match:
-            groups = version_match.groups()
-            major = 0
-            minor_val = 0.0
-            
-            if groups[2]:
-                major = int(groups[2])
-            elif groups[0] and groups[1]:
-                major = int(groups[0])
-                try:
-                    minor_val = float(groups[1])
-                except ValueError:
-                    pass
-            
-            if major > 2 or (major == 2 and minor_val >= 5.0):
-                is_thinking_capable = True
-                
-            if major == 2 and minor_val == 5.0:
-                is_gemini_2_5 = True
-            elif major >= 3:
-                is_gemini_3_or_above = True
-        # ==============================================================================================
-
-        # 提取客户端可能传入的推理强度参数
-        reasoning_effort = getattr(request, "reasoning_effort", None)
-        if not reasoning_effort and hasattr(request, "model_extra") and request.model_extra:
-            reasoning_effort = request.model_extra.get("reasoning_effort")
-
-        if is_thinking_capable and not is_image_model:
-            thinking_config = {"include_thoughts": True}
-            
-            if is_gemini_3_or_above:
-                # 【防崩溃探针优化】：
-                import google.genai
-                genai_version_str = getattr(google.genai, '__version__', '1.0.0')
-                try:
-                    parts = genai_version_str.split('.')
-                    sdk_supports_level = (int(parts[0]) >= 2) or (int(parts[0]) == 1 and int(parts[1]) >= 51)
-                except Exception:
-                    sdk_supports_level = False
-
-                if sdk_supports_level:
-                    if reasoning_effort == "low":
-                        thinking_config["thinking_level"] = "low"
-                    elif reasoning_effort == "medium":
-                        thinking_config["thinking_level"] = "medium"
-                    else:
-                        thinking_config["thinking_level"] = "high"
-                else:
-                    print(f"⚠️ [防崩溃降级机制已激活] 当前 google-genai 运行库版本 ({genai_version_str}) 过低，已自动剥离 thinking_level。请更新依赖并重新构建容器！")
-                    
-            elif is_gemini_2_5:
-                # 2.5 系列严格使用预算制
-                if reasoning_effort == "low":
-                    thinking_config["thinking_budget"] = 1024
-                else:
-                    thinking_config["thinking_budget"] = -1
-            
+        thinking_config = _build_thinking_config(base_model_name, request, is_image_model)
+        if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
-        client_to_use = None
-
-        if is_express_model_request:
-            if express_key_manager_instance.get_total_keys() == 0:
-                error_msg = f"Model '{request.model}' requires an Express API key, but none are configured."
-                return JSONResponse(status_code=401, content=create_openai_error_response(401, error_msg, "authentication_error"))
-
-            total_keys = express_key_manager_instance.get_total_keys()
-            for attempt in range(total_keys):
-                key_tuple = express_key_manager_instance.get_express_api_key()
-                if key_tuple:
-                    original_idx, key_val = key_tuple
-                    try:
-                        if "gemini-2.5-pro" in base_model_name or "gemini-2.5-flash" in base_model_name:
-                            project_id = await discover_project_id(key_val)
-                            base_url = f"https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global"
-                            client_to_use = genai.Client(
-                                vertexai=True,
-                                api_key=key_val,
-                                http_options=get_http_options(base_url=base_url)
-                            )
-                            client_to_use._api_client._http_options.api_version = None
-                        else:
-                            client_to_use = genai.Client(
-                                vertexai=True, 
-                                api_key=key_val, 
-                                http_options=get_http_options()
-                            )
-                        break 
-                    except Exception as e:
-                        client_to_use = None 
-                else:
-                    client_to_use = None
-
-            if client_to_use is None: 
-                return JSONResponse(status_code=500, content=create_openai_error_response(500, "All configured Express API keys failed.", "server_error"))
-        
-        else: 
-            rotated_credentials, rotated_project_id = credential_manager_instance.get_credentials()
-            
-            if rotated_credentials and rotated_project_id:
-                try:
-                    client_to_use = genai.Client(
-                        vertexai=True, 
-                        credentials=rotated_credentials, 
-                        project=rotated_project_id, 
-                        location="global",
-                        http_options=get_http_options()
-                    )
-                except Exception as e:
-                    return JSONResponse(status_code=500, content=create_openai_error_response(500, str(e), "server_error"))
-            else: 
-                return JSONResponse(status_code=401, content=create_openai_error_response(401, "No SA credentials available.", "authentication_error"))
-
-        if not is_openai_direct_model and client_to_use is None:
-            return JSONResponse(status_code=500, content=create_openai_error_response(500, "Critical internal server error: Gemini client not initialized.", "server_error"))
-
-        if is_openai_direct_model:
-            if is_express_model_request:
-                openai_handler = OpenAIDirectHandler(express_key_manager=express_key_manager_instance)
-                return await openai_handler.process_request(request, base_model_name, is_express=True, is_openai_search=is_openai_search_model)
+        if is_grounded_search and not is_image_model:
+            search_tool = {"google_search": {}}
+            if "tools" in gen_config_dict and isinstance(gen_config_dict["tools"], list):
+                gen_config_dict["tools"].append(search_tool)
             else:
-                openai_handler = OpenAIDirectHandler(credential_manager=credential_manager_instance)
-                return await openai_handler.process_request(request, base_model_name, is_openai_search=is_openai_search_model)
-        else: 
-            current_prompt_func = create_gemini_prompt
+                gen_config_dict["tools"] = [search_tool]
+            print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
 
-            if is_grounded_search and not is_image_model:
-                search_tool = {"google_search": {}}
-                if "tools" in gen_config_dict and isinstance(gen_config_dict["tools"], list):
-                    gen_config_dict["tools"].append(search_tool)
-                else:
-                    gen_config_dict["tools"] = [search_tool]
+        return await execute_gemini_call(client_to_use, base_model_name, create_gemini_prompt, gen_config_dict, request)
 
-            return await execute_gemini_call(client_to_use, base_model_name, current_prompt_func, gen_config_dict, request)
-
-    except Exception as e:
-        error_msg = f"Unexpected error in chat_completions endpoint: {str(e)}"
-        print(error_msg)
-        return JSONResponse(status_code=500, content=create_openai_error_response(500, error_msg, "server_error"))
+    except Exception as exc:
+        error_msg = f"处理 /v1/chat/completions 请求时发生未预期异常：{exc}"
+        print(f"❌ [服务异常] {error_msg}")
+        return JSONResponse(
+            status_code=500,
+            content=create_openai_error_response(500, error_msg, "server_error"),
+        )

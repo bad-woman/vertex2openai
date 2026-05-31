@@ -1,162 +1,201 @@
 ---
-title: OpenAI to Gemini Adapter
-emoji: 🔄☁️
+title: Vertex2OpenAI Express Adapter
+emoji: 🔄
 colorFrom: blue
 colorTo: green
 sdk: docker
-app_port: 7860 # Default Port exposed by Dockerfile, used by Hugging Face Spaces
+app_port: 7860
 ---
 
-# OpenAI to Gemini Adapter
+# Vertex2OpenAI Express Adapter
 
-This service acts as a compatibility layer, providing an OpenAI-compatible API interface that translates requests to Google's Vertex AI Gemini models. This allows you to leverage the power of Gemini models (including Gemini 1.5 Pro and Flash) using tools and applications originally built for the OpenAI API.
+Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风格的 `/v1/chat/completions` 和 `/v1/models` 接口，对内只调用 **Google Agent Platform / Vertex AI Express Mode 的 Gemini API**。
 
-The codebase is designed with modularity and maintainability in mind, located primarily within the [`app/`](app/) directory.
+> 当前版本已经重构为 **Express Mode 专用模式**：不再包含 Pay / Service Account / 标准 Vertex AI 项目模式，也不再维护 `-openai`、`-openaisearch` 这类上游 OpenAI-compatible endpoint 路径。
 
-## Key Features
+## 为什么改为 Express Mode 专用
 
--   **OpenAI-Compatible Endpoints:** Provides standard [`/v1/chat/completions`](app/routes/chat_api.py:0) and [`/v1/models`](app/routes/models_api.py:0) endpoints.
--   **Broad Model Support:** Seamlessly translates requests for various Gemini models (e.g., `gemini-1.5-pro-latest`, `gemini-1.5-flash-latest`). Check the [`/v1/models`](app/routes/models_api.py:0) endpoint for currently available models based on your Vertex AI Project.
--   **Multiple Credential Management Methods:**
-    -   **Vertex AI Express API Key:** Use a specific [`VERTEX_EXPRESS_API_KEY`](app/config.py:0) for simplified authentication with eligible models.
-    -   **Google Cloud Service Accounts:**
-        -   Provide the JSON key content directly via the [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) environment variable.
-        -   Place multiple service account `.json` files in a designated directory ([`CREDENTIALS_DIR`](app/config.py:0)).
--   **Smart Credential Selection:**
-    -   Uses the `ExpressKeyManager` for dedicated Vertex AI Express API key handling.
-    -   Employs `CredentialManager` for robust service account management.
-    -   Supports **round-robin rotation** ([`ROUNDROBIN=true`](app/config.py:0)) when multiple service account credentials are provided (either via [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) or [`CREDENTIALS_DIR`](app/config.py:0)), distributing requests across credentials.
--   **Streaming & Non-Streaming:** Handles both response types correctly.
--   **OpenAI Direct Mode Enhancements:** Includes tag-based extraction for reasoning/tool use information when interacting directly with certain OpenAI models (if configured).
--   **Dockerized:** Ready for deployment via Docker Compose locally or on platforms like Hugging Face Spaces.
--   **Centralized Configuration:** Environment variables managed via [`app/config.py`](app/config.py).
+Express Mode 官方调用方式使用 API Key，并且不需要在请求里拼接 `project` 或 `location`。本项目现在统一通过 `google-genai` SDK 初始化：
 
-## Hugging Face Spaces Deployment (Recommended)
-
-1.  **Create a Space:** On Hugging Face Spaces, create a new "Docker" SDK Space.
-2.  **Upload Files:** Add all project files ([`app/`](app/) directory, [`.gitignore`](.gitignore), [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`requirements.txt`](app/requirements.txt), etc.) to the repository.
-3.  **Configure Secrets:** In Space settings -> Secrets, add:
-    *   `API_KEY`: Your desired API key to protect this adapter service (required).
-    *   *Choose one credential method:*
-        *   `GOOGLE_CREDENTIALS_JSON`: The **full content** of your Google Cloud service account JSON key file(s). Separate multiple keys with commas if providing more than one within this variable.
-        *   Or provide individual files if your deployment setup supports mounting volumes (less common on standard HF Spaces).
-    *   `VERTEX_EXPRESS_API_KEY` (Optional): Add your Vertex AI Express API key if you plan to use Express Mode.
-    *   `ROUNDROBIN` (Optional): Set to `true` to enable round-robin rotation for service account credentials.
-    *   Other variables from the "Key Environment Variables" section can be set here to override defaults.
-4.  **Deploy:** Hugging Face automatically builds and deploys the container, exposing port 7860.
-
-## Local Docker Setup
-
-### Prerequisites
-
--   Docker and Docker Compose
--   Google Cloud Project with Vertex AI enabled.
--   Credentials: Either a Vertex AI Express API Key or one or more Service Account key files.
-
-### Credential Setup (Local)
-
-Manage environment variables using a [`.env`](.env) file in the project root (ignored by git) or within your [`docker-compose.yml`](docker-compose.yml).
-
-1.  **Method 1: Vertex Express API Key**
-    *   Set the [`VERTEX_EXPRESS_API_KEY`](app/config.py:0) environment variable.
-2.  **Method 2: Service Account JSON Content**
-    *   Set [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) to the full JSON content of your service account key(s). For multiple keys, separate the JSON objects with a comma (e.g., `{...},{...}`).
-3.  **Method 3: Service Account Files in Directory**
-    *   Ensure [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) is *not* set.
-    *   Create a directory (e.g., `mkdir credentials`).
-    *   Place your service account `.json` key files inside this directory.
-    *   Mount this directory to `/app/credentials` in the container (as shown in the default [`docker-compose.yml`](docker-compose.yml)). The service will use files found in the directory specified by [`CREDENTIALS_DIR`](app/config.py:0) (defaults to `/app/credentials`).
-
-### Environment Variables (`.env` file example)
-
-```env
-API_KEY="your_secure_api_key_here" # REQUIRED: Set a strong key for security
-
-# --- Choose *ONE* primary credential method ---
-# VERTEX_EXPRESS_API_KEY="your_vertex_express_key"          # Option 1: Express Key
-# GOOGLE_CREDENTIALS_JSON='{"type": ...}{"type": ...}' # Option 2: JSON content (comma-separate multiple keys)
-# CREDENTIALS_DIR="/app/credentials"                      # Option 3: Directory path (Default if GOOGLE_CREDENTIALS_JSON is unset, ensure volume mount in docker-compose)
-# ---
-
-# --- Optional Settings ---
-# ROUNDROBIN="true"              # Enable round-robin for Service Accounts (Method 2 or 3)
-# FAKE_STREAMING="false"         # For debugging - simulate streaming
-# FAKE_STREAMING_INTERVAL="1.0"  # Interval for fake streaming keep-alives
-# GCP_PROJECT_ID="your-gcp-project-id" # Explicitly set GCP Project ID if needed
-# GCP_LOCATION="us-central1"          # Explicitly set GCP Location if needed
+```python
+client = genai.Client(vertexai=True, api_key=VERTEX_EXPRESS_API_KEY)
 ```
 
-### Running Locally
+这样可以避免旧实现中为了兼容不同路径而手动发现 project、拼接 `locations/global` 或 `/endpoints/openapi` 所带来的复杂度。
+
+## 功能特性
+
+- **OpenAI 兼容接口**
+  - `GET /v1/models`
+  - `POST /v1/chat/completions`
+- **Express Mode 专用鉴权**
+  - 通过 `VERTEX_EXPRESS_API_KEY` 调用 Gemini Express Mode。
+  - 支持配置多个 Express API Key，用英文逗号分隔。
+  - 支持随机选择或轮询选择 API Key。
+- **Gemini 原有能力保留**
+  - 普通文本对话。
+  - 流式和非流式响应。
+  - OpenAI tools / function calling 到 Gemini function calling 的转换。
+  - Google Search 增强模型别名：`模型名-search`。
+  - Gemini 2.5 / 3.x 推理配置适配。
+  - 生图模型配置，包括图片输入压缩、比例解析、`image_config`、图片输出 Markdown data URL 转换。
+  - 429 / 503 / 502 / quota / resource exhausted 自动退避重试。
+- **中文运行日志**
+  - 密钥选择、模型配置、上游调用、重试、错误、Token 统计等信息均使用中文说明。
+
+## 已移除内容
+
+以下内容已在本版本移除：
+
+- `[PAY]` 模型前缀和 Pay / Service Account 调用路径。
+- `GOOGLE_CREDENTIALS_JSON`、`CREDENTIALS_DIR` 等 Service Account 配置。
+- 自动发现 Project ID 的 hack 逻辑。
+- `-openai`、`-openaisearch` 模型后缀路径。
+- Google 上游 OpenAI-compatible endpoint wrapper。
+
+如果客户端仍请求 `[PAY]...` 或 `...-openai` / `...-openaisearch`，服务会返回明确的 400 错误，提示改用 Express Mode 普通模型名或 `-search` 模型名。
+
+## 环境变量
+
+| 变量 | 必填 | 默认值 | 说明 |
+|---|---:|---|---|
+| `API_KEY` | 是 | `123456` | 保护本代理服务的 API Key。客户端请求本服务时使用 `Authorization: Bearer <API_KEY>`。 |
+| `VERTEX_EXPRESS_API_KEY` | 是 | 空 | Gemini Express Mode API Key。多个 Key 用英文逗号分隔。 |
+| `ROUNDROBIN` | 否 | `false` | `true` 表示多个 Express Key 按顺序轮询；`false` 表示随机选择。 |
+| `FAKE_STREAMING` | 否 | `false` | `true` 时先用非流式请求上游，再向客户端模拟流式输出；图片模型会自动启用假流式保护。 |
+| `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间发送 keep-alive chunk 的间隔秒数。 |
+| `MODELS_CONFIG_URL` | 否 | 空 | 可选远程模型列表地址；为空时直接使用本地 `vertexModels.json`，远程加载失败也会回退到本地配置。 |
+| `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出中。 |
+| `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。 |
+| `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
+| `HUGGINGFACE` | 否 | `false` | Hugging Face Spaces 特殊鉴权模式开关。 |
+| `HUGGINGFACE_API_KEY` | 否 | 空 | Hugging Face Spaces 模式下返回的内部 API Key。 |
+
+## 本地 Docker 运行
+
+编辑 `docker-compose.yml`，至少设置：
+
+```yaml
+environment:
+  - API_KEY=your_adapter_api_key
+  - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
+```
+
+启动：
 
 ```bash
-# Build the image (if needed)
-docker-compose build
-
-# Start the service in detached mode
-docker-compose up -d
+docker compose up -d
 ```
-The service will typically be available at `http://localhost:8050` (check your [`docker-compose.yml`](docker-compose.yml)).
 
-## API Usage
+默认会把宿主机 `8050` 映射到容器内 `7860`：
 
-### Endpoints
-
--   `GET /v1/models`: Lists models accessible via the configured credentials/Vertex project.
--   `POST /v1/chat/completions`: The main endpoint for generating text, mimicking the OpenAI chat completions API.
--   `GET /`: Basic health check/status endpoint.
-
-### Authentication
-
-All requests to the adapter require an API key passed in the `Authorization` header:
-
+```text
+http://localhost:8050
 ```
-Authorization: Bearer YOUR_API_KEY
-```
-Replace `YOUR_API_KEY` with the value you set for the [`API_KEY`](app/config.py:0) environment variable.
 
-### Example Request (`curl`)
+## Hugging Face Spaces 部署
+
+1. 创建 Docker SDK Space。
+2. 上传仓库文件。
+3. 在 Space Secrets 中添加：
+   - `API_KEY`：保护代理服务的密钥。
+   - `VERTEX_EXPRESS_API_KEY`：Gemini Express Mode API Key。
+   - 可选：`ROUNDROBIN`、`FAKE_STREAMING`、`PROXY_URL` 等。
+4. 等待 Space 自动构建并运行。
+
+## 调用示例
+
+### 查询模型
 
 ```bash
-curl -X POST http://localhost:8050/v1/chat/completions \
+curl http://localhost:8050/v1/models \
+  -H "Authorization: Bearer your_adapter_api_key"
+```
+
+### 非流式对话
+
+```bash
+curl http://localhost:8050/v1/chat/completions \
+  -H "Authorization: Bearer your_adapter_api_key" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your_secure_api_key_here" \
   -d '{
-    "model": "gemini-1.5-flash-latest",
+    "model": "gemini-2.5-flash",
     "messages": [
-      {"role": "system", "content": "You are a helpful coding assistant."},
-      {"role": "user", "content": "Explain the difference between lists and tuples in Python."}
+      {"role": "user", "content": "用一句话介绍 Gemini Express Mode。"}
     ],
-    "temperature": 0.7,
-    "max_tokens": 150
+    "stream": false
   }'
 ```
 
-*(Adjust URL and API Key as needed)*
+### 流式对话
 
-## Credential Handling Priority
+```bash
+curl http://localhost:8050/v1/chat/completions \
+  -H "Authorization: Bearer your_adapter_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-2.5-flash",
+    "messages": [
+      {"role": "user", "content": "写一首短诗。"}
+    ],
+    "stream": true
+  }'
+```
 
-The application selects credentials in this order:
+### Google Search 增强
 
-1.  **Vertex AI Express Mode:** If [`VERTEX_EXPRESS_API_KEY`](app/config.py:0) is set *and* the requested model is compatible with Express mode, this key is used via the [`ExpressKeyManager`](app/express_key_manager.py).
-2.  **Service Account Credentials:** If Express mode isn't used/applicable:
-    *   The [`CredentialManager`](app/credentials_manager.py) loads credentials first from the [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) environment variable (if set).
-    *   If [`GOOGLE_CREDENTIALS_JSON`](app/config.py:0) is *not* set, it loads credentials from `.json` files within the [`CREDENTIALS_DIR`](app/config.py:0).
-    *   If [`ROUNDROBIN`](app/config.py:0) is enabled (`true`), requests using Service Accounts will cycle through the loaded credentials. Otherwise, it typically uses the first valid credential found.
+把模型名改成 `-search` 后缀即可：
 
-## Key Environment Variables
+```json
+{
+  "model": "gemini-2.5-flash-search",
+  "messages": [
+    {"role": "user", "content": "今天有哪些 Gemini API 相关更新？"}
+  ]
+}
+```
 
-Managed in [`app/config.py`](app/config.py) and loaded from the environment:
+## 模型列表配置
 
--   `API_KEY`: **Required.** Secret key to authenticate requests *to this adapter*.
--   `VERTEX_EXPRESS_API_KEY`: Optional. Your Vertex AI Express API key for simplified authentication.
--   `GOOGLE_CREDENTIALS_JSON`: Optional. String containing the JSON content of one or more service account keys (comma-separated for multiple). Takes precedence over `CREDENTIALS_DIR` for service accounts.
--   `CREDENTIALS_DIR`: Optional. Path *within the container* where service account `.json` files are located. Used only if `GOOGLE_CREDENTIALS_JSON` is not set. (Default: `/app/credentials`)
--   `ROUNDROBIN`: Optional. Set to `"true"` to enable round-robin selection among loaded Service Account credentials. (Default: `"false"`)
--   `GCP_PROJECT_ID`: Optional. Explicitly set the Google Cloud Project ID. If not set, attempts to infer from credentials.
--   `GCP_LOCATION`: Optional. Explicitly set the Google Cloud Location (region). If not set, attempts to infer or uses Vertex AI defaults.
--   `FAKE_STREAMING`: Optional. Set to `"true"` to simulate streaming output for testing. (Default: `"false"`)
--   `FAKE_STREAMING_INTERVAL`: Optional. Interval (seconds) for keep-alive messages during fake streaming. (Default: `1.0`)
+本地模型列表位于 `vertexModels.json`：
 
-## License
+```json
+{
+  "models": [
+    "gemini-3.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-image-preview",
+    "gemini-3-pro-image-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash"
+  ]
+}
+```
 
-This project is licensed under the MIT License. See the [`LICENSE`](LICENSE) file for details.
+`/v1/models` 会在普通模型之外，为非图片 Gemini 模型自动添加 `-search` 别名。不会再添加 `[PAY]`、`[EXPRESS]`、`-openai` 或 `-openaisearch`。
+
+## 关于 429 / quota / resource exhausted
+
+429 通常表示 Express Mode 免费额度、速率限制、共享资源或瞬时容量不足。项目会自动退避重试，但重试不能突破上游配额。建议：
+
+- 降低客户端并发。
+- 控制最大输出长度。
+- 开启 billing 或升级到更适合生产吞吐的模式。
+- 配置多个合法 Express API Key 并启用随机或轮询选择。
+- 不要在 Express Mode 中随机拼接 location；Express Mode 官方路径不需要 project/location。
+
+## 开发检查
+
+常用检查命令：
+
+```bash
+python -m compileall app
+```
+
+如需本地启动：
+
+```bash
+cd app
+uvicorn main:app --host 0.0.0.0 --port 7860
+```

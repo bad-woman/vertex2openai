@@ -10,22 +10,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from auth import get_api_key
-from credentials_manager import CredentialManager
 from express_key_manager import ExpressKeyManager
-from vertex_ai_init import init_vertex_ai
 from routes import models_api, chat_api
 
 # 引入重写后的日志模块
 from logger import rt_logger, stats
 import config
 
-credential_manager = CredentialManager()
 express_key_manager = ExpressKeyManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_vertex_ai(credential_manager)
-    yield 
+    from model_loader import refresh_models_config_cache
+    print("🚀 [服务启动] Vertex2OpenAI 已切换为 Gemini Express Mode 专用模式。")
+    if express_key_manager.get_total_keys() > 0:
+        print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
+    else:
+        print("⚠️ [密钥配置] 未配置 VERTEX_EXPRESS_API_KEY，聊天接口会返回认证错误。")
+    await refresh_models_config_cache()
+    yield
 
 app = FastAPI(title="OpenAI to Gemini Adapter", lifespan=lifespan)
 
@@ -38,7 +41,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.state.credential_manager = credential_manager
 app.state.express_key_manager = express_key_manager
 
 # 【精细化拦截统计】：区分 HTTP 4xx/5xx 以及系统内部崩溃
@@ -316,7 +318,7 @@ DASHBOARD_HTML = """
             }
             
             let safeText = text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-            safeText = safeText.replace(/(gemini-[a-zA-Z0-9\-\.]+)/g, '<span style="color: #059669; font-weight: 700;">$1</span>');
+            safeText = safeText.replace(/(gemini-[a-zA-Z0-9.-]+)/g, '<span style="color: #059669; font-weight: 700;">$1</span>');
             
             return `<div style="color: ${color}; background-color: ${bgColor}; border-left: ${borderLeft}; padding: 6px 10px; border-radius: 4px;">${safeText}</div>`;
         }
