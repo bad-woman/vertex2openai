@@ -64,12 +64,10 @@ client = genai.Client(vertexai=True, api_key=VERTEX_EXPRESS_API_KEY)
 | `ROUNDROBIN` | 否 | `false` | `true` 表示多个 Express Key 按顺序轮询；`false` 表示随机选择。 |
 | `FAKE_STREAMING` | 否 | `false` | `true` 时先用非流式请求上游，再向客户端模拟流式输出；图片模型会自动启用假流式保护。 |
 | `FAKE_STREAMING_INTERVAL` | 否 | `1.0` | 假流式等待期间发送 keep-alive chunk 的间隔秒数。 |
-| `MODELS_CONFIG_URL` | 否 | 空 | 可选远程模型列表地址；为空时直接使用本地 `vertexModels.json`，远程加载失败也会回退到本地配置。 |
+| `MODELS_CONFIG_URL` | 否 | GitHub raw `vertexModels.json` | 远程模型列表地址；默认从仓库 `vertexModels.json` 拉取，修改远程文件后无需重新部署即可刷新模型列表，远程失败时回退本地配置。 |
 | `SAFETY_SCORE` | 否 | `false` | 是否把 Gemini safety ratings 附加到输出中。 |
 | `PROXY_URL` | 否 | 空 | 上游 HTTP/HTTPS/SOCKS 代理。 |
 | `SSL_CERT_FILE` | 否 | 空 | 自定义证书路径。 |
-| `HUGGINGFACE` | 否 | `false` | Hugging Face Spaces 特殊鉴权模式开关。 |
-| `HUGGINGFACE_API_KEY` | 否 | 空 | Hugging Face Spaces 模式下返回的内部 API Key。 |
 
 ## 本地 Docker 运行
 
@@ -92,16 +90,6 @@ docker compose up -d
 ```text
 http://localhost:8050
 ```
-
-## Hugging Face Spaces 部署
-
-1. 创建 Docker SDK Space。
-2. 上传仓库文件。
-3. 在 Space Secrets 中添加：
-   - `API_KEY`：保护代理服务的密钥。
-   - `VERTEX_EXPRESS_API_KEY`：Gemini Express Mode API Key。
-   - 可选：`ROUNDROBIN`、`FAKE_STREAMING`、`PROXY_URL` 等。
-4. 等待 Space 自动构建并运行。
 
 ## 调用示例
 
@@ -157,7 +145,7 @@ curl http://localhost:8050/v1/chat/completions \
 
 ## 模型列表配置
 
-本地模型列表位于 `vertexModels.json`：
+默认远程模型列表地址为 `MODELS_CONFIG_URL`，指向仓库里的 `vertexModels.json`。你可以直接更新该文件，服务端下一次刷新模型缓存时会读取到新模型；如果远程读取失败，则回退到容器内的本地 `vertexModels.json`：
 
 ```json
 {

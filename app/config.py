@@ -4,8 +4,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class AppSettings(BaseSettings):
     API_KEY: str = "123456"
-    HUGGINGFACE: bool = False
-    HUGGINGFACE_API_KEY: str = ""
     VERTEX_EXPRESS_API_KEY: Optional[str] = None
     FAKE_STREAMING: bool = False
     FAKE_STREAMING_INTERVAL: float = 1.0
@@ -21,8 +19,6 @@ class AppSettings(BaseSettings):
 _settings = AppSettings()
 
 API_KEY = _settings.API_KEY
-HUGGINGFACE = _settings.HUGGINGFACE
-HUGGINGFACE_API_KEY = _settings.HUGGINGFACE_API_KEY
 
 raw_vertex_keys = _settings.VERTEX_EXPRESS_API_KEY
 if raw_vertex_keys:

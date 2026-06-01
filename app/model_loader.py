@@ -8,7 +8,16 @@ import config as app_config
 
 _model_cache: Optional[Dict[str, List[str]]] = None
 _cache_lock = asyncio.Lock()
-_LOCAL_MODELS_FILE = Path(__file__).resolve().parent.parent / "vertexModels.json"
+DEFAULT_MODELS_CONFIG_URL = "https://raw.githubusercontent.com/bad-woman/vertex2openai/main/vertexModels.json"
+FALLBACK_MODELS_CONFIG_URLS = [
+    "https://cdn.jsdelivr.net/gh/bad-woman/vertex2openai@main/vertexModels.json",
+]
+
+_LOCAL_MODEL_FILE_CANDIDATES = [
+    Path.cwd() / "vertexModels.json",
+    Path(__file__).resolve().parent / "vertexModels.json",
+    Path(__file__).resolve().parent.parent / "vertexModels.json",
+]
 
 
 def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
@@ -28,23 +37,29 @@ def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
 
 def _load_local_models_config() -> Dict[str, List[str]]:
     try:
-        data = json.loads(_LOCAL_MODELS_FILE.read_text(encoding="utf-8"))
+        local_file = next((path for path in _LOCAL_MODEL_FILE_CANDIDATES if path.exists()), None)
+        if local_file is None:
+            searched = ", ".join(str(path) for path in _LOCAL_MODEL_FILE_CANDIDATES)
+            print(f"❌ [模型配置] 未找到本地 vertexModels.json，已检查：{searched}")
+            return {"models": []}
+
+        data = json.loads(local_file.read_text(encoding="utf-8"))
         normalized = _normalize_models_config(data)
         if normalized is not None:
-            print(f"📦 [模型配置] 已使用本地模型配置文件：{_LOCAL_MODELS_FILE.name}。")
+            print(f"📦 [模型配置] 已使用本地模型配置文件：{local_file}。")
             return normalized
-        print(f"❌ [模型配置] 本地模型配置结构无效：{_LOCAL_MODELS_FILE}。")
+        print(f"❌ [模型配置] 本地模型配置结构无效：{local_file}。")
     except Exception as exc:
         print(f"❌ [模型配置] 读取本地模型配置失败：{exc}")
     return {"models": []}
 
 
 async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
-    if not app_config.MODELS_CONFIG_URL:
-        print("📦 [模型配置] MODELS_CONFIG_URL 未设置，直接使用本地 vertexModels.json。")
-        return _load_local_models_config()
-
-    print(f"🌐 [模型配置] 正在获取远程模型配置：{app_config.MODELS_CONFIG_URL}")
+    primary_url = app_config.MODELS_CONFIG_URL or DEFAULT_MODELS_CONFIG_URL
+    urls_to_try = [primary_url]
+    for fallback_url in FALLBACK_MODELS_CONFIG_URLS:
+        if fallback_url not in urls_to_try:
+            urls_to_try.append(fallback_url)
 
     client_args = {"timeout": 20.0}
     if app_config.PROXY_URL:
@@ -52,25 +67,28 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
 
-    try:
-        async with httpx.AsyncClient(**client_args) as client:
-            response = await client.get(app_config.MODELS_CONFIG_URL)
-            response.raise_for_status()
-            normalized = _normalize_models_config(response.json())
-            if normalized is not None:
-                print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
-                return normalized
-            print("❌ [模型配置] 远程模型配置结构无效，将回退到本地配置。")
-            return _load_local_models_config()
-    except httpx.RequestError as exc:
-        print(f"⚠️ [模型配置] 获取远程模型配置失败，将回退到本地配置。网络错误：{exc}")
-        return _load_local_models_config()
-    except json.JSONDecodeError as exc:
-        print(f"⚠️ [模型配置] 远程模型配置不是有效 JSON，将回退到本地配置。解析错误：{exc}")
-        return _load_local_models_config()
-    except Exception as exc:
-        print(f"⚠️ [模型配置] 加载远程模型配置时出现异常，将回退到本地配置：{exc}")
-        return _load_local_models_config()
+    async with httpx.AsyncClient(**client_args) as client:
+        for index, url in enumerate(urls_to_try, start=1):
+            print(f"🌐 [模型配置] 正在获取远程模型配置（第 {index} 个地址）：{url}")
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                normalized = _normalize_models_config(response.json())
+                if normalized is not None:
+                    print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
+                    return normalized
+                print(f"⚠️ [模型配置] 远程模型配置结构无效，准备尝试下一个地址：{url}")
+            except httpx.HTTPStatusError as exc:
+                print(f"⚠️ [模型配置] 远程模型配置地址返回 HTTP {exc.response.status_code}，准备尝试下一个地址：{url}")
+            except httpx.RequestError as exc:
+                print(f"⚠️ [模型配置] 获取远程模型配置失败，准备尝试下一个地址。网络错误：{exc}")
+            except json.JSONDecodeError as exc:
+                print(f"⚠️ [模型配置] 远程模型配置不是有效 JSON，准备尝试下一个地址。解析错误：{exc}")
+            except Exception as exc:
+                print(f"⚠️ [模型配置] 加载远程模型配置时出现异常，准备尝试下一个地址：{exc}")
+
+    print("⚠️ [模型配置] 所有远程模型配置地址都不可用，将回退到本地 vertexModels.json。")
+    return _load_local_models_config()
 
 
 async def get_models_config() -> Dict[str, List[str]]:
