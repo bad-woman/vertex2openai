@@ -240,11 +240,16 @@ class StreamProcessor:
         if not data:
             return
         
-        # 检查错误
+        # ==========================================
+        # 核心修改：如果谷歌返回的 JSON 内包含 error 报错，
+        # 不再静默吞掉，而是强制通过 print 输出控制台，并抛出异常
+        # ==========================================
         if 'error' in data:
-            self._log_debug(f"Vertex AI错误: {data['error']}")
+            err_details = data['error']
+            print(f"❌ [Vertex AI 网关返回错误载荷]: {json.dumps(err_details, ensure_ascii=False, indent=2)}")
             self._stats["errors"] += 1
-            return
+            # 抛出异常以激活上游的 traceback 堆栈追踪
+            raise AuthError(f"Vertex AI Backend Error: {err_details.get('message', 'Unknown Error')}")
         
         results = data.get('results', [])
         if not results:
