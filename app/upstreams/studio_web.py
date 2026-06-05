@@ -11,15 +11,18 @@ from upstreams.studio_payload import build_studio_graphql_payload
 from runtime_state import app_state
 import config as app_config
 
-# 引入项目原生的 OpenAI 适配格式转换器
-from api.oai_adapter import OAIResponseConverter
+# 引入你原项目中的 google-genai 类型库和 OpenAI 格式转换器
+from google.genai import types
+from api_helpers import convert_chunk_to_openai
 
-# 引入 11-30 完美的流式追踪与消抖处理器 (用于兼容 GraphQL 旧接口)
+# 引入流式追踪与消抖处理器 (用于兼容 GraphQL 旧接口)
 from stream_engine.processor import StreamProcessor
+
 
 class WebProxyUpstream(BaseUpstream):
     """
     谷歌 Agent Platform Studio 网页反代渠道处理器
+    支持标准的 REST streamGenerateContent 和 legacy GraphQL 双通道
     """
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
         auth_bundle = app_state.get_auth_bundle()
@@ -42,7 +45,7 @@ class WebProxyUpstream(BaseUpstream):
         url = auth_bundle.get("url")
         raw_headers = auth_bundle.get("headers", {}).copy()
         
-        # 统一转小写 Header
+        # 统一转小写 Header 适配 HTTP 标准
         headers = {k.lower(): str(v) for k, v in raw_headers.items()}
         headers.pop("accept-encoding", None)
         headers.pop("content-length", None)
@@ -50,6 +53,11 @@ class WebProxyUpstream(BaseUpstream):
         headers.pop("connection", None)
         headers["content-type"] = "application/json"
 
+        # 补全被浏览器屏蔽的安全防护头
+        headers["referer"] = "https://console.cloud.google.com/"
+        headers["origin"] = "https://console.cloud.google.com"
+
+        # 客户端网络特征继承
         client_kwargs = {
             "timeout": 120.0,
             "follow_redirects": True
@@ -59,12 +67,15 @@ class WebProxyUpstream(BaseUpstream):
         if app_config.SSL_CERT_FILE:
             client_kwargs["verify"] = app_config.SSL_CERT_FILE
 
-        # 核心逻辑：检测截获的 URL。如果是区域标准的 streamGenerateContent，则走完美原生流！
+        # 核心判断：是否为标准的 REST 区域化聊天生成流
         is_standard_rest = "streamGenerateContent" in url
 
+        # 3. 流式处理通道 (stream = True)
         if request_obj.stream:
             async def stream_generator():
-                request_id = fastapi_request.state.request_id if hasattr(fastapi_request.state, "request_id") else "studio-web"
+                # 生成你原版项目所需的流 ID
+                response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
+                
                 try:
                     async with httpx.AsyncClient(**client_kwargs) as client:
                         async with client.stream("POST", url, headers=headers, json=payload) as response:
@@ -75,7 +86,6 @@ class WebProxyUpstream(BaseUpstream):
                             
                             # 通道 A：如果截获的是标准的 streamGenerateContent REST 流
                             if is_standard_rest:
-                                is_first = True
                                 buffer = ""
                                 async for chunk in response.aiter_content():
                                     if not chunk: continue
@@ -111,11 +121,17 @@ class WebProxyUpstream(BaseUpstream):
                                             buffer = buffer[end_idx+1:]
                                             try:
                                                 obj = json.loads(json_str)
-                                                # 使用项目原生的 OAIResponseConverter 做无缝 OAI SSE 流输出
-                                                events = OAIResponseConverter.convert_realtime_chunk(obj, request_obj.model, request_id, is_first=is_first)
-                                                is_first = False
-                                                for event in events:
-                                                    yield event
+                                                
+                                                # 核心：将 raw JSON dict 还原为官方 SDK 类型的 Pydantic 模型
+                                                gemini_chunk_obj = types.GenerateContentResponse(**obj)
+                                                
+                                                # 完美调用你原有的 convert_chunk_to_openai
+                                                yield convert_chunk_to_openai(
+                                                    gemini_chunk_obj, 
+                                                    request_obj.model, 
+                                                    response_id_for_stream, 
+                                                    0
+                                                )
                                             except Exception:
                                                 pass
                                         else:
@@ -136,6 +152,27 @@ class WebProxyUpstream(BaseUpstream):
             
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
+        # 4. 非流式处理通道 (stream = False)，在后端自动请求
         else:
-            # 非流式处理，逻辑与流式聚合相同
-            pass
+            try:
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+                    if response.status_code != 200:
+                        return JSONResponse(status_code=response.status_code, content={"error": response.text})
+                    
+                    if is_standard_rest:
+                        obj = response.json()
+                        gemini_response_obj = types.GenerateContentResponse(**obj)
+                        from message_processing import convert_to_openai_format
+                        openai_response_content = convert_to_openai_format(gemini_response_obj, request_obj.model)
+                        return JSONResponse(content=openai_response_content)
+                    else:
+                        # 兼容 GraphQL 聚合模式
+                        processor = StreamProcessor()
+                        parsed_res = await processor.process_stream(response.text, model=request_obj.model)
+                        # 重组过程由 StreamProcessor 自理
+                        return JSONResponse(content=parsed_res)
+            except Exception as e:
+                print("❌ [Web Proxy 非流式异常] 详细网络或解析堆栈如下：")
+                traceback.print_exc()
+                return JSONResponse(status_code=500, content={"error": f"Failed to gather studio response: {str(e)}"})
