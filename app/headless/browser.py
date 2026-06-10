@@ -30,6 +30,7 @@ class HeadlessBrowser:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self._is_running = False
+        self.needs_manual_login = False
 
     @staticmethod
     def check_availability() -> bool:
@@ -137,32 +138,42 @@ class HeadlessBrowser:
                 cookies = []
                 for pair in cookie_str.split(';'):
                     if '=' in pair:
-                        k, v = pair.strip().split('=', 1)
+                        k, v = pair.split('=', 1)
+                        k = k.strip()
+                        v = v.strip()
+                        if not k: continue
                         cookies.append({
-                            "name": k.strip(),
-                            "value": v.strip(),
+                            "name": k,
+                            "value": v,
                             "domain": ".google.com",
                             "path": "/"
                         })
                 if cookies:
-                    await self.context.add_cookies(cookies)
+                    try:
+                        await self.context.add_cookies(cookies)
+                    except Exception as e:
+                        print(f"❌ 注入 Cookie 失败: {e}")
 
             try:
                 await self.page.goto(self.VERTEX_AI_URL, wait_until="domcontentloaded", timeout=30000)
 
                 # 检查是否需要登录
                 current_url = self.page.url
-                if "accounts.google.com" in current_url:
+                if "accounts.google.com" in current_url or "signin" in current_url:
                     if cookie_str:
                         print("⚠️ 预设的 Cookie 可能已失效，被重定向到登录页")
                     print("⚠️ 需要登录 Google 账号")
-                    print("   若在无头服务器(如 Render)上看到此提示，由于没有浏览器界面，您必须配置 GOOGLE_COOKIE 环境变量，或在控制面板粘贴 Cookie！")
+                    print("   检测到需要登录，已进入云端交互登录模式。请打开大盘控制台进行远程可视化登录！")
+                    self.needs_manual_login = True
                     try:
-                        await self.page.wait_for_url("**/vertex-ai/**", timeout=300000)
-                        print("✅ 登录成功")
-                    except Exception:
-                        print("❌ 登录超时 (云端纯无头模式下若未配置 Cookie 将无法通过此步)")
-                        return False
+                        # 循环等待直到离开登录页
+                        while "accounts.google.com" in self.page.url or "signin" in self.page.url:
+                            await asyncio.sleep(1)
+                        print("✅ 登录成功，已离开登录页")
+                    except Exception as e:
+                        print(f"❌ 等待登录遇到错误: {e}")
+                    finally:
+                        self.needs_manual_login = False
 
                 # 等待页面进一步加载稳定
                 await asyncio.sleep(3)
@@ -452,6 +463,7 @@ class HeadlessBrowser:
     async def close(self) -> None:
         """关闭浏览器"""
         self._is_running = False
+        self.needs_manual_login = False
         if self.context:
             await self.context.close()
             self.context = None
@@ -464,3 +476,44 @@ class HeadlessBrowser:
     @property
     def is_running(self) -> bool:
         return self._is_running
+
+    # ========== 远程可视化交互接口 ==========
+
+    async def get_screenshot(self) -> Optional[bytes]:
+        """获取当前页面截图 (JPEG格式)"""
+        if not self.page or not self.is_running:
+            return None
+        try:
+            return await self.page.screenshot(type="jpeg", quality=60)
+        except Exception:
+            return None
+
+    async def send_click(self, x: float, y: float) -> bool:
+        """发送鼠标点击事件"""
+        if not self.page or not self.is_running:
+            return False
+        try:
+            await self.page.mouse.click(x, y)
+            return True
+        except Exception:
+            return False
+
+    async def send_text(self, text: str) -> bool:
+        """发送文本输入 (模拟键盘)"""
+        if not self.page or not self.is_running:
+            return False
+        try:
+            await self.page.keyboard.insert_text(text)
+            return True
+        except Exception:
+            return False
+
+    async def send_key(self, key: str) -> bool:
+        """发送按键 (如 Enter)"""
+        if not self.page or not self.is_running:
+            return False
+        try:
+            await self.page.keyboard.press(key)
+            return True
+        except Exception:
+            return False
