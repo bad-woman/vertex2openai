@@ -258,9 +258,11 @@ DASHBOARD_HTML = """
                             </div>
                         </div>
                         <div class="text-[11px] text-slate-600 mt-3 p-3 bg-blue-50/70 rounded-xl border border-blue-100/70 leading-relaxed shadow-sm">
-                            💡 <span class="font-bold text-blue-700">全新直连方案（告别崩溃卡死）：</span><br>
-                            系统现已支持 <b>SAPISIDHASH 原生算法直连</b>，无需启动任何无头浏览器（彻底解决 Render 环境闪退卡死问题）。<br>
-                            <b>如何获取：</b>打开 <code>console.cloud.google.com/vertex-ai</code>，按 F12 打开网络面板，复制任意请求头的 <code>cookie</code> 字符串，和 URL 中的 <code>project</code> 参数。
+                            💡 <span class="font-bold text-blue-700">Cookie 直连模式（免浏览器/免重启）：</span><br>
+                            <b>获取方法：</b>在电脑浏览器打开 <code>console.cloud.google.com</code> 并登录，<br>
+                            按 <b>F12</b> → 切换到 <b>Console</b> 面板 → 输入 <code class="bg-blue-100 px-1 py-0.5 rounded select-all">copy(document.cookie)</code> 回车 → Cookie 已复制到剪贴板！<br>
+                            <b>Project ID：</b>从 Studio URL 的 <code>?project=xxx</code> 参数中获取。<br>
+                            ⚠️ <span class="text-amber-600 font-semibold">Cookie 有效期约 1~2 小时</span>（PSIDTS 令牌会过期），过期后重新获取粘贴即可。
                         </div>
                     </div>
                 </div>

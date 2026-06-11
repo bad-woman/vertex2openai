@@ -17,6 +17,7 @@ class AppSettings(BaseSettings):
     GOOGLE_COOKIE: Optional[str] = None         # Google Cookie 字符串（从浏览器 DevTools 复制）
     GOOGLE_PROJECT_ID: Optional[str] = None     # Google Cloud 项目 ID（从 Console URL 中获取）
     GOOGLE_REGION: str = "us-central1"          # Vertex AI 区域，默认 us-central1
+    EXPERIMENT_FLAGS: Optional[str] = None       # experimentFlagsBinary（从 F12 Network 中获取，Express Mode 权限标识）
 
     # 无头浏览器模式配置（仅本地部署可用）
     HEADLESS_MODE: bool = True
@@ -46,6 +47,7 @@ SSL_CERT_FILE = _settings.SSL_CERT_FILE
 GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
 GOOGLE_PROJECT_ID = _settings.GOOGLE_PROJECT_ID
 GOOGLE_REGION = _settings.GOOGLE_REGION
+EXPERIMENT_FLAGS = _settings.EXPERIMENT_FLAGS
 HEADLESS_MODE = _settings.HEADLESS_MODE
 CREDENTIAL_REFRESH_INTERVAL = _settings.CREDENTIAL_REFRESH_INTERVAL
 
