@@ -2,8 +2,8 @@
 batchGraphql 直连代理上游通道
 
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
-无需无头浏览器，直接通过 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
-支持完整的 Function Calling (工具调用) 与 Google Search，并自动清洗 Schema 字段防静默丢弃。
+支持完整的 Function Calling (工具调用) 与 Google Search。
+内置终极防弹 Schema 清洗器，完美解决所有第三方格式兼容报错。
 """
 
 import json
@@ -58,36 +58,73 @@ def _is_cookie_expired_error(error_msg: str) -> bool:
     return any(kw in lower for kw in COOKIE_EXPIRED_KEYWORDS)
 
 
-# ========== Schema 清洗与类型转换辅助函数 ==========
-# 严格限制谷歌支持的 Schema 字段，防静默丢弃
+# ========== 🛡️ 终极防弹 Schema 清洗器 ==========
 ALLOWED_SCHEMA_FIELDS = {"type", "description", "properties", "required", "items", "enum", "format", "nullable"}
 
 def _clean_and_convert_schema(schema: dict) -> dict:
-    """递归清洗 Schema，转大写并剔除 Gemini 不支持的字段（如 additionalProperties），防止大模型后端静默丢弃工具"""
+    """递归清洗 Schema，防范第三方客户端发送的不规范数据导致 Google gRPC 崩溃"""
     if not isinstance(schema, dict):
         return schema
     
     new_schema = {}
     for k, v in schema.items():
         if k not in ALLOWED_SCHEMA_FIELDS:
-            continue  # 剔除不支持的字段
-            
+            continue
+        if v is None:  # 防御 1: 剔除任何 null 值
+            continue
+
         if k == "type":
             if isinstance(v, str):
                 new_schema[k] = v.upper()
             elif isinstance(v, list) and len(v) > 0:
                 new_schema[k] = str(v[0]).upper()
-        elif k == "properties" and isinstance(v, dict):
-            new_schema[k] = {pk: _clean_and_convert_schema(pv) for pk, pv in v.items()}
-        elif k == "items" and isinstance(v, dict):
-            new_schema[k] = _clean_and_convert_schema(v)
+        elif k == "properties":
+            if isinstance(v, dict):
+                cleaned_props = {}
+                for pk, pv in v.items():
+                    # 防御 2: 严防 null 键、空字符串键以及 null 属性值
+                    if pk and str(pk).strip() and pv is not None:
+                        cleaned_props[str(pk)] = _clean_and_convert_schema(pv)
+                if cleaned_props:
+                    new_schema[k] = cleaned_props
+        elif k == "items":
+            if isinstance(v, dict):
+                cleaned_items = _clean_and_convert_schema(v)
+                if cleaned_items:
+                    new_schema[k] = cleaned_items
+        elif k == "required":
+            if isinstance(v, list):
+                reqs = [str(x) for x in v if x and str(x).strip()]
+                if reqs:
+                    new_schema[k] = reqs
+        elif k == "enum":
+            if isinstance(v, list):
+                enums = [str(x) for x in v if x is not None]
+                if enums:
+                    new_schema[k] = enums
         else:
             new_schema[k] = v
             
-    # 如果存在 properties 但没写 type，强制补全为 OBJECT
-    if "properties" in new_schema and "type" not in new_schema:
-        new_schema["type"] = "OBJECT"
-        
+    # 防御 3: 强制兜底类型补全（Gemini 必须要有 type）
+    if "type" not in new_schema:
+        if "properties" in new_schema:
+            new_schema["type"] = "OBJECT"
+        elif "items" in new_schema:
+            new_schema["type"] = "ARRAY"
+        else:
+            new_schema["type"] = "STRING"
+            
+    # 防御 4: 防止 required 引用了不存在的属性导致校验失败
+    if "required" in new_schema:
+        if "properties" in new_schema:
+            valid_reqs = [r for r in new_schema["required"] if r in new_schema["properties"]]
+            if valid_reqs:
+                new_schema["required"] = valid_reqs
+            else:
+                del new_schema["required"]
+        else:
+            del new_schema["required"]
+            
     return new_schema
 
 
@@ -135,9 +172,7 @@ def _convert_messages_to_contents(messages: list) -> tuple:
         
         parts = []
         
-        # 1. 处理传入的函数调用结果 (OpenAI role="tool")
         if role == "tool":
-            # 关键修改：Gemini 处理历史工具回调时，最好放在 user 角色下，避免被过滤
             gemini_role = "user" 
             tool_output_data = {}
             try:
@@ -155,7 +190,6 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                 }
             })
             
-        # 2. 处理助手发出的函数调用历史 (OpenAI role="assistant" 且带有 tool_calls)
         elif role == "assistant" and getattr(msg, "tool_calls", None):
             gemini_role = "model"
             for tool_call in msg.tool_calls:
@@ -174,7 +208,6 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             if content:
                 parts.append({"text": str(content)})
                 
-        # 3. 正常用户或助手的文本/图片
         else:
             gemini_role = "user" if role == "user" else "model"
             if isinstance(content, str):
@@ -219,7 +252,7 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
     }
     
     if any(kw in model_name for kw in ("gemini-3", "gemini-2.5")):
-        gen_config["thinkingConfig"] = {"thinkingLevel": "MEDIUM", "includeThoughts": True}
+        gen_config["thinkingConfig"] = {"thinkingLevel": "HIGH", "includeThoughts": True}
     
     safety_settings = [
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
@@ -240,10 +273,8 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
     if request.stop:
         gen_config["stopSequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
     
-    # 动态构建工具列表 (tools / toolConfig)
     tools_list = []
     
-    # 1. 处理自定义 Function Calling
     if request.tools:
         function_declarations = []
         for tool in request.tools:
@@ -256,23 +287,20 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
                     }
                     parameters = func_data.get("parameters")
                     if isinstance(parameters, dict):
-                        # 洗掉不支持的字段，转换格式
                         parameters = _clean_and_convert_schema(parameters)
-                        if "type" not in parameters:
+                        if parameters:
                             parameters["type"] = "OBJECT"
-                        declaration["parameters"] = parameters
+                            declaration["parameters"] = parameters
                     function_declarations.append(declaration)
         if function_declarations:
             tools_list.append({"functionDeclarations": function_declarations})
 
-    # 2. 处理自带联网搜索
     if hasattr(request, 'model') and request.model.endswith("-search"):
         tools_list.append({"googleSearch": {}})
         
     if tools_list:
         variables["tools"] = tools_list
 
-    # 处理强制工具调用配置 (tool_choice)
     if request.tool_choice:
         choice = request.tool_choice
         mode = None
