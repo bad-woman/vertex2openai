@@ -3,7 +3,7 @@ batchGraphql 直连代理上游通道
 
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
 支持完整的 Function Calling (工具调用) 与 Google Search。
-内置终极防弹 Schema 清洗器，与自动相邻消息合并机制，完美解决所有兼容报错。
+内置终极防弹 Schema 清洗器、相邻消息合并、以及【思考签名(thoughtSignature)无损保留技术】。
 """
 
 import json
@@ -169,6 +169,7 @@ def _convert_messages_to_contents(messages: list) -> tuple:
         
         parts = []
         
+        # 1. 还原 Function Response (含 thought_signature)
         if role == "tool":
             gemini_role = "user" 
             tool_output_data = {}
@@ -180,13 +181,33 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             except json.JSONDecodeError:
                 tool_output_data = {"result": str(content)}
             
-            parts.append({
-                "functionResponse": {
-                    "name": msg.name or "unknown",
-                    "response": tool_output_data
-                }
-            })
+            tool_call_id_str = getattr(msg, "tool_call_id", "") or ""
+            real_tool_id = ""
+            thought_sig = ""
             
+            # 解析潜藏在 ID 里的思考签名
+            if "__thought__" in tool_call_id_str:
+                parts_id = tool_call_id_str.split("__thought__")
+                real_tool_id = parts_id[0]
+                thought_sig = parts_id[1] if len(parts_id) > 1 else ""
+            else:
+                real_tool_id = tool_call_id_str
+
+            func_resp = {
+                "name": msg.name or "unknown",
+                "response": tool_output_data
+            }
+            if real_tool_id and not real_tool_id.startswith("call_"):
+                func_resp["id"] = real_tool_id
+                
+            part_dict = {"functionResponse": func_resp}
+            # 完璧归赵，交还 thoughtSignature
+            if thought_sig:
+                part_dict["thoughtSignature"] = thought_sig
+                
+            parts.append(part_dict)
+            
+        # 2. 还原 Function Call 历史 (含 thought_signature)
         elif role == "assistant" and getattr(msg, "tool_calls", None):
             gemini_role = "model"
             for tool_call in msg.tool_calls:
@@ -196,26 +217,45 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                     args_dict = json.loads(args_str)
                 except json.JSONDecodeError:
                     args_dict = {}
-                parts.append({
-                    "functionCall": {
-                        "name": func_data.get("name", "unknown"),
-                        "args": args_dict
-                    }
-                })
+                
+                tool_call_id_str = tool_call.get("id", "")
+                real_tool_id = ""
+                thought_sig = ""
+                if "__thought__" in tool_call_id_str:
+                    parts_id = tool_call_id_str.split("__thought__")
+                    real_tool_id = parts_id[0]
+                    thought_sig = parts_id[1] if len(parts_id) > 1 else ""
+                else:
+                    real_tool_id = tool_call_id_str
+                    
+                func_call = {
+                    "name": func_data.get("name", "unknown"),
+                    "args": args_dict
+                }
+                if real_tool_id and not real_tool_id.startswith("call_"):
+                    func_call["id"] = real_tool_id
+                    
+                part_dict = {"functionCall": func_call}
+                # 完璧归赵，交还 thoughtSignature
+                if thought_sig:
+                    part_dict["thoughtSignature"] = thought_sig
+                    
+                parts.append(part_dict)
+                
             # 过滤掉空文本
             if content:
                 parts.append({"text": str(content)})
                 
+        # 3. 正常聊天内容
         else:
             gemini_role = "user" if role == "user" else "model"
             if isinstance(content, str):
-                if content:  # 过滤掉空文本防崩溃
+                if content:
                     parts.append({"text": content})
             elif isinstance(content, list):
                 for item in content:
                     if hasattr(item, 'model_dump'):
                         item = item.model_dump()
-                    
                     if isinstance(item, dict):
                         item_type = item.get("type", "")
                         if item_type == "text":
@@ -234,7 +274,6 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                         parts.append({"text": item})
         
         if parts:
-            # 🧩 关键修复：合并相邻的同角色消息 (将并发工具结果、连续用户消息强行合并为一回合)
             if contents and contents[-1]["role"] == gemini_role:
                 contents[-1]["parts"].extend(parts)
             else:
@@ -255,7 +294,7 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
     }
     
     if any(kw in model_name for kw in ("gemini-3", "gemini-2.5")):
-        gen_config["thinkingConfig"] = {"thinkingLevel": "HIGH", "includeThoughts": True}
+        gen_config["thinkingConfig"] = {"thinkingLevel": "MEDIUM", "includeThoughts": True}
     
     safety_settings = [
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
@@ -402,7 +441,9 @@ def _extract_from_results(obj: dict):
             for part in parts:
                 func_call = part.get("functionCall")
                 if func_call:
-                    yield ("function_call", func_call)
+                    # 关键修改：提取 thoughtSignature
+                    sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
+                    yield ("function_call", {"call": func_call, "sig": sig})
                     continue
                 
                 text = part.get("text", "")
@@ -472,9 +513,18 @@ async def _execute_stream_request(client, headers, body, model_display, response
                         events.append(_make_openai_chunk(response_id, model_display, content=data))
                         has_content = True
                     elif event_type == "function_call":
-                        func_name = data.get("name", "unknown")
-                        args_dict = data.get("args", {})
-                        tool_call_id = f"call_{response_id}_{int(time.time()*1000)}_{func_name}"
+                        # 还原签名到 ID 中
+                        func_name = data["call"].get("name", "unknown")
+                        args_dict = data["call"].get("args", {})
+                        real_id = data["call"].get("id", "")
+                        thought_sig = data.get("sig", "")
+                        
+                        if real_id:
+                            tool_call_id = f"{real_id}__thought__{thought_sig}" if thought_sig else real_id
+                        else:
+                            rand_str = f"{int(time.time()*1000)}_{func_name}"
+                            tool_call_id = f"call_{response_id}_{rand_str}__thought__{thought_sig}" if thought_sig else f"call_{response_id}_{rand_str}"
+                            
                         tc = [{"index": 0, "id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args_dict, ensure_ascii=False)}}]
                         events.append(_make_openai_chunk(response_id, model_display, tool_calls=tc))
                         has_content = True
@@ -595,9 +645,17 @@ class HeadlessProxyUpstream(BaseUpstream):
                             if event_type == "text" or event_type == "image": full_text += data
                             elif event_type == "thought": reasoning_text += data
                             elif event_type == "function_call":
-                                func_name = data.get("name", "unknown")
-                                args_dict = data.get("args", {})
-                                tool_call_id = f"call_{response_id}_{int(time.time()*1000)}_{func_name}"
+                                func_name = data["call"].get("name", "unknown")
+                                args_dict = data["call"].get("args", {})
+                                real_id = data["call"].get("id", "")
+                                thought_sig = data.get("sig", "")
+                                
+                                if real_id:
+                                    tool_call_id = f"{real_id}__thought__{thought_sig}" if thought_sig else real_id
+                                else:
+                                    rand_str = f"{int(time.time()*1000)}_{func_name}"
+                                    tool_call_id = f"call_{response_id}_{rand_str}__thought__{thought_sig}" if thought_sig else f"call_{response_id}_{rand_str}"
+                                    
                                 tool_calls_list.append({"id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args_dict, ensure_ascii=False)}})
                             elif event_type == "finish":
                                 if data == "MAX_TOKENS": finish_reason = "length"
@@ -631,4 +689,16 @@ class HeadlessProxyUpstream(BaseUpstream):
                 except Exception as e:
                     err_msg = str(e)
                     is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
-           
+                    if is_retryable and attempt < MAX_RETRIES:
+                        wait_sec = RETRY_BACKOFF[attempt]
+                        print(f"⚠️ [Studio] 异常 (尝试 {attempt+1}): {err_msg[:100]}, {wait_sec}s 后重试...")
+                        await asyncio.sleep(wait_sec)
+                        continue
+                    elapsed = time.time() - start_time
+                    print(f"❌ [Studio] {base_model_name} | 异常 | {elapsed:.1f}s: {err_msg[:150]}")
+                    traceback.print_exc()
+                    return JSONResponse(status_code=500, content={"error": {"message": f"batchGraphql proxy error: {err_msg}", "type": "proxy_error"}})
+            
+            elapsed = time.time() - start_time
+            print(f"❌ [Studio] {base_model_name} | 重试 {MAX_RETRIES} 次后仍失败 | {elapsed:.1f}s")
+            return JSONResponse(status_code=429, content={"error": {"message": "请求被限流，已重试多次仍失败。请稍后再试。", "type": "rate_limit_error"}})
