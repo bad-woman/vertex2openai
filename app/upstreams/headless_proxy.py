@@ -3,7 +3,7 @@ batchGraphql 直连代理上游通道
 
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
 支持完整的 Function Calling (工具调用) 与 Google Search。
-内置终极防弹 Schema 清洗器、参数强制兜底与纯净历史回放机制。
+内置终极防弹 Schema 清洗器、参数按需传递与纯净历史回放机制。
 """
 
 import json
@@ -189,13 +189,22 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             except json.JSONDecodeError:
                 tool_output_data = {"result": str(content)}
             
-            # 🛡️ 纯净还原：只传 name 和 response，绝对不传 ID 和 Signature
-            parts.append({
-                "functionResponse": {
-                    "name": msg.name or "unknown",
-                    "response": tool_output_data
-                }
-            })
+            tool_call_id_str = getattr(msg, "tool_call_id", "") or ""
+            real_tool_id = ""
+            if "__thought__" in tool_call_id_str:
+                real_tool_id = tool_call_id_str.split("__thought__")[0]
+            else:
+                real_tool_id = tool_call_id_str
+
+            func_resp = {
+                "name": msg.name or "unknown",
+                "response": tool_output_data
+            }
+            # 🎯 修复点1：精准拦截本地假ID(包含chatcmpl-studio-)，真实ID(即使是以call_开头)一律放行给谷歌
+            if real_tool_id and "chatcmpl-studio-" not in real_tool_id:
+                func_resp["id"] = real_tool_id
+                
+            parts.append({"functionResponse": func_resp})
             
         # 2. 还原 Function Call 历史 (属于 model 角色)
         elif role == "assistant" and getattr(msg, "tool_calls", None):
@@ -211,19 +220,24 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                     args_dict = {}
                 
                 tool_call_id_str = tool_call.get("id", "")
+                real_tool_id = ""
                 thought_sig = ""
                 if "__thought__" in tool_call_id_str:
                     parts_id = tool_call_id_str.split("__thought__")
+                    real_tool_id = parts_id[0]
                     thought_sig = parts_id[1] if len(parts_id) > 1 else ""
+                else:
+                    real_tool_id = tool_call_id_str
                     
-                # 🛡️ 纯净还原：只传 name 和 args，绝对不传 ID
-                part_dict = {
-                    "functionCall": {
-                        "name": func_data.get("name", "unknown"),
-                        "args": args_dict
-                    }
+                func_call = {
+                    "name": func_data.get("name", "unknown"),
+                    "args": args_dict
                 }
-                # 如果有签名，仅使用官方驼峰命名
+                # 🎯 修复点1同理：完美保留原生 ID 防断链
+                if real_tool_id and "chatcmpl-studio-" not in real_tool_id:
+                    func_call["id"] = real_tool_id
+                    
+                part_dict = {"functionCall": func_call}
                 if thought_sig:
                     part_dict["thoughtSignature"] = thought_sig
                     
@@ -304,8 +318,10 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
         "safetySettings": safety_settings,
     }
     
+    # 🎯 修复点3：规范 systemInstruction 的结构，带上 role
     if system_text:
-        variables["systemInstruction"] = {"parts": [{"text": system_text}]}
+        variables["systemInstruction"] = {"role": "system", "parts": [{"text": system_text}]}
+        
     if request.stop:
         gen_config["stopSequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
     
@@ -326,14 +342,11 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
                     parameters = func_data.get("parameters")
                     if isinstance(parameters, dict):
                         parameters = _clean_and_convert_schema(parameters)
-                    else:
-                        parameters = None
                         
-                    # 🛡️ 强制兜底：没传参数的插件，强制给个空壳对象，防谷歌报错
-                    if not parameters or "type" not in parameters:
-                        parameters = {"type": "OBJECT", "properties": {}}
+                    # 🎯 修复点2：废除强塞空属性！如果没有参数，就让它为空，斩断“你好”也会引发幻觉调用的祸根
+                    if parameters:
+                        declaration["parameters"] = parameters
                         
-                    declaration["parameters"] = parameters
                     function_declarations.append(declaration)
         if function_declarations:
             tools_list.append({"functionDeclarations": function_declarations})
@@ -515,10 +528,14 @@ async def _execute_stream_request(client, headers, body, model_display, response
                     elif event_type == "function_call":
                         func_name = data["call"].get("name", "unknown")
                         args_dict = data["call"].get("args", {})
+                        real_id = data["call"].get("id", "")
                         thought_sig = data.get("sig", "")
                         
-                        rand_str = f"{int(time.time()*1000)}_{func_name}"
-                        tool_call_id = f"call_{response_id}_{rand_str}__thought__{thought_sig}" if thought_sig else f"call_{response_id}_{rand_str}"
+                        if real_id:
+                            tool_call_id = f"{real_id}__thought__{thought_sig}" if thought_sig else real_id
+                        else:
+                            rand_str = f"{int(time.time()*1000)}_{func_name}"
+                            tool_call_id = f"call_{response_id}_{rand_str}__thought__{thought_sig}" if thought_sig else f"call_{response_id}_{rand_str}"
                             
                         tc = [{"index": 0, "id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args_dict, ensure_ascii=False)}}]
                         events.append(_make_openai_chunk(response_id, model_display, tool_calls=tc))
@@ -642,10 +659,14 @@ class HeadlessProxyUpstream(BaseUpstream):
                             elif event_type == "function_call":
                                 func_name = data["call"].get("name", "unknown")
                                 args_dict = data["call"].get("args", {})
+                                real_id = data["call"].get("id", "")
                                 thought_sig = data.get("sig", "")
                                 
-                                rand_str = f"{int(time.time()*1000)}_{func_name}"
-                                tool_call_id = f"call_{response_id}_{rand_str}__thought__{thought_sig}" if thought_sig else f"call_{response_id}_{rand_str}"
+                                if real_id:
+                                    tool_call_id = f"{real_id}__thought__{thought_sig}" if thought_sig else real_id
+                                else:
+                                    rand_str = f"{int(time.time()*1000)}_{func_name}"
+                                    tool_call_id = f"call_{response_id}_{rand_str}__thought__{thought_sig}" if thought_sig else f"call_{response_id}_{rand_str}"
                                     
                                 tool_calls_list.append({"id": tool_call_id, "type": "function", "function": {"name": func_name, "arguments": json.dumps(args_dict, ensure_ascii=False)}})
                             elif event_type == "finish":
