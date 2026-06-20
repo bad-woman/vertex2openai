@@ -2,8 +2,9 @@
 batchGraphql 直连代理上游通道
 
 基于 Agent Platform Studio Express Mode 的 batchGraphql 协议实现。
+无需无头浏览器，直接通过 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
 支持完整的 Function Calling (工具调用) 与 Google Search。
-内置终极防弹 Schema 清洗器、相邻消息合并、以及【思考签名(thoughtSignature)无损保留技术】。
+内置终极防弹 Schema 清洗器、相邻消息合并、以及【思考签名(thoughtSignature)精准回放技术】。
 """
 
 import json
@@ -169,7 +170,7 @@ def _convert_messages_to_contents(messages: list) -> tuple:
         
         parts = []
         
-        # 1. 还原 Function Response (含 thought_signature)
+        # 1. 还原 Function Response (属于 user 角色)
         if role == "tool":
             gemini_role = "user" 
             tool_output_data = {}
@@ -181,33 +182,15 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             except json.JSONDecodeError:
                 tool_output_data = {"result": str(content)}
             
-            tool_call_id_str = getattr(msg, "tool_call_id", "") or ""
-            real_tool_id = ""
-            thought_sig = ""
-            
-            # 解析潜藏在 ID 里的思考签名
-            if "__thought__" in tool_call_id_str:
-                parts_id = tool_call_id_str.split("__thought__")
-                real_tool_id = parts_id[0]
-                thought_sig = parts_id[1] if len(parts_id) > 1 else ""
-            else:
-                real_tool_id = tool_call_id_str
-
             func_resp = {
                 "name": msg.name or "unknown",
                 "response": tool_output_data
             }
-            if real_tool_id and not real_tool_id.startswith("call_"):
-                func_resp["id"] = real_tool_id
-                
+            # 🛡️ 严防 1：在这里绝不能传入 id 或者 thoughtSignature，否则谷歌会直接爆 invalid argument
             part_dict = {"functionResponse": func_resp}
-            # 完璧归赵，交还 thoughtSignature
-            if thought_sig:
-                part_dict["thoughtSignature"] = thought_sig
-                
             parts.append(part_dict)
             
-        # 2. 还原 Function Call 历史 (含 thought_signature)
+        # 2. 还原 Function Call 历史 (属于 model 角色)
         elif role == "assistant" and getattr(msg, "tool_calls", None):
             gemini_role = "model"
             for tool_call in msg.tool_calls:
@@ -219,30 +202,24 @@ def _convert_messages_to_contents(messages: list) -> tuple:
                     args_dict = {}
                 
                 tool_call_id_str = tool_call.get("id", "")
-                real_tool_id = ""
                 thought_sig = ""
                 if "__thought__" in tool_call_id_str:
                     parts_id = tool_call_id_str.split("__thought__")
-                    real_tool_id = parts_id[0]
+                    # 剥离出我们临时藏在 ID 里的 base64 思考签名
                     thought_sig = parts_id[1] if len(parts_id) > 1 else ""
-                else:
-                    real_tool_id = tool_call_id_str
                     
                 func_call = {
                     "name": func_data.get("name", "unknown"),
                     "args": args_dict
                 }
-                if real_tool_id and not real_tool_id.startswith("call_"):
-                    func_call["id"] = real_tool_id
-                    
+                # 🛡️ 严防 2：绝不把我们本地自创的假 call_ 形式 ID 发给谷歌，防旧模型报错
                 part_dict = {"functionCall": func_call}
-                # 完璧归赵，交还 thoughtSignature
+                # 🎯 精准回放：思考签名必须且只能塞进原生的 model (assistant) 部分
                 if thought_sig:
                     part_dict["thoughtSignature"] = thought_sig
                     
                 parts.append(part_dict)
                 
-            # 过滤掉空文本
             if content:
                 parts.append({"text": str(content)})
                 
@@ -293,8 +270,18 @@ def _build_batch_graphql_body(project_id: str, model_name: str, request: OpenAIR
         "maxOutputTokens": request.max_tokens if request.max_tokens is not None else 65535,
     }
     
-    if any(kw in model_name for kw in ("gemini-3", "gemini-2.5")):
-        gen_config["thinkingConfig"] = {"thinkingLevel": "MEDIUM", "includeThoughts": True}
+    # 🛡️ 严防 3：动态适配思考配置，防 2.5 级等旧版模型因不识别 thinkingLevel 字段爆 invalid argument
+    if "gemini-3" in model_name:
+        gen_config["thinkingConfig"] = {
+            "thinkingLevel": "HIGH", 
+            "includeThoughts": True
+        }
+    elif "gemini-2.5" in model_name:
+        # 2.5 模型仅支持用 Token 数作为预算单位的 thinkingBudget
+        gen_config["thinkingConfig"] = {
+            "thinkingBudget": 4096, 
+            "includeThoughts": True
+        }
     
     safety_settings = [
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
@@ -441,7 +428,7 @@ def _extract_from_results(obj: dict):
             for part in parts:
                 func_call = part.get("functionCall")
                 if func_call:
-                    # 关键修改：提取 thoughtSignature
+                    # 提取并记录原始的 thoughtSignature
                     sig = part.get("thoughtSignature") or part.get("thought_signature") or ""
                     yield ("function_call", {"call": func_call, "sig": sig})
                     continue
@@ -513,7 +500,6 @@ async def _execute_stream_request(client, headers, body, model_display, response
                         events.append(_make_openai_chunk(response_id, model_display, content=data))
                         has_content = True
                     elif event_type == "function_call":
-                        # 还原签名到 ID 中
                         func_name = data["call"].get("name", "unknown")
                         args_dict = data["call"].get("args", {})
                         real_id = data["call"].get("id", "")
