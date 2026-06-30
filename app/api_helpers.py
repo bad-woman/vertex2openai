@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Callable, Optional
 
 from fastapi.responses import JSONResponse, StreamingResponse
 from google.genai import types
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from models import OpenAIRequest, OpenAIMessage
 from message_processing import (
@@ -149,16 +149,11 @@ def log_retry_attempt(retry_state):
 @retry(
     stop=stop_after_attempt(20),
     wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type(Exception),
+    retry=retry_if_exception(is_retryable_exception),
     before_sleep=log_retry_attempt
 )
 async def execute_with_retry(func, *args, **kwargs):
-    try:
-        return await func(*args, **kwargs)
-    except Exception as e:
-        if not is_retryable_exception(e):
-            raise e 
-        raise 
+    return await func(*args, **kwargs)
     
 def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
