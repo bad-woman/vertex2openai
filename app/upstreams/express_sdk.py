@@ -10,7 +10,7 @@ from api_helpers import (
     create_generation_config,
     execute_gemini_call,
     create_openai_error_response,
-    execute_interaction_call  # <--- 导入 Interactions API 处理器
+    execute_interaction_call  # 导入 Interactions API 处理器
 )
 from message_processing import create_gemini_prompt
 from http_options import get_http_options
@@ -57,6 +57,28 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
         thinking_config["thinking_budget"] = 1024 if reasoning_effort == "low" else -1
     return thinking_config
 
+
+# ==========================================================
+# 🌟 新增：专门为 Interactions API (Omni模型) 适配的 Prompt 构造器
+# ==========================================================
+def create_interaction_prompt(messages: list) -> list:
+    """将 OpenAI 消息结构转换为 Interactions API 要求的 Step 列表结构"""
+    # 1. 先复用原有的强大处理器，它会帮我们自动下载图片、压缩、解析格式
+    contents = create_gemini_prompt(messages)
+    
+    steps = []
+    # 2. 将 Content 结构转化为 Pydantic 能够识别的 UserInputStep / ModelOutputStep 字典
+    for content in contents:
+        # 映射 role 到 type
+        step_type = "user_input" if content.role == "user" else "model_output"
+        steps.append({
+            "type": step_type,
+            "content": content.parts  # 直接透传已经处理好的 parts 数组
+        })
+        
+    return steps
+
+
 class ExpressSDKUpstream(BaseUpstream):
     async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
         express_key_manager_instance = fastapi_request.app.state.express_key_manager
@@ -87,7 +109,8 @@ class ExpressSDKUpstream(BaseUpstream):
 
         if is_omni:
             print(f"🌐 [上游端点] 检测到 Omni 模型，已启用 Interactions API 专属视频通道。")
-            return await execute_interaction_call(client_to_use, base_model_name, create_gemini_prompt, request_obj)
+            # 👇 核心修复点：将 create_gemini_prompt 替换为全新的 create_interaction_prompt
+            return await execute_interaction_call(client_to_use, base_model_name, create_interaction_prompt, request_obj)
 
         # ====== 旧版生成模型逻辑 (Gemini 3.5/2.5 等) ======
         print(f"🌐 [上游端点] 使用官方 Gemini SDK 调用模型 {base_model_name}。")
