@@ -10,10 +10,14 @@ from api_helpers import (
     create_generation_config,
     execute_gemini_call,
     create_openai_error_response,
-    execute_interaction_call  # 导入 Interactions API 处理器
+    execute_interaction_call
 )
 from message_processing import create_gemini_prompt
 from http_options import get_http_options
+
+# 引入状态管理，用于获取 Project ID
+from runtime_state import app_state
+import config as app_config
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -57,25 +61,15 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
         thinking_config["thinking_budget"] = 1024 if reasoning_effort == "low" else -1
     return thinking_config
 
-
-# ==========================================================
-# 🌟 新增：专门为 Interactions API (Omni模型) 适配的 Prompt 构造器
-# ==========================================================
 def create_interaction_prompt(messages: list) -> list:
-    """将 OpenAI 消息结构转换为 Interactions API 要求的 Step 列表结构"""
-    # 1. 先复用原有的强大处理器，它会帮我们自动下载图片、压缩、解析格式
     contents = create_gemini_prompt(messages)
-    
     steps = []
-    # 2. 将 Content 结构转化为 Pydantic 能够识别的 UserInputStep / ModelOutputStep 字典
     for content in contents:
-        # 映射 role 到 type
         step_type = "user_input" if content.role == "user" else "model_output"
         steps.append({
             "type": step_type,
-            "content": content.parts  # 直接透传已经处理好的 parts 数组
+            "content": content.parts
         })
-        
     return steps
 
 
@@ -95,24 +89,39 @@ class ExpressSDKUpstream(BaseUpstream):
             return JSONResponse(status_code=401, content=create_openai_error_response(401, "无可用 API Key", "auth_error"))
         _, express_api_key = key_tuple
 
-        # ==========================================
-        # 🌟 针对 Omni 模型触发新版 Interactions API
-        # ==========================================
         is_omni = "omni" in base_model_name.lower()
-        custom_headers = {"Api-Revision": "2026-05-20"} if is_omni else None
+        
+        # ==========================================
+        # 🌟 构建客户端参数
+        # ==========================================
+        client_kwargs = {
+            "vertexai": True,
+            "api_key": express_api_key,
+        }
+        
+        if is_omni:
+            client_kwargs["http_options"] = get_http_options(headers={"Api-Revision": "2026-05-20"})
+            client_kwargs["location"] = "global"  # Interactions API 强制要求
+            
+            # 获取 Project ID
+            project_id = app_config.GOOGLE_PROJECT_ID or app_state.get_project_id()
+            if not project_id:
+                # 安全拦截：如果没有提供 Project ID，绝不硬编码，而是直接抛出清晰的错误要求用户去填
+                error_msg = "调用 Omni 视频模型 (Interactions API) 必须配置 Google Cloud Project ID。请在系统大盘中填写，或设置环境变量 GOOGLE_PROJECT_ID。"
+                print(f"❌ [配置错误] {error_msg}")
+                return JSONResponse(status_code=400, content=create_openai_error_response(400, error_msg, "invalid_request_error"))
+                
+            client_kwargs["project"] = project_id
+        else:
+            client_kwargs["http_options"] = get_http_options()
 
-        client_to_use = genai.Client(
-            vertexai=True,
-            api_key=express_api_key,
-            http_options=get_http_options(headers=custom_headers),
-        )
+        client_to_use = genai.Client(**client_kwargs)
 
+        # ====== 分流逻辑 ======
         if is_omni:
             print(f"🌐 [上游端点] 检测到 Omni 模型，已启用 Interactions API 专属视频通道。")
-            # 👇 核心修复点：将 create_gemini_prompt 替换为全新的 create_interaction_prompt
             return await execute_interaction_call(client_to_use, base_model_name, create_interaction_prompt, request_obj)
 
-        # ====== 旧版生成模型逻辑 (Gemini 3.5/2.5 等) ======
         print(f"🌐 [上游端点] 使用官方 Gemini SDK 调用模型 {base_model_name}。")
         is_image_model = "image" in request_obj.model.lower()
         gen_config_dict = create_generation_config(request_obj)
