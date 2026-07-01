@@ -15,7 +15,6 @@ from api_helpers import (
 from message_processing import create_gemini_prompt
 from http_options import get_http_options
 
-# 引入状态管理，用于获取 Project ID
 from runtime_state import app_state
 import config as app_config
 
@@ -92,7 +91,7 @@ class ExpressSDKUpstream(BaseUpstream):
         is_omni = "omni" in base_model_name.lower()
         
         # ==========================================
-        # 🌟 构建客户端参数
+        # 🌟 构建客户端：坚决不在初始化时传 Project
         # ==========================================
         client_kwargs = {
             "vertexai": True,
@@ -101,27 +100,37 @@ class ExpressSDKUpstream(BaseUpstream):
         
         if is_omni:
             client_kwargs["http_options"] = get_http_options(headers={"Api-Revision": "2026-05-20"})
-            client_kwargs["location"] = "global"  # Interactions API 强制要求
-            
-            # 获取 Project ID
-            project_id = app_config.GOOGLE_PROJECT_ID or app_state.get_project_id()
-            if not project_id:
-                # 安全拦截：如果没有提供 Project ID，绝不硬编码，而是直接抛出清晰的错误要求用户去填
-                error_msg = "调用 Omni 视频模型 (Interactions API) 必须配置 Google Cloud Project ID。请在系统大盘中填写，或设置环境变量 GOOGLE_PROJECT_ID。"
-                print(f"❌ [配置错误] {error_msg}")
-                return JSONResponse(status_code=400, content=create_openai_error_response(400, error_msg, "invalid_request_error"))
-                
-            client_kwargs["project"] = project_id
         else:
             client_kwargs["http_options"] = get_http_options()
 
         client_to_use = genai.Client(**client_kwargs)
 
-        # ====== 分流逻辑 ======
+        # ==========================================
+        # 🌟 猴子补丁：绕过拦截器，强行注入 Project ID
+        # ==========================================
         if is_omni:
-            print(f"🌐 [上游端点] 检测到 Omni 模型，已启用 Interactions API 专属视频通道。")
+            project_id = app_config.GOOGLE_PROJECT_ID or app_state.get_project_id()
+            if not project_id:
+                error_msg = "调用 Omni 视频模型 (Interactions API) 必须配置 Google Cloud Project ID。请在系统大盘中填写，或设置环境变量 GOOGLE_PROJECT_ID。"
+                print(f"❌ [配置错误] {error_msg}")
+                return JSONResponse(status_code=400, content=create_openai_error_response(400, error_msg, "invalid_request_error"))
+            
+            # 强行突破 3.0.0+ SDK 限制：对象生成后，再把路由需要的参数塞进去！
+            client_to_use.project = project_id
+            client_to_use.location = "global"
+            if hasattr(client_to_use, '_api_client'):
+                client_to_use._api_client.project = project_id
+                client_to_use._api_client.location = "global"
+                # 兼容部分子版本的内部属性
+                if hasattr(client_to_use._api_client, 'vertex_project'):
+                    client_to_use._api_client.vertex_project = project_id
+                if hasattr(client_to_use._api_client, 'vertex_location'):
+                    client_to_use._api_client.vertex_location = "global"
+
+            print(f"🌐 [上游端点] 检测到 Omni 模型，已突破 SDK 路由限制，启用 Interactions API 专属视频通道。")
             return await execute_interaction_call(client_to_use, base_model_name, create_interaction_prompt, request_obj)
 
+        # ====== 旧版生成模型逻辑 (Gemini 3.5/2.5 等) ======
         print(f"🌐 [上游端点] 使用官方 Gemini SDK 调用模型 {base_model_name}。")
         is_image_model = "image" in request_obj.model.lower()
         gen_config_dict = create_generation_config(request_obj)
