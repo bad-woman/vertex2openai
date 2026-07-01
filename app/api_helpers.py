@@ -143,7 +143,7 @@ def is_retryable_exception(e):
 def log_retry_attempt(retry_state):
     attempt = retry_state.attempt_number
     e = retry_state.outcome.exception()
-    stats.add_retry() # 核心：自动退避重试精准计入大盘
+    stats.add_retry()
     print(f"⚠️ [自动重试] 上游暂时繁忙或触发 Express Mode 配额限制（{e.__class__.__name__}）。正在进行第 {attempt} 次退避重试。")
 
 @retry(
@@ -197,7 +197,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if fmt_type == "json_object":
             config["response_mime_type"] = "application/json"
     
-    # 官方 2026 最新基准配置
     safety_threshold = "BLOCK_NONE"
     
     config["safety_settings"] = [
@@ -235,10 +234,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     
     if is_image_model:
         config["response_modalities"] = ["TEXT", "IMAGE"]
-        
-        # 默认不指定比例，开启 API 原生智能自动决策机制
         target_ar = None
-        
         req_dict = request.model_dump()
         size_param = req_dict.get("size")
         if size_param:
@@ -253,18 +249,14 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                 if isinstance(msg.content, str): content = msg.content
                 elif isinstance(msg.content, list): content = " ".join([p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"])
                 
-                # 优先匹配标准生图 --ar，其次匹配独立比例，防非比例数字干扰
                 ar_match = re.search(r"(?i)--ar\s*(\d+[:：]\d+)", content)
                 if not ar_match:
                     ar_match = re.search(r"\b(\d+[:：]\d+)\b", content)
                     
                 if ar_match:
                     parsed_ar = ar_match.group(1).replace("：", ":")
-                    
-                    # 定义生图模型的比例安全白名单
                     pro_supported = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
                     flash_supported = pro_supported | {"1:4", "4:1", "1:8", "8:1"}
-                    
                     is_flash_img = "3.1-flash" in request.model.lower()
                     allowed_set = flash_supported if is_flash_img else pro_supported
                     
@@ -275,7 +267,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                         target_ar = None
                 break
                 
-        # 封装 image_config 结构，强制 4K 级别分辨率
         image_config_args = {"image_size": "4K"}
         if target_ar:
             image_config_args["aspect_ratio"] = target_ar
@@ -352,10 +343,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             for part in candidate.content.parts:
                 if hasattr(part, "function_call") and part.function_call is not None: 
                     fc = part.function_call
-                    
                     real_id = getattr(fc, "id", None)
                     if not real_id: real_id = getattr(fc, "thought_signature", None)
-                    
                     thought_sig = getattr(part, "thought_signature", None)
                     thought_sig_b64 = ""
                     if thought_sig:
@@ -366,33 +355,21 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     
                     safe_name = fc.name.replace(" ", "_")
                     rand_num = int(time.time() * 10000 + random.randint(0, 9999))
-                    
                     if real_id:
-                        if thought_sig_b64:
-                            tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
-                        else:
-                            tool_call_id = real_id
+                        if thought_sig_b64: tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
+                        else: tool_call_id = real_id
                     else:
-                        if thought_sig_b64:
-                            tool_call_id = f"call_{response_id}_{candidate_index}_{safe_name}__thought__{thought_sig_b64}"
-                        else:
-                            tool_call_id = f"call_{response_id}_{candidate_index}_{safe_name}_{rand_num}"
+                        if thought_sig_b64: tool_call_id = f"call_{response_id}_{candidate_index}_{safe_name}__thought__{thought_sig_b64}"
+                        else: tool_call_id = f"call_{response_id}_{candidate_index}_{safe_name}_{rand_num}"
                     
                     current_tool_call_delta = {
-                        "index": 0, 
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {"name": fc.name}
+                        "index": 0, "id": tool_call_id, "type": "function", "function": {"name": fc.name}
                     }
-                    if fc.args is not None: 
-                        current_tool_call_delta["function"]["arguments"] = json.dumps(fc.args)
-                    else: 
-                        current_tool_call_delta["function"]["arguments"] = "" 
+                    if fc.args is not None: current_tool_call_delta["function"]["arguments"] = json.dumps(fc.args)
+                    else: current_tool_call_delta["function"]["arguments"] = "" 
 
-                    if "tool_calls" not in delta_payload:
-                        delta_payload["tool_calls"] = []
+                    if "tool_calls" not in delta_payload: delta_payload["tool_calls"] = []
                     delta_payload["tool_calls"].append(current_tool_call_delta)
-                    
                     delta_payload["content"] = None 
                     function_call_detected_in_chunk = True
                     break 
@@ -402,14 +379,11 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
             if app_config.SAFETY_SCORE and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
                 safety_html = _create_safety_ratings_html(candidate.safety_ratings)
-                if reasoning_text:
-                    reasoning_text += safety_html
-                else:
-                    normal_text += safety_html
+                if reasoning_text: reasoning_text += safety_html
+                else: normal_text += safety_html
 
             if reasoning_text: delta_payload["reasoning_content"] = reasoning_text
-            if normal_text: 
-                delta_payload["content"] = normal_text
+            if normal_text: delta_payload["content"] = normal_text
             elif not reasoning_text and not delta_payload.get("tool_calls") and openai_finish_reason is None:
                 delta_payload["content"] = ""
     
@@ -481,7 +455,6 @@ async def _chunk_openai_response_dict_for_sse(
 
             content_to_chunk = actual_content if actual_content is not None else ""
             if actual_content is not None:
-                # 【回滚】：恢复原版图片传输方案（一次性全量发送），彻底拯救前端解析器不卡死
                 if "![Image](data:image/" in content_to_chunk:
                     chunk_size = max(1, len(content_to_chunk))
                 else:
@@ -545,9 +518,7 @@ async def gemini_fake_stream_generator(
                 block_message += f" (Message: {raw_gemini_response.prompt_feedback.block_reason_message})"
             raise ValueError(block_message)
 
-        async for chunk_sse in _chunk_openai_response_dict_for_sse(
-            openai_response_dict=openai_response_dict
-        ):
+        async for chunk_sse in _chunk_openai_response_dict_for_sse(openai_response_dict):
             yield chunk_sse
 
     except asyncio.CancelledError:
@@ -561,9 +532,8 @@ async def gemini_fake_stream_generator(
         sse_err_msg_display = str(e_outer_gemini)
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
         err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
-        json_payload_error = json.dumps(err_resp_sse)
         if not is_auto_attempt:
-            yield f"data: {json_payload_error}\n\n"
+            yield f"data: {json.dumps(err_resp_sse)}\n\n"
             yield "data: [DONE]\n\n"
         if is_auto_attempt: raise
             
@@ -576,22 +546,19 @@ async def execute_gemini_call(
     is_auto_attempt: bool = False
 ):
     actual_prompt_for_call = prompt_func(request_obj.messages)
-    client_model_name_for_log = getattr(current_client, "model_name", "unknown_direct_client_object")
     print(f"🚀 [上游请求] 正在调用 Gemini Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
     
     if request_obj.stream:
         is_image_request = "image" in request_obj.model.lower()
-        
         if app_config.FAKE_STREAMING_ENABLED or is_image_request:
-            if is_image_request:
-                 print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
+            if is_image_request: print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出，以避免上游流式限制。")
             return StreamingResponse(
                 gemini_fake_stream_generator(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt
                 ), media_type="text/event-stream"
             )
-        else: # True Streaming
+        else:
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
                 max_retries = 20
@@ -602,16 +569,13 @@ async def execute_gemini_call(
                             contents=actual_prompt_for_call,
                             config=gen_config_dict
                         )
-                        
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
-                        
                         async for chunk_item_call in stream_gen_obj:
                             if hasattr(chunk_item_call, "usage_metadata") and chunk_item_call.usage_metadata:
                                 um = chunk_item_call.usage_metadata
                                 final_p_tk = getattr(um, "prompt_token_count", 0) or 0
                                 final_c_tk = getattr(um, "candidates_token_count", 0) or 0
                                 final_t_tk = getattr(um, "total_token_count", final_p_tk + final_c_tk) or (final_p_tk + final_c_tk)
-                                    
                             yield convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, 0)
                         
                         if final_p_tk > 0 or final_c_tk > 0:
@@ -619,22 +583,19 @@ async def execute_gemini_call(
                             
                         yield "data: [DONE]\n\n"
                         break 
-                        
                     except asyncio.CancelledError:
                         print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                         raise
                     except Exception as e_stream_call:
                         error_str = str(e_stream_call).lower()
                         is_retryable = False
-                        
                         if "429" in error_str or "503" in error_str or "too many requests" in error_str or "quota" in error_str or "resource exhausted" in error_str:
                             is_retryable = True
-                            
                         if is_retryable and attempt < max_retries - 1:
                             wave_index = attempt % 4
                             round_num = (attempt // 4) + 1
                             wait_time = 2 ** wave_index
-                            stats.add_retry() # 核心：手动重试计入大盘
+                            stats.add_retry()
                             print(f"⚠️ [自动重试] Gemini Express Mode 流式请求返回 429/503 或配额繁忙。第 {round_num} 轮第 {wave_index + 1} 次重试，等待 {wait_time} 秒。")
                             await asyncio.sleep(wait_time)
                             continue 
@@ -642,58 +603,157 @@ async def execute_gemini_call(
                         err_msg_detail_stream = f"Gemini 流式请求异常（模型：{model_to_call}）：{type(e_stream_call).__name__} - {str(e_stream_call)}"
                         print(f"❌ [API 错误响应] 流式连接异常中断 (Model: {model_to_call})。错误详情: {err_msg_detail_stream}")
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
-                        err_resp = create_openai_error_response(500,s_err,"server_error")
-                        j_err = json.dumps(err_resp)
                         if not is_auto_attempt: 
-                            yield f"data: {j_err}\n\n"
+                            yield f"data: {json.dumps(create_openai_error_response(500,s_err,'server_error'))}\n\n"
                             yield "data: [DONE]\n\n"
-                        else:
-                            raise e_stream_call
-            
+                        else: raise e_stream_call
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
-    else: # Non-streaming
+    else:
         response_obj_call = await execute_with_retry(
             current_client.aio.models.generate_content,
             model=model_to_call, 
             contents=actual_prompt_for_call,
             config=gen_config_dict
         )
-        if hasattr(response_obj_call, "prompt_feedback") and \
-           hasattr(response_obj_call.prompt_feedback, "block_reason") and \
-           response_obj_call.prompt_feedback.block_reason:
+        if hasattr(response_obj_call, "prompt_feedback") and hasattr(response_obj_call.prompt_feedback, "block_reason") and response_obj_call.prompt_feedback.block_reason:
             block_msg = f"Gemini 安全策略拦截了请求：{response_obj_call.prompt_feedback.block_reason}"
-            if hasattr(response_obj_call.prompt_feedback,"block_reason_message") and \
-               response_obj_call.prompt_feedback.block_reason_message: 
-                block_msg+=f"（{response_obj_call.prompt_feedback.block_reason_message}）"
             raise ValueError(block_msg)
-        
         if not is_gemini_response_valid(response_obj_call):
-            error_details = f"Gemini 非流式响应无有效内容，模型：{model_to_call}。"
-            if hasattr(response_obj_call, "candidates"):
-                error_details += f"Candidates: {len(response_obj_call.candidates) if response_obj_call.candidates else 0}. "
-                if response_obj_call.candidates and len(response_obj_call.candidates) > 0:
-                    candidate = response_obj_call.candidates if isinstance(response_obj_call.candidates, list) else response_obj_call.candidates
-                    if hasattr(candidate, "content"):
-                        error_details += "Has content. "
-                        if hasattr(candidate.content, "parts"):
-                            error_details += f"Parts: {len(candidate.content.parts) if candidate.content.parts else 0}. "
-                            if candidate.content.parts and len(candidate.content.parts) > 0:
-                                part = candidate.content.parts if isinstance(candidate.content.parts, list) else candidate.content.parts
-                                if hasattr(part, "text"):
-                                    text_preview = str(getattr(part, "text", ""))[:100]
-                                    error_details += f"First part text: '{text_preview}'"
-                                elif hasattr(part, "function_call"):
-                                    error_details += f"First part is function_call: {part.function_call.name}"
-            else:
-                error_details += f"Response type: {type(response_obj_call).__name__}"
-            raise ValueError(error_details)
+            raise ValueError(f"Gemini 非流式响应无有效内容，模型：{model_to_call}。")
         
         if hasattr(response_obj_call, "usage_metadata") and response_obj_call.usage_metadata:
             um = response_obj_call.usage_metadata
             p_tk = getattr(um, "prompt_token_count", 0) or 0
             c_tk = getattr(um, "candidates_token_count", 0) or 0
-            t_tk = getattr(um, "total_token_count", p_tk + c_tk) or (p_tk + c_tk)
-            print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+            print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {p_tk + c_tk} Tokens")
 
-        openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
-        return JSONResponse(content=openai_response_content)
+        return JSONResponse(content=convert_to_openai_format(response_obj_call, request_obj.model))
+
+
+# =========================================================================
+# 🎬 Gemini Interactions API (如 Omni 视频模型) 专属解析与调用通道
+# =========================================================================
+
+def _build_omni_config(request: OpenAIRequest) -> dict | None:
+    """智能拦截并提取用户传入的宽高比和视频时长参数"""
+    video_config = {}
+    
+    # 1. 从 OpenAI API 顶层参数提取 (例如支持传 size)
+    req_dict = request.model_dump()
+    size_param = req_dict.get("size")
+    if size_param in ["16:9", "9:16"]:
+        video_config["aspect_ratio"] = size_param
+        
+    # 2. 从用户的自然语言 Prompt 中提取魔法指令
+    for msg in reversed(request.messages):
+        if msg.role == "user":
+            content = ""
+            if isinstance(msg.content, str): 
+                content = msg.content
+            elif isinstance(msg.content, list): 
+                content = " ".join([p.get("text", "") for p in msg.content if isinstance(p, dict) and p.get("type") == "text"])
+            
+            # 匹配 --ar 16:9 或 9:16
+            ar_match = re.search(r"(?i)--ar\s*(16:9|9:16)", content)
+            if ar_match:
+                video_config["aspect_ratio"] = ar_match.group(1)
+                
+            # 匹配 --duration 5 或 --时长 8
+            duration_match = re.search(r"(?i)--(?:duration|time|时长)\s*(\d+)", content)
+            if duration_match:
+                sec = int(duration_match.group(1))
+                if 3 <= sec <= 10:
+                    video_config["duration_seconds"] = sec
+            break
+            
+    if video_config:
+        print(f"⚙️ [视频配置] 提取到视频控制参数: {video_config}")
+        return {"video_config": video_config}
+    return None
+
+
+def _parse_interaction_to_openai(interaction: Any, model_name: str) -> dict:
+    text_content = ""
+    steps = getattr(interaction, 'steps', [])
+    if not steps and isinstance(interaction, dict):
+        steps = interaction.get('steps', [])
+        
+    for step in steps:
+        step_type = getattr(step, 'type', None) or (step.get('type') if isinstance(step, dict) else None)
+        if step_type == 'model_output':
+            content = getattr(step, 'content', []) or (step.get('content') if isinstance(step, dict) else [])
+            for part in content:
+                part_type = getattr(part, 'type', None) or (part.get('type') if isinstance(part, dict) else None)
+                if part_type == 'text':
+                    text_val = getattr(part, 'text', '') or (part.get('text', '') if isinstance(part, dict) else '')
+                    text_content += text_val + "\n"
+                elif part_type == 'video':
+                    mime_type = getattr(part, 'mime_type', 'video/mp4') or (part.get('mime_type', 'video/mp4') if isinstance(part, dict) else 'video/mp4')
+                    video_b64 = getattr(part, 'data', None) or (part.get('data') if isinstance(part, dict) else None)
+                    uri = getattr(part, 'uri', None) or (part.get('uri') if isinstance(part, dict) else None)
+                    
+                    if video_b64:
+                        text_content += f'\n<br><video controls autoplay loop width="100%" style="max-width: 640px; border-radius: 8px;"><source src="data:{mime_type};base64,{video_b64}" type="{mime_type}"></video><br>\n'
+                    elif uri:
+                        text_content += f'\n> 💡 **视频生成完毕！**\n> 但由于 Express Mode 暂无 Cloud Storage 读取权限，视频无法直接返回。它被托管在了：\n> `GCS URI: {uri}`\n> *（如果你看到了这条消息，说明你的 API Key 支持调用该模型，只是受到了储存桶权限限制）*\n'
+                        
+    response_timestamp = int(time.time())
+    return {
+        "id": f"chatcmpl-interaction-{response_timestamp}-{random.randint(1000,9999)}",
+        "object": "chat.completion",
+        "created": response_timestamp,
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text_content.strip()},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    }
+
+async def _interaction_fake_stream_generator(current_client, model_to_call, actual_prompt, request_obj):
+    kwargs = {"model": model_to_call, "input": actual_prompt}
+    omni_config = _build_omni_config(request_obj)
+    if omni_config:
+        kwargs["config"] = omni_config
+
+    api_call_task = asyncio.create_task(
+        execute_with_retry(current_client.aio.interactions.create, **kwargs)
+    )
+    
+    outer_keep_alive_interval = app_config.FAKE_STREAMING_INTERVAL_SECONDS
+    if outer_keep_alive_interval > 0:
+        while not api_call_task.done():
+            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+            await asyncio.sleep(outer_keep_alive_interval)
+            
+    try:
+        interaction_response = await api_call_task
+        openai_dict = _parse_interaction_to_openai(interaction_response, request_obj.model)
+        
+        async for chunk_sse in _chunk_openai_response_dict_for_sse(openai_dict):
+            yield chunk_sse
+    except Exception as e:
+        print(f"❌ [Interactions API] Omni 模型生成异常: {e}")
+        err_resp = create_openai_error_response(500, str(e), "server_error")
+        yield f"data: {json.dumps(err_resp)}\n\n"
+        yield "data: [DONE]\n\n"
+
+async def execute_interaction_call(current_client, model_to_call, prompt_func, request_obj):
+    actual_prompt = prompt_func(request_obj.messages)
+    print(f"🚀 [上游请求] 正在通过 Interactions API 专属通道调用 Omni 模型 {model_to_call}...")
+
+    if request_obj.stream:
+        return StreamingResponse(
+            _interaction_fake_stream_generator(current_client, model_to_call, actual_prompt, request_obj), 
+            media_type="text/event-stream"
+        )
+    else:
+        kwargs = {"model": model_to_call, "input": actual_prompt}
+        omni_config = _build_omni_config(request_obj)
+        if omni_config:
+            kwargs["config"] = omni_config
+            
+        response = await execute_with_retry(current_client.aio.interactions.create, **kwargs)
+        return JSONResponse(content=_parse_interaction_to_openai(response, request_obj.model))
