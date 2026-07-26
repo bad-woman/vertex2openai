@@ -509,7 +509,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）</span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分</span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
+            <div id="h_ss" class="helpbox">在每条回复<b>正文末尾</b>附一个可折叠块，列出该回复各安全分类的概率与严重度评分（Hate Speech / Dangerous Content / Sexually Explicit / Harassment / Jailbreak）。用来判断内容离触发拦截还有多远。<br>前端若不渲染 HTML，会看到一段 <code>&lt;details&gt;</code> 原文，属正常。<br><b>Cookie 通道注意</b>：该通道平时下发 <code>OFF</code>（分类器整个关闭、上游不回传评分）。打开本开关后会改为下发 <code>BLOCK_NONE</code>——仍然<b>永不拦截</b>，只是让上游把评分算出来回传。不需要看评分就关掉，保持 <code>OFF</code>。</div>
+          </div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
             <div id="h_dbg" class="helpbox">两条通道都会在运行日志里打印<b>实际发出</b>的思考档位与采样参数。排查“设置没生效”时先开这个——日志里看到什么，模型就收到了什么。平时可关。</div>

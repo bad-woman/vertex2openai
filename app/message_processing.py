@@ -842,30 +842,49 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
     return parts
 
 
+def _rating_fields(r: Any) -> Tuple[str, str, Optional[float], Optional[float]]:
+    """把一条安全评分归一成 (分类, 概率档, 概率分, 严重度分)。
+
+    Express 通道给的是 SDK 对象（属性 + 枚举），Cookie 通道给的是 batchGraphql
+    的 camelCase 字典，两边共用同一个渲染器。
+    """
+    def _enum_name(v):
+        return getattr(v, "name", None) or (str(v) if v is not None else "")
+
+    if isinstance(r, dict):
+        cat = str(r.get("category") or "")
+        prob = str(r.get("probability") or "")
+        ps, ss = r.get("probabilityScore"), r.get("severityScore")
+    else:
+        cat = _enum_name(getattr(r, "category", None))
+        prob = _enum_name(getattr(r, "probability", None))
+        ps, ss = getattr(r, "probability_score", None), getattr(r, "severity_score", None)
+    cat = cat.replace("HARM_CATEGORY_", "").replace("_", " ").title()
+    return cat, prob, (ps if isinstance(ps, (int, float)) else None), (ss if isinstance(ss, (int, float)) else None)
+
+
 def _create_safety_ratings_html(safety_ratings: list) -> str:
     if not safety_ratings:
         return ""
-    highest_rating = max(safety_ratings, key=lambda r: r.probability_score)
-    highest_score = highest_rating.probability_score
+    # 上游对部分分类只给 probability 不给 probability_score（实测 JAILBREAK 常为 None），
+    # 直接 max(key=probability_score) 会拿 None 和 float 比较 → TypeError，
+    # 整个请求变成 500。缺分数的按 -1 排，永远不会被选成“最高分”。
+    normalized = [_rating_fields(r) for r in safety_ratings]
+    highest = max(normalized, key=lambda t: t[2] if t[2] is not None else -1.0)
+    highest_score = highest[2] if highest[2] is not None else -1.0
 
-    if highest_score <= 0.33: color = "#0f8"  
+    if highest_score < 0: color = "#888"          # 一条分数都没有
+    elif highest_score <= 0.33: color = "#0f8"
     elif highest_score <= 0.66: color = "yellow"
     else: color = "#bf555d"
 
-    summary_category = highest_rating.category.name.replace("HARM_CATEGORY_", "").replace("_", " ").title()
-    summary_probability = highest_rating.probability.name
-    summary_score_str = f"{highest_rating.probability_score:.7f}" if highest_rating.probability_score is not None else "None"
-    summary_severity_str = f"{highest_rating.severity_score:.8f}" if highest_rating.severity_score is not None else "None"
-    summary_line = f"{summary_category}: {summary_probability} (Score: {summary_score_str}, Severity: {summary_severity_str})"
+    def _fmt(cat, prob, ps, ss):
+        ps_s = f"{ps:.7f}" if ps is not None else "None"
+        ss_s = f"{ss:.8f}" if ss is not None else "None"
+        return f"{cat}: {prob} (Score: {ps_s}, Severity: {ss_s})"
 
-    ratings_list = []
-    for rating in safety_ratings:
-        category = rating.category.name.replace("HARM_CATEGORY_", "").replace("_", " ").title()
-        probability = rating.probability.name
-        score_str = f"{rating.probability_score:.7f}" if rating.probability_score is not None else "None"
-        severity_str = f"{rating.severity_score:.8f}" if rating.severity_score is not None else "None"
-        ratings_list.append(f"{category}: {probability} (Score: {score_str}, Severity: {severity_str})")
-    all_ratings_str = "\n".join(ratings_list)
+    summary_line = _fmt(*highest)
+    all_ratings_str = "\n".join(_fmt(*t) for t in normalized)
 
     css_style = "<style>.cb{border:1px solid #444;margin:10px;border-radius:4px;background:#111}.cb summary{padding:8px;cursor:pointer;background:#222}.cb pre{margin:0;padding:10px;border-top:1px solid #444;white-space:pre-wrap}</style>"
     html_output = (
@@ -977,9 +996,9 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             if not function_call_detected:
                 reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
                 if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
-                    safety_html = _create_safety_ratings_html(candidate.safety_ratings)
-                    if reasoning_str: reasoning_str += safety_html
-                    else: normal_content_str += safety_html
+                    # 一律附在正文末尾。旧实现"有思考就塞进思考字段"，结果被埋进前端
+                    # 折叠起来的思考区，甚至在剥离思考的配置下整块消失——开了开关却看不到东西。
+                    normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
                 
                 message_payload["content"] = normal_content_str
                 if reasoning_str: message_payload["reasoning_content"] = reasoning_str

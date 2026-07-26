@@ -26,6 +26,7 @@ import config as app_config
 import model_capabilities as mc
 from message_processing import (
     DEFAULT_IMAGE_PREFILL_NUDGE,
+    _create_safety_ratings_html,
     apply_console_injection,
     apply_prefill_compat,
     strip_prefill_overlap,
@@ -83,6 +84,15 @@ _THINKING_RUNAWAY_HINT = (
 _NO_BODY_HINT = (
     "可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"
 )
+
+
+def _safety_html_if_enabled(ratings: Any) -> str:
+    """开关打开时把 batchGraphql 的 safetyRatings 渲染成附加块，否则空串。"""
+    if not ratings:
+        return ""
+    if not app_state.get_setting("safety_score", app_config.SAFETY_SCORE):
+        return ""
+    return _create_safety_ratings_html(ratings)
 
 
 def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
@@ -292,15 +302,19 @@ def _build_batch_graphql_body(
         if thinking_config:
             gen_config["thinkingConfig"] = thinking_config
 
+    # OFF = 分类器整个关掉，上游**不会回传** safetyRatings；BLOCK_NONE = 照常评分但从不拦截。
+    # 想看安全分就必须用后者，因此跟着「输出附加安全分」开关走（默认仍是 OFF，行为不变）。
+    _want_scores = bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
+    _threshold = "BLOCK_NONE" if _want_scores else "OFF"
     safety_settings = [
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": _threshold},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": _threshold},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": _threshold},
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": _threshold},
         # 与标准（Express）通道对齐：不发这个分类时，越狱式提示词（roleplay 预设常见）
         # 可能被默认越狱过滤拦掉“正文”而思考照常流出 → 表现为只有思考没有正文。
         # 已真机验证 batchGraphql 接受该分类（OFF / BLOCK_NONE 均可）。
-        {"category": "HARM_CATEGORY_JAILBREAK", "threshold": "OFF"},
+        {"category": "HARM_CATEGORY_JAILBREAK", "threshold": _threshold},
     ]
 
     variables = {
@@ -496,6 +510,11 @@ def _extract_from_results(obj: dict):
             # FINISH_REASON_UNSPECIFIED 是流式中间块的枚举默认值（非真实结束），需过滤。
             finish_reason = candidate.get("finishReason")
             if finish_reason and not str(finish_reason).upper().endswith("UNSPECIFIED"):
+                # 安全分只在最后一块透出：每个流式块都带 safetyRatings，
+                # 逐块附加会把同一份评分重复插进正文。
+                ratings = candidate.get("safetyRatings")
+                if ratings:
+                    yield ("safety", ratings)
                 yield ("finish", str(finish_reason))
 
         # 尽力解析 token 用量（私有接口通常不回传；保留解析以防未来补上）
@@ -637,7 +656,7 @@ async def _execute_stream_request_generator(
                         has_content = True
                         yield event_type, data
 
-                    elif event_type in ("finish", "usage", "blocked"):
+                    elif event_type in ("finish", "usage", "blocked", "safety"):
                         yield event_type, data
 
                     elif event_type == "error":
@@ -687,6 +706,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
 
             full_text, reasoning_text, api_error, usage_meta = "", "", None, None
             finish_raw, blocked_msg = None, None
+            safety_html = ""
             sampler = _RawSampler()
 
             class _F:
@@ -704,6 +724,8 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                         full_text += data
                     elif et == "finish":
                         finish_raw = data
+                    elif et == "safety":
+                        safety_html = _safety_html_if_enabled(data)
                     elif et == "blocked":
                         blocked_msg = data
                     elif et == "usage":
@@ -729,7 +751,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 print(f"🔎 [Studio 诊断] 生图无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
                 return {"kind": "error", "message": f"上游未返回图片/正文（{detail}）。已在日志记录原始响应样本。"}
 
-            return {"kind": "ok", "full_text": full_text, "reasoning_text": reasoning_text,
+            return {"kind": "ok", "full_text": full_text + safety_html, "reasoning_text": reasoning_text,
                     "finish_reason": _map_finish_reason(finish_raw), "usage_meta": usage_meta}
         except Exception as e:
             em = str(e)
@@ -968,6 +990,11 @@ class CookieProxyUpstream(BaseUpstream):
 
                             elif status == "finish":
                                 finish_raw = data
+                            elif status == "safety":
+                                # 最后一块才到，作为一个独立 chunk 追加在正文之后
+                                _sh = _safety_html_if_enabled(data)
+                                if _sh:
+                                    yield _make_openai_chunk(response_id, model_display, content=_sh)
                             elif status == "usage":
                                 usage_meta = data
                             elif status == "blocked":
@@ -1107,6 +1134,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                     full_text = ""
                     reasoning_text = ""
+                    safety_html = ""
                     api_error = None
                     usage_meta = None
                     finish_raw = None
@@ -1131,6 +1159,8 @@ class CookieProxyUpstream(BaseUpstream):
                                 full_text += data
                             elif event_type == "finish":
                                 finish_raw = data
+                            elif event_type == "safety":
+                                safety_html = _safety_html_if_enabled(data)
                             elif event_type == "blocked":
                                 blocked_msg = data
                             elif event_type == "usage":
@@ -1175,7 +1205,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                     usage = _map_usage(usage_meta)
 
-                    message_obj = {"role": "assistant", "content": full_text}
+                    message_obj = {"role": "assistant", "content": full_text + safety_html}
                     if reasoning_text and not strip_thoughts:   # strip：batchGraphql 忽略 includeThoughts，输出侧剥离
                         message_obj["reasoning_content"] = reasoning_text
 

@@ -485,12 +485,13 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         if not tool_call_deltas:
             reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
 
-            if _safety_score_enabled() and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
-                safety_html = _create_safety_ratings_html(candidate.safety_ratings)
-                if reasoning_text:
-                    reasoning_text += safety_html
-                else:
-                    normal_text += safety_html
+            # 只在**最后一个** chunk 附安全分：上游每个 chunk 都带 safetyRatings，
+            # 逐块追加会把同一份评分重复插进正文里。同样一律进正文，不进思考字段。
+            # openai_finish_reason 只在**最后一块**才有值——上游每个 chunk 都带
+            # safetyRatings，逐块追加会把同一份评分重复插进正文里。
+            if (openai_finish_reason and _safety_score_enabled()
+                    and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
+                normal_text += _create_safety_ratings_html(candidate.safety_ratings)
 
             if reasoning_text: delta_payload["reasoning_content"] = reasoning_text
             if normal_text: 
