@@ -81,21 +81,24 @@ def test_keep_turn_skips_tool_call_tail():
     assert out == msgs and detected is False
 
 
-def test_keep_turn_is_the_default_mode():
-    """默认模式改为 keep_turn。
+def test_smart_remains_the_default_mode():
+    """默认保持 smart。
 
-    实机对照（预设思维链预填充 `<thinking>\\n1.`，gemini-3.6-flash 各 3 次）：
-      smart     切题 0/3，且预设要求的 <thinking> 格式全部丢失
-      keep_turn 切题 3/3，格式完整
-    预填充在本项目的主要用途就是用预设思维链顶掉原生思维链，smart 在这条主路径上失效。
+    用真实酒馆预设（Izumi，思维链标签 <konatan_planning~>）实测 gemini-3.6-flash × 3：
+      smart      重复开标签 0/3，思考语言正确 3/3
+      keep_turn  重复开标签 3/3，思考语言正确 2/3
+    真实预设的预填充多以完整句子收尾，keep_turn 追加的 user 推动语会让模型当成
+    新一轮、把开标签重写一遍，且该重复去重逻辑抓不到（见下一条用例）。
+    keep_turn 只在预填充停在半截 token 时更优，因此保留为可选项而非默认。
     """
     import config as app_config
-    assert app_config.DEFAULT_SETTINGS["prefill_mode"] == "keep_turn"
+    assert app_config.DEFAULT_SETTINGS["prefill_mode"] == "smart"
 
 
-def test_default_mode_keeps_prefill_in_model_voice():
-    """走默认配置时，预填充不得落进 user 消息。"""
-    import config as app_config
-    out, _, _ = apply_prefill_compat(
-        _msgs(), mode=app_config.DEFAULT_SETTINGS["prefill_mode"], allow_model_last=False)
-    assert out[1].role == "assistant" and out[1].content == "从前有座山，"
+def test_dedup_cannot_catch_repeated_opening_tag():
+    """锁住选择 smart 作默认的关键依据：重复的开标签去重逻辑救不了。"""
+    from message_processing import strip_prefill_overlap
+    prefill = "小此准备好啦。\n<konatan_planning~>\n¡Allá voy!\n"
+    output = "<konatan_planning~>\n- Repaso de la situación actual"
+    assert strip_prefill_overlap(prefill, output) == output   # 无重叠，原样返回
+    assert (prefill + output).count("<konatan_planning~>") == 2

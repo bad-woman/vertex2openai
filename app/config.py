@@ -80,11 +80,16 @@ DEFAULT_SETTINGS = {
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
     # 预填充兼容模式: smart|minimal|off
-    # keep_turn：保留预填充所在的 model 轮次，只补一句极短推动语。
-    # 实机对照（预设思维链场景，gemini-3.6-flash × 3 次）：smart 切题 0/3、连
-    # <thinking> 格式都丢；keep_turn 切题 3/3 且格式完整。smart 会把预填充塞进
-    # user 消息，模型于是当成"用户贴来的参考文本"，而非"自己已写了一半"。
-    "prefill_mode": "keep_turn",
+    # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用真实酒馆预设
+    # （Izumi，思维链标签 <konatan_planning~>，西语思考）实测 gemini-3.6-flash × 3：
+    #   smart      重复开标签 0/3，思考语言正确 3/3   ← 真实预设的常见形态
+    #   keep_turn  重复开标签 3/3，思考语言正确 2/3
+    # 真实预设的预填充多以完整句子收尾（"…¡Allá voy!"），keep_turn 追加的 user
+    # 推动语会让模型当成新一轮，把开标签又写一遍；而该重复**去重逻辑抓不到**
+    # （预填充结尾与输出开头无重叠），最终输出里出现两个开标签，破坏前端正则。
+    # 仅当预填充停在半截 token（如 "<thinking>\n1."）时 keep_turn 才更优——
+    # 那种情况下 smart 会跑题且丢格式（合成用例实测 0/3）。
+    "prefill_mode": "smart",
     # 预填充触发时压制原生思考（“卡思维链”核心开关）：
     # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
     # 此路径会忽略前端 effort（预填充时优先）。

@@ -445,8 +445,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志 <span class="text-xs text-neutral-400">（两条通道都打印实际发出的思考/采样参数，实机验证必开）</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断 <span class="text-xs text-neutral-400">（无正文时的原始响应样本总是自动记录，无需开启）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令 <span class="text-xs text-neutral-400">（默认关＝沿用旧行为；开启前请先真机验证目标模型）</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式 <span class="text-xs text-neutral-400">（3.x 起官方取消预填充。「保留模型轮次」把预填充留在模型自己的轮次里，预设思维链才不会被当成参考文本）</span></span>
-            <select id="prefill_mode" class="inp" style="width:190px"><option value="keep_turn">保留模型轮次（默认）</option><option value="smart">智能（旧行为）</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式 <span class="text-xs text-neutral-400">（3.x 起官方取消预填充。预填充停在半截词/半截标签时改用「保留模型轮次」更贴合；以完整句子收尾则用「智能」）</span></span>
+            <select id="prefill_mode" class="inp" style="width:190px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
           </div>
           <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考 <span class="text-xs text-neutral-400">（卡思维链）</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
           <div>
