@@ -120,6 +120,10 @@ DEFAULT_SETTINGS = {
     # 这两项解决的是"前端本身没有预设系统"的场景，见 message_processing.apply_console_injection。
     "inject_system_instruction": "",
     "inject_prefill": "",
+    # 生图模型是否也注入预填充。实测预填充对生图有很强的引导力
+    # （同一句"画一只猫"：无预填充→彩色写实照片；预填充承诺"纯黑白钢笔线稿"→真的输出线稿），
+    # 但角色扮演用的预填充落到生图请求上会让模型改吐文本，故默认关、按需开。
+    "inject_prefill_for_image": False,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},

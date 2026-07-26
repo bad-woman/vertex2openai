@@ -25,6 +25,7 @@ from runtime_state import app_state
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
+    DEFAULT_IMAGE_PREFILL_NUDGE,
     apply_console_injection,
     apply_prefill_compat,
     strip_prefill_overlap,
@@ -82,6 +83,18 @@ _THINKING_RUNAWAY_HINT = (
 _NO_BODY_HINT = (
     "可能被安全策略拦截或接口行为变化；原始响应样本已写入运行日志，可到大盘“运行日志”页查看。"
 )
+
+
+def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
+    """选用续写指令：生图模型在用户未自定义时改用要图片的那句。
+
+    通用模板说的是"从断点处无缝往下写"，生图模型会老老实实继续写**文本**，
+    结果吐出一段字符画而不是图片（实测复现）。用户填了自定义模板则以用户的为准。
+    """
+    tpl = (user_template or "").strip()
+    if tpl:
+        return tpl
+    return DEFAULT_IMAGE_PREFILL_NUDGE if is_image_model else ""
 
 
 def _prefill_log(mode: str, prefill_text: str) -> str:
@@ -792,6 +805,7 @@ class CookieProxyUpstream(BaseUpstream):
             prefill_text=_inj_settings.get("inject_prefill", ""),
             has_tools=False,
             is_image_model=_profile["is_image"],
+            allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
         )
         for _n in _inj_notes:
             print(_n)
@@ -803,7 +817,7 @@ class CookieProxyUpstream(BaseUpstream):
             _new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not _profile["requires_user_last_turn"],
-                instruction_template=app_state.get_setting("prefill_instruction", ""),
+                instruction_template=_prefill_tpl(app_state.get_setting("prefill_instruction", ""), _profile["is_image"]),
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})

@@ -272,12 +272,20 @@ DEFAULT_KEEP_TURN_NUDGE = (
 )
 
 
+# 生图模型专用的续写指令。通用那句是"从断点处无缝往下写"，模型会照办——
+# 继续写**文本**，于是吐出一段字符画而不是图片（实测）。生图必须明确要图。
+DEFAULT_IMAGE_PREFILL_NUDGE = (
+    "[继续] 按上面说的风格与要求，直接输出图片本身，不要输出任何文字描述或字符画。"
+)
+
+
 def apply_console_injection(
     messages: List[OpenAIMessage],
     system_text: str = "",
     prefill_text: str = "",
     has_tools: bool = False,
     is_image_model: bool = False,
+    allow_image_prefill: bool = False,
 ) -> Tuple[List[OpenAIMessage], List[str]]:
     """把控制台配置的 system 指令 / 预填充注入到消息里。
 
@@ -291,7 +299,10 @@ def apply_console_injection(
     四条护栏（缺一个就会和现有功能打架）：
       1. 客户端已经发了预填充 → 不注入，否则两段预填充叠一起（酒馆场景）；
       2. 请求带 tools → 不注入，凭空多一个 model 轮次会打乱函数调用往返；
-      3. 生图模型 → 不注入预填充（给生图请求塞一段旁白没有意义）；
+      3. 生图模型 → 默认不注入预填充，除非 allow_image_prefill=True。
+         预填充对生图确有很强的引导力（实测：同一句"画一只猫"，预填充承诺
+         "纯黑白钢笔线稿"就真的输出线稿，不加则是彩色写实照片），但角色扮演
+         用的预填充落到生图请求上会让模型改吐文本，所以做成开关而非默认放行；
       4. 两个字段都留空 → 整个函数是空操作。
 
     返回 (新消息列表, 说明做了什么的日志行列表)。
@@ -317,8 +328,9 @@ def apply_console_injection(
     if prefill_text:
         if has_tools:
             notes.append("💉 [控制台注入] 请求带函数调用，已跳过预填充注入（避免打乱工具往返）。")
-        elif is_image_model:
-            notes.append("💉 [控制台注入] 生图模型，已跳过预填充注入。")
+        elif is_image_model and not allow_image_prefill:
+            notes.append("💉 [控制台注入] 生图模型，已跳过预填充注入"
+                         "（如需用预填充引导画风，请在控制台打开「生图也注入预填充」）。")
         else:
             idx = len(new_msgs) - 1
             while idx >= 0 and _is_empty_message(new_msgs[idx]):

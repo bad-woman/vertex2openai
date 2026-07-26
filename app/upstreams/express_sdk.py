@@ -14,7 +14,7 @@ from api_helpers import (
     create_openai_error_response,
 )
 from message_processing import (create_gemini_prompt, apply_prefill_compat,
-                                apply_console_injection)
+                                apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
 from http_options import get_http_options
 import model_capabilities as mc
 from runtime_state import app_state
@@ -43,6 +43,18 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
         base_model_name = base_model_name[:-len("-search")]
 
     return base_model_name, is_grounded_search, None
+
+
+def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
+    """选用续写指令：生图模型在用户未自定义时改用要图片的那句。
+
+    通用模板说的是"从断点处无缝往下写"，生图模型会老老实实继续写**文本**，
+    结果吐出一段字符画而不是图片（实测复现）。用户填了自定义模板则以用户的为准。
+    """
+    tpl = (user_template or "").strip()
+    if tpl:
+        return tpl
+    return DEFAULT_IMAGE_PREFILL_NUDGE if is_image_model else ""
 
 
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
@@ -151,6 +163,7 @@ class ExpressSDKUpstream(BaseUpstream):
             prefill_text=_inj_settings.get("inject_prefill", ""),
             has_tools=bool(getattr(request_obj, "tools", None)),
             is_image_model=is_image_model,
+            allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
         )
         for _n in _inj_notes:
             print(_n)
@@ -162,7 +175,7 @@ class ExpressSDKUpstream(BaseUpstream):
             new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not profile["requires_user_last_turn"],
-                instruction_template=app_state.get_setting("prefill_instruction", ""),
+                instruction_template=_prefill_tpl(app_state.get_setting("prefill_instruction", ""), is_image_model),
             )
             if new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": new_msgs})

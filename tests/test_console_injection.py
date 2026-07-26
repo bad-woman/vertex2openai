@@ -73,10 +73,31 @@ def test_guard_tools_skip_prefill_injection():
     assert any("函数调用" in n for n in notes)
 
 
-def test_guard_image_model_skips_prefill_injection():
+def test_guard_image_model_skips_prefill_by_default():
     out, notes = apply_console_injection(_client_msgs(), prefill_text=PRE, is_image_model=True)
     assert all(m.role != "assistant" for m in out)
     assert any("生图" in n for n in notes)
+
+
+def test_image_prefill_can_be_allowed():
+    """预填充对生图有实际引导力，实测：同一句“画一只猫”，
+    预填充承诺“纯黑白钢笔线稿”→ 输出线稿；不加 → 彩色写实照片。
+    所以这条护栏是开关，不是硬拦。"""
+    out, _ = apply_console_injection(_client_msgs(), prefill_text=PRE,
+                                     is_image_model=True, allow_image_prefill=True)
+    assert out[-1].role == "assistant" and out[-1].content == PRE
+
+
+def test_image_toggle_defaults_off():
+    assert app_config.DEFAULT_SETTINGS["inject_prefill_for_image"] is False
+
+
+def test_image_toggle_does_not_bypass_other_guards():
+    """放行生图不代表放行工具流量。"""
+    out, notes = apply_console_injection(_client_msgs(), prefill_text=PRE, is_image_model=True,
+                                         allow_image_prefill=True, has_tools=True)
+    assert all(m.role != "assistant" for m in out)
+    assert any("函数调用" in n for n in notes)
 
 
 def test_guard_tools_still_allows_system_injection():
@@ -120,3 +141,30 @@ def test_whitespace_only_values_count_as_empty():
     msgs = _client_msgs()
     out, notes = apply_console_injection(msgs, system_text="   ", prefill_text="\n\t")
     assert out is msgs and notes == []
+
+
+def test_image_models_get_an_image_specific_nudge():
+    """生图模型必须换一句要图片的续写指令。
+
+    通用那句是"从断点处无缝往下写"，生图模型会照办——继续写**文本**，
+    实测结果是吐出一段 ASCII 字符画而不是图片。换成明确要图片的措辞后，
+    smart / keep_turn 两种模式都能正常返回图片。
+    """
+    from upstreams.express_sdk import _prefill_tpl
+    from message_processing import DEFAULT_IMAGE_PREFILL_NUDGE
+
+    assert _prefill_tpl("", is_image_model=True) == DEFAULT_IMAGE_PREFILL_NUDGE
+    assert "图片" in DEFAULT_IMAGE_PREFILL_NUDGE
+    # 文本模型保持原样（空 = 让 apply_prefill_compat 用它自己的内置默认）
+    assert _prefill_tpl("", is_image_model=False) == ""
+    # 用户自定义优先，两类模型都不覆盖
+    assert _prefill_tpl("我的模板", is_image_model=True) == "我的模板"
+    assert _prefill_tpl("  我的模板  ", is_image_model=False) == "我的模板"
+
+
+def test_both_upstreams_share_the_same_template_rule():
+    from upstreams.express_sdk import _prefill_tpl as a
+    from upstreams.cookie_proxy import _prefill_tpl as b
+    for tpl in ("", "  ", "自定义"):
+        for img in (True, False):
+            assert a(tpl, img) == b(tpl, img)
