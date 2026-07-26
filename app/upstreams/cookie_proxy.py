@@ -261,8 +261,8 @@ def _build_batch_graphql_body(
     contents, system_text = _convert_messages_to_contents(request.messages)
     model_path = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
 
-    profile = mc.get_profile(model_name)
     settings = app_state.get_effective_settings(model_name)
+    profile = mc.apply_sampling_policy(mc.get_profile(model_name), settings)
     allowed = profile["allowed_sampling"]
 
     gen_config = {}

@@ -440,6 +440,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div><div class="lbl mb-1">top_p</div><input id="default_top_p" type="number" step="0.05" class="inp" placeholder="—"></div>
           <div><div class="lbl mb-1">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
         </div>
+        <div class="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-neutral-100">
+          <span class="text-sm">采样参数处理<span class="helpq" onclick="hlp(this,'h_sp')">?</span></span>
+          <select id="sampling_policy" class="inp" style="width:150px"><option value="auto">自动判定</option><option value="deprecated">强制剥离</option><option value="allowed">强制保留</option></select>
+        </div>
+        <div id="h_sp" class="helpbox">决定是否把 <code>temperature / top_p / top_k</code> 发给模型。<br>
+          <b>自动判定</b>（默认）：按版本号推断——3.6 起、3.5 Flash-Lite、以及 4.x 及以后一律剥离。<br>
+          <b>什么时候需要手动改</b>：版本号表达不了“号更小但发布更晚”。比如日后出一个 <code>gemini-3.5-pro</code>，官方按“更新模型”废弃了采样，自动判定却会因为 3.5 &lt; 3.6 而放行——此时给它选<b>强制剥离</b>即可，不必改代码。反过来官方澄清某模型仍可调，就选<b>强制保留</b>。<br>
+          可按模型专属保存。生图模型不受此开关影响（本来就剥离全部采样）；<code>candidate_count</code> 是 3.x 的硬限制，也不归它管。</div>
         <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
       </div>
 
@@ -572,7 +580,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -652,7 +660,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
@@ -705,6 +713,7 @@ async function saveModelOverride(){
     prefill_instruction:$('prefill_instruction').value,
     image_system_instruction:$('image_system_instruction').checked,
     inject_prefill_for_image:$('inject_prefill_for_image').checked,
+    sampling_policy:$('sampling_policy').value,
   };
   if(m==='__global__'){
     // 全局默认作用域：写进全局设置，而不是任何模型的专属值
@@ -972,7 +981,8 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
         models = await get_express_models()
     except Exception:
         models = []
-    caps = {m: mc.capabilities_summary(m) for m in models}
+    # 能力摘要要反映该模型生效的采样策略，否则控制台提示与实际下发不一致
+    caps = {m: mc.capabilities_summary(m, app_state.get_effective_settings(m)) for m in models}
     # 附带各模型是否已有专属参数覆盖，供前端标示
     overrides = app_state.get_model_overrides()
     return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})

@@ -306,7 +306,8 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
 
     # 读取控制台设置与模型能力档案（优先级：单次请求 > 模型专属 > 全局 > 内置默认）
     settings = app_state.get_effective_settings(request.model)
-    profile = mc.get_profile(request.model)
+    # 控制台的「采样参数处理」可覆盖版本自动判定（新模型版本号更小却已废弃采样时用）
+    profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
     is_image_model = profile["is_image"]
 
     if is_image_model:

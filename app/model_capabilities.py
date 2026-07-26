@@ -334,6 +334,35 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
     return {"mode": "budget", "budget": budget, "include_thoughts": include_thoughts}
 
 
+def apply_sampling_policy(profile: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """用控制台的「采样参数处理」覆盖自动判定，返回修正后的档案副本。
+
+    自动判定按版本号（3.6+ / 3.5-flash-lite / 4.x 起废弃），但版本号表达不了
+    "号更小却发布更晚"的情况——比如日后出一个 gemini-3.5-pro，官方按"更新模型"
+    废弃采样，版本判据却会放行。有了这个开关，加模型就不必改代码。
+
+      auto       —— 用内置版本判定（默认）
+      deprecated —— 强制剥离 temperature / top_p / top_k
+      allowed    —— 强制保留（官方澄清某模型仍可调时用）
+    """
+    policy = str(settings.get("sampling_policy", "auto") or "auto").lower()
+    if policy not in ("deprecated", "allowed") or profile.get("is_image"):
+        return profile          # 生图本来就剥离全部采样，不受该开关影响
+    prof = dict(profile)
+    allowed = set(prof.get("allowed_sampling", set()))
+    if policy == "deprecated":
+        allowed -= {"temperature", "top_p", "top_k"}
+        prof["sampling_advice"] = "deprecated"
+    else:
+        allowed |= {"temperature", "top_p", "top_k"}
+        # candidate_count 是 3.x 的硬限制，不归这个开关管
+        if prof.get("family") == "g3":
+            allowed.discard("candidate_count")
+        prof["sampling_advice"] = "recommend_default"
+    prof["allowed_sampling"] = allowed
+    return prof
+
+
 def sanitize_sampling(config: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
     """按档案剥离不支持的采样参数（防止未来 3.x 传弃用参数直接 400）。"""
     allowed = profile.get("allowed_sampling", set())
@@ -433,9 +462,15 @@ def validate_aspect_ratio(model_name: str, ar: Optional[str]) -> Optional[str]:
     return norm if norm in prof["image_aspect_ratios"] else None
 
 
-def capabilities_summary(model_name: str) -> Dict[str, Any]:
-    """给控制台前端用的精简能力描述（决定显示/禁用哪些控件）。"""
+def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """给控制台前端用的精简能力描述（决定显示/禁用哪些控件）。
+
+    传入该模型生效的 settings 时，会把「采样参数处理」开关算进去，
+    否则控制台显示的能力会和实际下发的参数对不上。
+    """
     prof = get_profile(model_name)
+    if settings:
+        prof = apply_sampling_policy(prof, settings)
     thinking: Dict[str, Any] = {"kind": prof["thinking_kind"]}
     if prof["thinking_kind"] == "level":
         # 按强度排序（minimal→high），不要用字典序（会排成 high, low, medium, minimal）

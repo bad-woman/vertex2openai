@@ -124,6 +124,9 @@ DEFAULT_SETTINGS = {
     # （同一句"画一只猫"：无预填充→彩色写实照片；预填充承诺"纯黑白钢笔线稿"→真的输出线稿），
     # 但角色扮演用的预填充落到生图请求上会让模型改吐文本，故默认关、按需开。
     "inject_prefill_for_image": False,
+    # 采样参数处理：auto=按版本自动判定 / deprecated=强制剥离 / allowed=强制保留。
+    # 给"新出的模型版本号更小但已废弃采样"这类情况留的手动出口，免于改代码。
+    "sampling_policy": "auto",
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},
@@ -149,4 +152,5 @@ PER_MODEL_KEYS = [
     # 这两个本就是"针对生图模型"的开关，作用域却是全局，用户按模型保存会落空。
     "image_system_instruction",
     "inject_prefill_for_image",
+    "sampling_policy",
 ]
