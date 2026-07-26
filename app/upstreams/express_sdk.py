@@ -17,6 +17,7 @@ from message_processing import create_gemini_prompt, apply_prefill_compat
 from http_options import get_http_options
 import model_capabilities as mc
 from runtime_state import app_state
+import config as app_config
 
 LEGACY_EXPRESS_PREFIX = "[EXPRESS] "
 LEGACY_PAY_PREFIX = "[PAY]"
@@ -87,8 +88,7 @@ def _prefill_log(mode: str, prefill_text: str) -> str:
         return ("🩹 [预填充兼容] 仅补占位 user 保证不报错；预填充**不会**拼回输出开头"
                 "（预设的思考开标签可能因此缺失，酒馆正则会抓不到）。")
     return (f"🩹 [预填充兼容] 预填充（{n} 字）已并入末尾 user 消息作为续写指令，并将拼回输出开头。"
-            "注意：模型会把它当成“用户给的参考文本”而非“自己写了一半”，"
-            "预设思维链场景建议改用「保留模型轮次」。")
+            "若预填充停在半截词/半截标签且模型接不上，可试试「保留模型轮次」。")
 
 
 class ExpressSDKUpstream(BaseUpstream):
