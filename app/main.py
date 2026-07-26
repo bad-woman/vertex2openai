@@ -367,12 +367,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
       </div>
-      <p class="text-xs text-neutral-500 mt-3">下方参数默认为<b>全局默认值</b>（对所有模型生效）。可为<b>当前所选模型</b>单独保存专属值：<b>思考、生图、采样默认、注入与续写</b>这四类支持按模型覆盖。优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
+      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">页面分两段：<b>① 按模型参数</b>（思考 / 生图 / 采样 / 注入与续写）既可作全局默认，也可只对上面选中的模型生效；<b>② 全局设置</b>（图压缩 / 重试 / 假流式 / 调试开关等）只有全局一份。<br>
+      <b>两个按钮的区别</b>：本卡片的「保存为该模型专属」只保存 ① 区、且只对<b>当前所选模型</b>生效（模型名后会出现 ★）；页面底部的「保存全局设置」保存整页、作为<b>所有模型</b>的默认值。<br>
+      优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
       <div class="flex items-center gap-2 mt-3 flex-wrap">
         <button class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
         <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
         <span id="ov-hint" class="text-xs text-neutral-500"></span>
       </div>
+    </div>
+
+    <div class="flex items-center gap-2 mb-2 mt-5">
+      <span class="pill pill-accent" style="text-transform:none">① 按模型参数</span>
+      <span class="text-xs text-neutral-500">下面这些卡片里的项，都可以用上方「保存为该模型专属」只对所选模型生效；点「保存全局设置」则作为所有模型的默认值。</span>
     </div>
 
     <div class="grid md:grid-cols-2 gap-4">
@@ -411,6 +418,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <select id="image_aspect_ratio" class="inp"></select>
         </div>
         <p id="image-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div class="space-y-3 mt-3 pt-3 border-t border-neutral-100">
+          <div class="text-xs text-neutral-400">以下两项仅对生图模型有意义，可按模型专属保存</div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
+            <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
+            <div id="h_ipf" class="helpbox">默认关：下面“注入预填充”的内容<b>不会</b>发给生图模型。<br>预填充对生图其实有<b>很强的引导力</b>——实测同一句“画一只猫”，预填充承诺“纯黑白钢笔线稿”就真的输出线稿，不加则是彩色写实照片。想用它引导画风或做破限，就打开。<br><b>注意</b>：角色扮演用的预填充（例如思考块开标签）落到生图请求上，可能让模型改吐一段文字而不出图。建议配合“保存为该模型专属”，给生图模型单独配一段合适的预填充。<br>生图模型会自动改用一句<b>要图片</b>的续写指令（否则模型会把“继续往下写”理解成继续写文字，实测会吐字符画）；若你在下面自定义了“续写指令模板”，则以你的为准——生图用时记得写明“直接输出图片”。</div>
+          </div>
+        </div>
       </div>
 
       <!-- 采样默认 -->
@@ -453,6 +471,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+    </div>
+
+    <div class="flex items-center gap-2 mb-2 mt-6">
+      <span class="pill" style="text-transform:none;background:#f1f1f5;color:#52525b">② 全局设置</span>
+      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后请点页面底部「保存全局设置」。</span>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-4">
       <!-- 输入图压缩 -->
       <div class="card p-5">
         <div class="flex items-center justify-between mb-3">
@@ -491,15 +517,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
             <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。<b>无正文时的原始响应样本总是会自动记录，不需要开这个</b>。</div>
           </div>
-          <div>
-            <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
-            <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
-          </div>
 
-          <div>
-            <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
-            <div id="h_ipf" class="helpbox">默认关：下面“注入预填充”的内容<b>不会</b>发给生图模型。<br>预填充对生图其实有<b>很强的引导力</b>——实测同一句“画一只猫”，预填充承诺“纯黑白钢笔线稿”就真的输出线稿，不加则是彩色写实照片。想用它引导画风或做破限，就打开。<br><b>注意</b>：角色扮演用的预填充（例如思考块开标签）落到生图请求上，可能让模型改吐一段文字而不出图。建议配合“保存为该模型专属”，给生图模型单独配一段合适的预填充。<br>生图模型会自动改用一句<b>要图片</b>的续写指令（否则模型会把“继续往下写”理解成继续写文字，实测会吐字符画）；若你在下面自定义了“续写指令模板”，则以你的为准——生图用时记得写明“直接输出图片”。</div>
-          </div>
 
           <div class="pt-1 border-t border-neutral-100"></div>
           <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
@@ -528,7 +546,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="flex items-center justify-end gap-3 mt-4">
-      <span class="text-xs text-neutral-500">此按钮保存<b>全局默认 + 基础设施项</b>，不影响已设专属参数的模型</span>
+      <span class="text-xs text-neutral-500">保存<b>整页</b>作为所有模型的默认值；已设 ★ 专属的模型仍以自己的专属值为准</span>
       <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
@@ -550,7 +568,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -672,6 +690,8 @@ async function saveModelOverride(){
     inject_system_instruction:$('inject_system_instruction').value,
     inject_prefill:$('inject_prefill').value,
     prefill_instruction:$('prefill_instruction').value,
+    image_system_instruction:$('image_system_instruction').checked,
+    inject_prefill_for_image:$('inject_prefill_for_image').checked,
   };
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});

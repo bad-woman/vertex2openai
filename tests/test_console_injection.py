@@ -229,3 +229,20 @@ def test_effective_settings_resolve_template_per_model():
     finally:
         app_state.clear_model_override("gemini-3.1-flash-image")
         app_state.update_settings({"prefill_instruction": ""})
+
+
+def test_image_toggles_are_per_model_overridable():
+    """这两个开关本就是"针对生图模型"的，作用域却是全局，
+    用户按模型保存会落空、刷新即失效。它们必须可按模型覆盖。"""
+    main_py = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text(encoding="utf-8")
+    patch = main_py.split("async function saveModelOverride()", 1)[1].split("};", 1)[0]
+    for key in ("image_system_instruction", "inject_prefill_for_image"):
+        assert key in app_config.PER_MODEL_KEYS, key
+        assert key in patch, f"saveModelOverride 未提交 {key}"
+
+
+def test_panel_separates_the_two_save_scopes():
+    """界面必须让人看出哪些项归哪个保存按钮——这是用户反馈最难理解的点。"""
+    main_py = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text(encoding="utf-8")
+    assert "① 按模型参数" in main_py and "② 全局设置" in main_py
+    assert "两个按钮的区别" in main_py

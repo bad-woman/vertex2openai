@@ -146,4 +146,7 @@ PER_MODEL_KEYS = [
     # 续写指令也必须能按模型分开：文本模型要"接着往下写"，生图模型要"直接输出图片"，
     # 只有一份全局模板时，为文本调好的那句会让生图吐字符画。
     "prefill_instruction",
+    # 这两个本就是"针对生图模型"的开关，作用域却是全局，用户按模型保存会落空。
+    "image_system_instruction",
+    "inject_prefill_for_image",
 ]
