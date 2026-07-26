@@ -19,6 +19,8 @@
 import re
 from typing import Any, Dict, Optional
 
+from models import normalize_content_part
+
 # 所有“采样类”参数键（用于按模型剥离）
 SAMPLING_KEYS = {
     "temperature", "top_p", "top_k",
@@ -324,6 +326,11 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
     # 0 = 关闭思考，是合法值，不能被 max(bmin, ...) 抬成 512/128；仅夹取非 0 非 -1 的值。
     if budget not in (-1, 0):
         budget = max(bmin, min(bmax, budget))
+    # F-4：budget=0 表示关闭思考，此时上游拒绝 include_thoughts=True
+    # （"Thinking_config.include_thoughts is only enabled when thinking is enabled"），
+    # 即"用户主动关思考"这条路径必然 400。关思考就必须同时不要思考摘要。
+    if budget == 0:
+        include_thoughts = False
     return {"mode": "budget", "budget": budget, "include_thoughts": include_thoughts}
 
 
@@ -372,8 +379,12 @@ def _prompt_aspect_ratio(request: Any) -> Optional[str]:
             if isinstance(c, str):
                 content = c
             elif isinstance(c, list):
+                # F-1：先归一，否则 pydantic 生成的 ContentPartText 会被 isinstance(p, dict) 漏掉，
+                # 导致列表形式内容里的 `--ar 16:9` 永远检测不到。
+                parts = [normalize_content_part(p) for p in c]
                 content = " ".join(
-                    p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"
+                    p.get("text", "") for p in parts
+                    if isinstance(p, dict) and p.get("type") == "text"
                 )
             m = re.search(r"(?i)--ar\s*(\d+[:：]\d+)", content) or re.search(r"\b(\d+[:：]\d+)\b", content)
             return m.group(1) if m else None

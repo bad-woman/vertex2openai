@@ -13,6 +13,22 @@ class ContentPartText(BaseModel):
     type: Literal["text"]
     text: str
 
+def normalize_content_part(part: Any) -> Any:
+    """把 message.content 里的单个 part 归一成普通 dict。
+
+    F-1：`content` 的类型是 `list[ContentPartText | ContentPartImage | dict]`，
+    pydantic 会优先把 `{"type": "text", ...}` 解析成 `ContentPartText` 实例，
+    因此 `isinstance(p, dict)` 对标准 OpenAI 请求恒为 False——凡是靠这个判断
+    筛选 part 的地方都会静默丢内容（分段 system、`--ar` 检测、markdown 图片抽取）。
+    统一先过这个函数再按 dict 处理。
+    """
+    if isinstance(part, dict):
+        return part
+    if hasattr(part, "model_dump"):
+        return part.model_dump()
+    return part
+
+
 class OpenAIMessage(BaseModel):
     role: str
     content: str | list[ContentPartText | ContentPartImage | dict[str, Any]] | None = None

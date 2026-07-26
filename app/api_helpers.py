@@ -814,7 +814,7 @@ async def execute_gemini_call(
         else: # True Streaming
             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
             async def _gemini_real_stream_generator_inner():
-                max_retries, _backoff = get_retry_settings()
+                max_retries, backoff_sec = get_retry_settings()
                 has_yielded = False  # 是否已向客户端输出过内容
                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
                 yield ": keep-alive\n\n"
@@ -895,11 +895,11 @@ async def execute_gemini_call(
                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
                         # 否则重试会导致整段答案重复输出（前半段 + 完整重发）。
                         if is_retryable and not has_yielded and attempt < max_retries:
-                            wave_index = attempt % 4
-                            round_num = (attempt // 4) + 1
-                            wait_time = 2 ** wave_index
+                            # F-5：退避时长改读控制台的 retry_backoff_seconds，
+                            # 原先硬编码 2**(attempt%4)，控制台设置对真流式完全没作用。
+                            wait_time = backoff_sec
                             stats.add_retry() # 核心：手动重试计入大盘
-                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {round_num} 轮第 {wave_index + 1} 次重试，等待 {wait_time} 秒。")
+                            print(f"⚠️ [自动重试] Agent Platform Express Mode 流式请求返回 429/503 或配额繁忙。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                             if await _client_gone():
                                 print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {model_to_call}。")
                                 return
@@ -931,7 +931,7 @@ async def execute_gemini_call(
             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
     else: # Non-streaming
         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
-        max_retries, _backoff = get_retry_settings()
+        max_retries, backoff_sec = get_retry_settings()
         response_obj_call = None
         # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
         for attempt in range(max_retries + 1):
@@ -954,7 +954,7 @@ async def execute_gemini_call(
             except Exception as e_call:
                 if is_retryable_exception(e_call) and attempt < max_retries:
                     stats.add_retry()
-                    wait_time = min(8, 2 ** (attempt % 4))
+                    wait_time = backoff_sec   # F-5：同上，统一用控制台配置的退避
                     print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
                     await asyncio.sleep(wait_time)
                     continue

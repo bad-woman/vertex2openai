@@ -19,7 +19,7 @@ from typing import Any, Optional, List, Dict, AsyncGenerator
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from models import OpenAIRequest
+from models import OpenAIRequest, normalize_content_part
 from upstreams.base import BaseUpstream
 from runtime_state import app_state
 import config as app_config
@@ -178,11 +178,12 @@ def _convert_messages_to_contents(messages: list) -> tuple:
             if isinstance(content, str):
                 system_parts.append(content)
             else:
-                # 分段 system 也要收下，否则酒馆预设的多段 system 会被整段丢弃
-                system_parts.extend(
-                    p.get("text", "") for p in (content or [])
-                    if isinstance(p, dict) and p.get("type") == "text"
-                )
+                # 分段 system 也要收下，否则酒馆预设的多段 system 会被整段丢弃。
+                # F-1：必须先归一，pydantic 已把标准 text part 变成 ContentPartText 实例。
+                for p in (content or []):
+                    p = normalize_content_part(p)
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        system_parts.append(p.get("text", ""))
             continue
 
         # 已在入口用 has_tool_traffic() 拒绝了工具流量，这里只可能是 user / assistant

@@ -13,7 +13,7 @@ from runtime_state import app_state
 from signature_store import signature_store, SKIP_VALIDATOR_SENTINEL
 
 from google.genai import types
-from models import OpenAIMessage, ContentPartText, ContentPartImage
+from models import OpenAIMessage, ContentPartText, ContentPartImage, normalize_content_part
 
 import io
 try:
@@ -506,75 +506,43 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
             elif isinstance(message.content, list):
                 for part_item in message.content:
-                    if isinstance(part_item, dict):
-                        if part_item.get("type") == "text":
-                            text_content = part_item.get("text", "\n")
-                            image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
-                            if clean_text: parts.append(types.Part.from_text(text=clean_text))
-                            parts.extend(image_parts)
+                    # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
+                    # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
+                    # 实例分支直接 from_text，跳过了 markdown 内联图片抽取）。
+                    part_item = normalize_content_part(part_item)
+                    if not isinstance(part_item, dict):
+                        text_attr = getattr(part_item, "text", None)
+                        if isinstance(text_attr, str):
+                            parts.append(types.Part.from_text(text=text_attr))
+                        continue
 
-                        elif part_item.get("type") == "image_url":
-                            image_url = part_item.get("image_url", {}).get("url", "")
-                            if image_url.startswith("data:"):
-                                mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url)
-                                if mime_match:
-                                    mime_type, b64_data = mime_match.groups()
-                                    raw_bytes = base64.b64decode(b64_data)
-                                    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                            elif image_url.startswith("http"):
-                                try:
-                                    def fetch_img():
-                                        client_args = {"timeout": 10.0, "follow_redirects": True}
-                                        if app_config.PROXY_URL:
-                                            client_args["proxy"] = app_config.PROXY_URL
-                                        if getattr(app_config, "SSL_CERT_FILE", None):
-                                            client_args["verify"] = app_config.SSL_CERT_FILE
-                                        with httpx.Client(**client_args) as client:
-                                            resp = client.get(image_url)
-                                            resp.raise_for_status()
-                                            return resp.content, resp.headers.get("content-type", "image/jpeg")
-                                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                                        future = pool.submit(fetch_img)
-                                        img_bytes, mime_type = future.result(timeout=12) 
-                                        opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                        parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                                except Exception as e:
-                                    print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{image_url}，原因：{e}")
+                    if part_item.get("type") == "text":
+                        text_content = part_item.get("text", "\n")
+                        image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
+                        if clean_text: parts.append(types.Part.from_text(text=clean_text))
+                        parts.extend(image_parts)
 
-                    elif hasattr(part_item, "type") and getattr(part_item, "type") == "image_url":
-                        img_url_data = part_item.image_url
-                        url_str = getattr(img_url_data, "url", "") if hasattr(img_url_data, "url") else (img_url_data.get("url", "") if isinstance(img_url_data, dict) else "")
-                        
-                        if url_str.startswith("data:"):
-                            mime_match = re.match(r"data:([^;]+);base64,(.+)", url_str)
+                    elif part_item.get("type") == "image_url":
+                        img_url_data = part_item.get("image_url") or {}
+                        if isinstance(img_url_data, dict):
+                            image_url = img_url_data.get("url", "")
+                        else:
+                            image_url = getattr(img_url_data, "url", "") or ""
+
+                        if image_url.startswith("data:"):
+                            mime_match = re.match(r"data:([^;]+);base64,(.+)", image_url)
                             if mime_match:
                                 mime_type, b64_data = mime_match.groups()
                                 raw_bytes = base64.b64decode(b64_data)
                                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
                                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                        elif url_str.startswith("http"):
-                            try:
-                                def fetch_img():
-                                    client_args = {"timeout": 10.0, "follow_redirects": True}
-                                    if app_config.PROXY_URL:
-                                        client_args["proxy"] = app_config.PROXY_URL
-                                    if getattr(app_config, "SSL_CERT_FILE", None):
-                                        client_args["verify"] = app_config.SSL_CERT_FILE
-                                    with httpx.Client(**client_args) as client:
-                                        resp = client.get(url_str)
-                                        resp.raise_for_status()
-                                        return resp.content, resp.headers.get("content-type", "image/jpeg")
-                                with concurrent.futures.ThreadPoolExecutor() as pool:
-                                    future = pool.submit(fetch_img)
-                                    img_bytes, mime_type = future.result(timeout=12) 
-                                    opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                    parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
-                            except Exception as e:
-                                print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url_str}，原因：{e}")
-                                
-                    elif hasattr(part_item, "text"):
-                        parts.append(types.Part.from_text(text=part_item.text))
+                        elif image_url.startswith(("http://", "https://")):
+                            # 统一走加固后的 fetch_remote_image（SSRF 与体积防护都在那里，见 F-3）。
+                            fetched = fetch_remote_image(image_url)
+                            if fetched:
+                                img_bytes, mime_type = fetched
+                                opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
+                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
 
         if not parts: continue
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
@@ -609,22 +577,97 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
     return merged_messages
 
+# F-3：远程图片抓取的防护参数。
+# 本服务常部署在能访问内网/云元数据服务的环境里，而图片 URL 完全由请求方控制，
+# 不加限制等于把代理变成一个任意内网 GET 的跳板（SSRF）。
+MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024   # 单张图上限，防止超大响应打爆内存
+MAX_REMOTE_IMAGE_REDIRECTS = 3
+
+
+def _is_blocked_host(host: str) -> bool:
+    """目标是否指向内网/环回/链路本地等不该被代理访问的地址。
+
+    云元数据服务（169.254.169.254）属于链路本地段，已被 is_link_local 覆盖。
+    主机名先解析再判断，避免用 DNS 指向内网的域名绕过。
+    """
+    import ipaddress
+    import socket
+
+    if not host:
+        return True
+    host = host.strip("[]")
+    candidates = []
+    try:
+        candidates.append(ipaddress.ip_address(host))
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except Exception:
+            return True   # 解析不了就不放行
+        for info in infos:
+            try:
+                candidates.append(ipaddress.ip_address(info[4][0]))
+            except ValueError:
+                continue
+    if not candidates:
+        return True
+    for ip in candidates:
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
+
+
 def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
     """同步抓取远程图片，返回 (bytes, mime)。失败返回 None。
 
     调用方须保证不在事件循环线程里直接调用（Express/Cookie 两条通道都用
     asyncio.to_thread 包住整个消息转换）。
+
+    F-3 防护：只允许 http/https、拒绝内网与链路本地地址（重定向后逐跳复查）、
+    限制响应体积、校验 content-type。配置了 PROXY_URL 时出站本就经代理，
+    到不了内网，此时跳过地址检查。
     """
+    from urllib.parse import urlparse
+
+    check_host = not app_config.PROXY_URL
     try:
-        client_args = {"timeout": timeout, "follow_redirects": True}
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"不支持的 URL 协议：{parsed.scheme or '(空)'}")
+        if check_host and _is_blocked_host(parsed.hostname or ""):
+            raise ValueError("目标地址指向内网/环回/链路本地，已拒绝")
+
+        client_args = {"timeout": timeout, "follow_redirects": False}
         if app_config.PROXY_URL:
             client_args["proxy"] = app_config.PROXY_URL
         if getattr(app_config, "SSL_CERT_FILE", None):
             client_args["verify"] = app_config.SSL_CERT_FILE
+
         with httpx.Client(**client_args) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            return resp.content, resp.headers.get("content-type", "image/jpeg")
+            current = url
+            for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
+                resp = client.get(current)
+                if resp.is_redirect:
+                    # 逐跳复查：只校验首个 URL 的话，一个 302 就能把请求带进内网。
+                    current = str(resp.next_request.url) if resp.next_request else ""
+                    nxt = urlparse(current)
+                    if nxt.scheme not in ("http", "https"):
+                        raise ValueError(f"重定向到不支持的协议：{nxt.scheme or '(空)'}")
+                    if check_host and _is_blocked_host(nxt.hostname or ""):
+                        raise ValueError("重定向指向内网/环回/链路本地，已拒绝")
+                    continue
+
+                resp.raise_for_status()
+                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                if mime and not mime.startswith("image/"):
+                    raise ValueError(f"响应不是图片（content-type={mime}）")
+                data = resp.content
+                if len(data) > MAX_REMOTE_IMAGE_BYTES:
+                    raise ValueError(
+                        f"图片超过 {MAX_REMOTE_IMAGE_BYTES // (1024 * 1024)}MB 上限（{len(data)} 字节）")
+                return data, mime or "image/jpeg"
+            raise ValueError("重定向次数过多")
     except Exception as e:
         print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{e}")
         return None

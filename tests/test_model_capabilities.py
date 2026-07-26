@@ -125,7 +125,9 @@ def test_resolve_thinking_g25_budget(fake_req):
     r = fake_req()
     # 控制台预算
     t = mc.resolve_thinking("gemini-2.5-flash", r, {"thinking_g25_budget": 0})
-    assert t == {"mode": "budget", "budget": 0, "include_thoughts": True}
+    # F-4：budget=0 即关闭思考，此时上游拒绝 include_thoughts=True，必须同为 False。
+    # （旧断言写的是 True，实机验证时这条路径稳定返回 400。）
+    assert t == {"mode": "budget", "budget": 0, "include_thoughts": False}
     # pro 不可 0 → 抬到 128
     t2 = mc.resolve_thinking("gemini-2.5-pro", r, {"thinking_g25_budget": 0})
     assert t2["budget"] == 128

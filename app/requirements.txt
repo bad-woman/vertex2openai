@@ -5,5 +5,4 @@ pydantic-settings>=2.2.1
 google-genai>=2.0.0
 httpx[socks]>=0.25.0
 curl_cffi>=0.7.1
-tenacity>=8.2.3
 Pillow>=10.0.0
