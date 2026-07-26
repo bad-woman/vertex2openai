@@ -367,19 +367,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
       </div>
-      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">页面分两段：<b>① 按模型参数</b>（思考 / 生图 / 采样 / 注入与续写）既可作全局默认，也可只对上面选中的模型生效；<b>② 全局设置</b>（图压缩 / 重试 / 假流式 / 调试开关等）只有全局一份。<br>
-      <b>两个按钮的区别</b>：本卡片的「保存为该模型专属」只保存 ① 区、且只对<b>当前所选模型</b>生效（模型名后会出现 ★）；页面底部的「保存全局设置」保存整页、作为<b>所有模型</b>的默认值。<br>
+      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">上面的下拉框选择<b>编辑对象</b>：选「＊ 全局默认」就是在改所有模型的默认值；选某个具体模型，就是在改<b>那个模型</b>的专属值（保存后模型名后出现 ★）。切换下拉框时，下面 ① 区的字段会跟着换成对应对象的值。<br>
+      <b>① 按模型参数</b>（思考 / 生图 / 采样 / 注入与续写）跟随上面的下拉框，用本卡片的按钮保存。<br>
+      <b>② 全局设置</b>（图压缩 / 重试 / 假流式 / 调试开关）只有全局一份，用页面底部的「保存全局设置」保存，<b>不会</b>动到 ① 区的任何内容。<br>
       优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
       <div class="flex items-center gap-2 mt-3 flex-wrap">
-        <button class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
-        <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
+        <button id="btn-scope-save" class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
+        <button id="btn-scope-clear" class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
         <span id="ov-hint" class="text-xs text-neutral-500"></span>
       </div>
     </div>
 
     <div class="flex items-center gap-2 mb-2 mt-5">
       <span class="pill pill-accent" style="text-transform:none">① 按模型参数</span>
-      <span class="text-xs text-neutral-500">下面这些卡片里的项，都可以用上方「保存为该模型专属」只对所选模型生效；点「保存全局设置」则作为所有模型的默认值。</span>
+      <span class="text-xs text-neutral-500">下面这些卡片的内容，属于上方下拉框选中的那个对象（全局默认 / 某个模型），用上方的保存按钮写入。</span>
     </div>
 
     <div class="grid md:grid-cols-2 gap-4">
@@ -475,7 +476,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     <div class="flex items-center gap-2 mb-2 mt-6">
       <span class="pill" style="text-transform:none;background:#f1f1f5;color:#52525b">② 全局设置</span>
-      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后请点页面底部「保存全局设置」。</span>
+      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后点页面底部「保存全局设置」，它只保存本区、不影响 ① 区。</span>
     </div>
 
     <div class="grid md:grid-cols-2 gap-4">
@@ -546,7 +547,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="flex items-center justify-end gap-3 mt-4">
-      <span class="text-xs text-neutral-500">保存<b>整页</b>作为所有模型的默认值；已设 ★ 专属的模型仍以自己的专属值为准</span>
+      <span class="text-xs text-neutral-500">只保存 ② 区（图压缩 / 重试 / 假流式 / 调试开关）；① 区请用上方那个保存按钮</span>
       <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
@@ -660,21 +661,30 @@ async function loadParams(){
     const c=await (await fetch('/api/capabilities')).json();
     CAPS=c.capabilities||{};
     OVERRIDES=c.overrides||{};
-    $('model-sel').innerHTML=(c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
+    $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
+      + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
     renderCaps();
   }catch(e){}
 }
 // 按所选模型把“可覆盖的 7 个参数字段”填成：有专属值用专属，否则回退全局
 function applyModelParamFields(model){
-  const ov = OVERRIDES[model] || {};
+  // __global__ = 全局默认作用域：只显示全局值，不掺任何模型专属值
+  const ov = (model==='__global__') ? {} : (OVERRIDES[model] || {});
   PER_MODEL_KEYS.forEach(k=>{
     const v = (k in ov) ? ov[k] : GLOBAL_SETTINGS[k];
     if(k==='image_aspect_ratio'){ curAR = v || ""; }
     else setV(k, v);
   });
-  const has = !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
+  const isGlobal = (model==='__global__');
+  const has = !isGlobal && !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
   $('ov-badge').classList.toggle('hidden', !has);
-  $('ov-hint').textContent = has ? '当前显示该模型的专属值（带 ★）；改动后点“保存为该模型专属”更新。' : '当前显示全局默认值；改动后点“保存为该模型专属”即可只对此模型生效。';
+  // 保存按钮的落点随作用域切换，避免"看着像全局、存进了专属"（或反过来）
+  $('btn-scope-save').textContent = isGlobal ? '💾 保存为全局默认' : '💾 保存为该模型专属';
+  $('btn-scope-clear').classList.toggle('hidden', isGlobal);
+  $('ov-hint').textContent = isGlobal
+    ? '当前编辑的是全局默认值，对所有未设专属的模型生效。'
+    : (has ? '当前显示该模型的专属值（带 ★）；改动后点“保存为该模型专属”更新。'
+           : '当前显示全局默认值；改动后点“保存为该模型专属”即可只对此模型生效。');
 }
 async function saveModelOverride(){
   const m=$('model-sel').value; if(!m) return;
@@ -693,6 +703,15 @@ async function saveModelOverride(){
     image_system_instruction:$('image_system_instruction').checked,
     inject_prefill_for_image:$('inject_prefill_for_image').checked,
   };
+  if(m==='__global__'){
+    // 全局默认作用域：写进全局设置，而不是任何模型的专属值
+    try{
+      const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+      if(r.ok){ Object.assign(GLOBAL_SETTINGS,patch); toast('已保存为全局默认'); }
+      else toast('保存失败');
+    }catch(e){ toast('保存失败'); }
+    return;
+  }
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
     const d=await r.json();
@@ -722,7 +741,18 @@ function fillARFor(cap){
   sel.value = (curAR && list.includes(curAR)) ? curAR : "";
 }
 function renderCaps(){
-  const m=$('model-sel').value; const cap=CAPS[m]; if(!cap) return;
+  const m=$('model-sel').value;
+  if(m==='__global__'){
+    applyModelParamFields(m);
+    $('caps-summary').innerHTML='<span class="text-xs text-neutral-500">全局默认作用域：下面的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力与专属值。</span>';
+    ['thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio'].forEach(id=>{const el=$(id); if(el) el.disabled=false;});
+    $('wrap-g3level').style.opacity='1'; $('wrap-g25budget').style.opacity='1';
+    $('think-note').textContent='全局默认：具体下发时仍按各模型能力自动裁剪（例如 Pro 上 minimal 会就近取 low）。';
+    $('image-note').textContent='全局默认：仅生图模型会用到。';
+    $('sampling-note').textContent='全局默认：已废弃采样参数的模型会自动剥离。';
+    return;
+  }
+  const cap=CAPS[m]; if(!cap) return;
   applyModelParamFields(m);   // 按模型填入专属/全局参数值（含 curAR）
   const th=cap.thinking||{};
   let sum=[chip('家族 '+cap.family, true)];
@@ -772,7 +802,9 @@ function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
 // 说明折叠：点 ⓘ 展开/收起对应的说明块
 function hlp(el,id){const b=document.getElementById(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);}
 async function saveSettings(){
-  // 基础设施级设置：始终作为全局保存
+  // 只保存 ② 全局设置区（基础设施项）。
+  // ① 按模型参数不在这里保存——那些字段显示的是"当前所选模型"的生效值，
+  // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
   const patch={
     img_compress_enabled:$('img_compress_enabled').checked,
     img_compress_max_dim:numOr('img_compress_max_dim',1536),
@@ -786,13 +818,8 @@ async function saveSettings(){
     safety_score:$('safety_score').checked,
     cookie_debug:$('cookie_debug').checked,
     debug_outbound:$('debug_outbound').checked,
-    image_system_instruction:$('image_system_instruction').checked,
-    inject_prefill_for_image:$('inject_prefill_for_image').checked,
     prefill_mode:$('prefill_mode').value,
-    inject_system_instruction:$('inject_system_instruction').value,
-    inject_prefill:$('inject_prefill').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
-    prefill_instruction:$('prefill_instruction').value,
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
   // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
@@ -800,14 +827,6 @@ async function saveSettings(){
   const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
   if(!overriding){
     Object.assign(patch,{
-      native_thinking_mode:$('native_thinking_mode').value,
-      thinking_g3_level:$('thinking_g3_level').value,
-      thinking_g25_budget:numOr('thinking_g25_budget',-1),
-      image_size:$('image_size').value,
-      image_aspect_ratio:$('image_aspect_ratio').value,
-      default_temperature:numOrNull('default_temperature'),
-      default_top_p:numOrNull('default_top_p'),
-      default_max_tokens:numOrNull('default_max_tokens'),
     });
   }
   const scope = overriding

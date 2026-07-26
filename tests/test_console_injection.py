@@ -241,8 +241,37 @@ def test_image_toggles_are_per_model_overridable():
         assert key in patch, f"saveModelOverride 未提交 {key}"
 
 
-def test_panel_separates_the_two_save_scopes():
-    """界面必须让人看出哪些项归哪个保存按钮——这是用户反馈最难理解的点。"""
+def test_global_save_must_not_carry_per_model_fields():
+    """最关键的不变量：底部「保存全局设置」不得提交任何按模型字段。
+
+    这些字段显示的是"当前所选模型"的生效值。一起提交的话，选中生图模型、
+    填好画风注入之后，只要点一次全局保存，生图专用的内容就变成了所有模型的
+    全局默认——生图和文本要的内容完全不同，这是实打实的误配。
+    """
+    import re
     main_py = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text(encoding="utf-8")
+    body = main_py.split("async function saveSettings()", 1)[1].split("\n}", 1)[0]
+    submitted = set(re.findall(r"^\s*(\w+)\s*:", body, re.M))
+    leaked = submitted & set(app_config.PER_MODEL_KEYS)
+    assert not leaked, f"全局保存混入了按模型字段：{sorted(leaked)}"
+
+
+def test_panel_has_an_explicit_scope_selector():
+    """作用域必须显式可选，而不是靠用户猜哪个按钮存到哪儿。"""
+    main_py = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text(encoding="utf-8")
+    assert "__global__" in main_py, "模型下拉缺少「全局默认」作用域"
+    assert "保存为全局默认" in main_py and "保存为该模型专属" in main_py
     assert "① 按模型参数" in main_py and "② 全局设置" in main_py
-    assert "两个按钮的区别" in main_py
+    # 选到全局作用域时不能显示任何模型的专属值
+    apply_fn = main_py.split("function applyModelParamFields(", 1)[1].split("\n}", 1)[0]
+    assert "__global__" in apply_fn, "全局作用域下仍会回填某个模型的专属值"
+
+
+def test_per_model_save_still_covers_every_per_model_key():
+    """反过来也要成立：按模型保存必须覆盖全部按模型字段，不能漏。"""
+    import re
+    main_py = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text(encoding="utf-8")
+    patch = main_py.split("async function saveModelOverride()", 1)[1].split("};", 1)[0]
+    submitted = set(re.findall(r"^\s*(\w+)\s*:", patch, re.M))
+    missing = set(app_config.PER_MODEL_KEYS) - submitted
+    assert not missing, f"按模型保存漏了：{sorted(missing)}"
