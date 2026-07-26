@@ -70,6 +70,8 @@ DEFAULT_SETTINGS = {
     "img_compress_max_mb": 1.5,
     "img_compress_quality": 85,
     # 重试
+    # 语义：retry_max = 失败后的**重试**次数，总请求次数 = retry_max + 1。
+    # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
     "retry_max": 10,
     "retry_backoff_seconds": 5,
     # 开关（初始值取环境变量）
@@ -94,8 +96,18 @@ DEFAULT_SETTINGS = {
     "hide_thoughts": False,
     # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
     "prefill_instruction": "",
-    # Cookie 通道调试：打印出站 generationConfig（无正文时的原始响应样本总是自动记录，无需开启）
+    # 出站参数调试：打印两条通道实际发出的 generationConfig / thinkingConfig。
+    # 实机验证思考档位、采样裁剪是否生效时必开。
+    # （旧键名 cookie_debug 保留为别名，只作用于 Cookie 通道的额外诊断）
+    "debug_outbound": False,
     "cookie_debug": False,
+    # 思考签名内嵌开关（默认关）：
+    #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
+    #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用
+    "embed_thought_signature_in_id": False,
+    # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
+    # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
+    "image_system_instruction": False,
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},

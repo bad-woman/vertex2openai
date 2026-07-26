@@ -1,6 +1,8 @@
 import asyncio
+import os
 import secrets
-import hashlib
+import threading
+import time
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,18 @@ express_key_manager = ExpressKeyManager()
 async def lifespan(app: FastAPI):
     from model_loader import refresh_models_config_cache
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
+
+    # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
+    if config.API_KEY == DEFAULT_API_KEY:
+        public_host = any(os.environ.get(k) for k in ("SPACE_ID", "SPACE_HOST", "HF_SPACE_ID"))
+        if public_host and os.environ.get("ALLOW_DEFAULT_KEY", "").lower() not in ("1", "true", "yes"):
+            raise RuntimeError(
+                "检测到公开托管环境（HuggingFace Space 等）且 API_KEY 仍为默认值 123456。\n"
+                "该口令同时是控制台登录密码，而控制台可以读写完整的 Google 会话 Cookie。\n"
+                "请设置一个强 API_KEY 后重启；确需临时放行可设 ALLOW_DEFAULT_KEY=true。"
+            )
+        print("🔴 [安全警告] API_KEY 仍是默认值 123456！它既是本代理的 Key，也是控制台登录口令，"
+              "请立刻改成强口令。")
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:
@@ -65,13 +79,89 @@ async def stats_tracker_middleware(request: Request, call_next):
 
 # ====== 仅密码登录（Cookie 会话，免输账号）======
 AUTH_COOKIE = "ap_session"
+DEFAULT_API_KEY = "123456"
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
 
-def _session_token() -> str:
-    # 存 hash 而非明文 key；httponly cookie，前端 JS 读不到
-    return hashlib.sha256(("agentplatform2api::" + (config.API_KEY or "")).encode()).hexdigest()
+# P2-2：会话 token 改为随机值存内存，不再用 sha256(常量 + API_KEY) 这种确定值。
+# 确定值意味着同一个 API_KEY 永远对应同一个 cookie，无法单独失效某个会话。
+_sessions: dict = {}          # token -> 过期时间戳
+_sessions_lock = threading.Lock()
+
+# 登录失败计数：{ip: [失败次数, 最近失败时间]}，指数退避
+_login_failures: dict = {}
+_login_lock = threading.Lock()
+LOGIN_LOCK_BASE_SECONDS = 2
+LOGIN_LOCK_MAX_SECONDS = 300
+
+
+def _issue_session() -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _sessions_lock:
+        for t, exp in list(_sessions.items()):     # 顺手清理过期会话
+            if exp < now:
+                _sessions.pop(t, None)
+        _sessions[token] = now + SESSION_TTL_SECONDS
+    return token
+
+
+def _revoke_session(token: str) -> None:
+    with _sessions_lock:
+        _sessions.pop(token, None)
+
 
 def _is_authed(request: Request) -> bool:
-    return secrets.compare_digest(request.cookies.get(AUTH_COOKIE, ""), _session_token())
+    token = request.cookies.get(AUTH_COOKIE, "")
+    if not token:
+        return False
+    with _sessions_lock:
+        exp = _sessions.get(token)
+        if exp is None:
+            return False
+        if exp < time.time():
+            _sessions.pop(token, None)
+            return False
+    return True
+
+
+def _login_retry_after(ip: str) -> int:
+    """该 IP 还需等待多少秒才能再次尝试登录（0 = 可以尝试）。"""
+    with _login_lock:
+        rec = _login_failures.get(ip)
+        if not rec:
+            return 0
+        count, last = rec
+        if count < 3:
+            return 0
+        wait = min(LOGIN_LOCK_BASE_SECONDS * (2 ** (count - 3)), LOGIN_LOCK_MAX_SECONDS)
+        remain = int(last + wait - time.time())
+        return max(0, remain)
+
+
+def _record_login_failure(ip: str) -> None:
+    with _login_lock:
+        count, _ = _login_failures.get(ip, (0, 0.0))
+        _login_failures[ip] = (count + 1, time.time())
+
+
+def _clear_login_failure(ip: str) -> None:
+    with _login_lock:
+        _login_failures.pop(ip, None)
+
+
+def mask_cookie(cookie_str: str) -> str:
+    """S-1：控制台只回显掩码，不再把完整 Google 会话 Cookie 明文吐回前端。"""
+    if not cookie_str:
+        return ""
+    names = []
+    for seg in cookie_str.split(";"):
+        name = seg.strip().split("=", 1)[0].strip()
+        if name:
+            names.append(name)
+    head = cookie_str.strip()[:6]
+    tail = cookie_str.strip()[-4:]
+    return f"{head}…{tail}（共 {len(names)} 个 cookie 字段，{len(cookie_str)} 字符）"
+
 
 async def require_auth(request: Request):
     if not _is_authed(request):
@@ -352,7 +442,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分</span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道调试日志 <span class="text-xs text-neutral-400">（打印出站参数；无正文诊断总是自动记录）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志 <span class="text-xs text-neutral-400">（两条通道都打印实际发出的思考/采样参数，实机验证必开）</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断 <span class="text-xs text-neutral-400">（无正文时的原始响应样本总是自动记录，无需开启）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">思考签名内嵌 tool_call_id <span class="text-xs text-neutral-400">（默认关＝短 id＋内存缓存；多副本部署才需开启）</span></span><label class="switch"><input type="checkbox" id="embed_thought_signature_in_id"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令 <span class="text-xs text-neutral-400">（默认关＝沿用旧行为；开启前请先真机验证目标模型）</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式</span>
             <select id="prefill_mode" class="inp" style="width:130px"><option value="smart">智能</option><option value="minimal">最小</option><option value="off">关闭</option></select>
           </div>
@@ -436,7 +529,7 @@ async function saveCookie(){
   let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
   const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
   $('cookie-input').value=ck; $('project-input').value=pid;
-  if(!ck||!pid){ toast('请填写完整 Cookie 和 Project ID'); return; }
+  if(!pid){ toast('请填写 Project ID'); return; }
   try{
     const r=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
     const d=await r.json(); toast(r.ok?(d.message||'已保存并激活'):('❌ '+(d.error||'保存失败')));
@@ -449,7 +542,15 @@ async function loadRuntime(){
     document.querySelector(`input[name=mode][value=${m}]`).checked=true;
     $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
     $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-    if(s.google_cookie) $('cookie-input').value=s.google_cookie;
+    /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
+       输入框留空 = 保持现有 Cookie；填了才更新。 */
+    const ci=$('cookie-input');
+    if(ci){
+      ci.value='';
+      ci.placeholder = s.google_cookie_configured
+        ? ('已配置：'+s.google_cookie+'　（留空则保持不变，需更新时粘贴新 Cookie）')
+        : '粘贴完整 Cookie 头或 Cookie-Editor 导出内容';
+    }
     if(s.google_project_id) $('project-input').value=s.google_project_id;
   }catch(e){}
 }
@@ -462,7 +563,7 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
     ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','prefill_suppress_thinking'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','embed_thought_signature_in_id','image_system_instruction'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -591,6 +692,9 @@ async function saveSettings(){
     roundrobin:$('roundrobin').checked,
     safety_score:$('safety_score').checked,
     cookie_debug:$('cookie_debug').checked,
+    debug_outbound:$('debug_outbound').checked,
+    embed_thought_signature_in_id:$('embed_thought_signature_in_id').checked,
+    image_system_instruction:$('image_system_instruction').checked,
     prefill_mode:$('prefill_mode').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
     prefill_instruction:$('prefill_instruction').value,
@@ -663,16 +767,35 @@ class LoginBody(BaseModel):
 
 
 @app.post("/api/login")
-async def login(body: LoginBody):
+async def login(body: LoginBody, request: Request):
+    ip = request.client.host if request.client else "unknown"
+
+    # P2-2：失败三次后指数退避，避免对口令（同时也是 API Key）无限爆破
+    remain = _login_retry_after(ip)
+    if remain > 0:
+        return JSONResponse(status_code=429,
+                            content={"error": f"尝试过于频繁，请 {remain} 秒后再试"})
+
     if config.API_KEY and secrets.compare_digest(body.password, config.API_KEY):
+        _clear_login_failure(ip)
         resp = JSONResponse(content={"ok": True})
-        resp.set_cookie(AUTH_COOKIE, _session_token(), httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30, path="/")
+        resp.set_cookie(
+            AUTH_COOKIE, _issue_session(),
+            httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS, path="/",
+            # 反代后 request.url.scheme 可能是 http，这里同时看 x-forwarded-proto
+            secure=(request.url.scheme == "https"
+                    or request.headers.get("x-forwarded-proto", "") == "https"),
+        )
         return resp
+
+    _record_login_failure(ip)
+    print(f"🔐 [登录失败] 来自 {ip} 的密码尝试失败。")
     return JSONResponse(status_code=401, content={"error": "密码错误"})
 
 
 @app.post("/api/logout")
-async def logout():
+async def logout(request: Request):
+    _revoke_session(request.cookies.get(AUTH_COOKIE, ""))
     resp = JSONResponse(content={"ok": True})
     resp.delete_cookie(AUTH_COOKIE, path="/")
     return resp
@@ -692,9 +815,13 @@ class ModeSetting(BaseModel):
 
 @app.get("/api/settings/runtime")
 async def get_runtime_settings(_auth: bool = Depends(require_auth)):
+    cookie = app_state.get_google_cookie()
     return JSONResponse(content={
         "use_web_proxy": app_state.is_web_proxy_enabled(),
-        "google_cookie": app_state.get_google_cookie(),
+        # S-1：只回显掩码。完整 Cookie 等价于该 Google 账号的完整访问权，
+        # 没有任何理由让它出现在前端 JS / 浏览器缓存 / 截图里。
+        "google_cookie": mask_cookie(cookie),
+        "google_cookie_configured": bool(cookie),
         "google_project_id": app_state.get_project_id(),
     })
 
@@ -761,27 +888,43 @@ async def delete_model_override(model_name: str, _auth: bool = Depends(require_a
 
 
 class CookieSetting(BaseModel):
-    cookie: str
-    project_id: str
+    cookie: str = ""          # 留空 = 保持现有 Cookie
+    project_id: str = ""
 
 
 @app.post("/api/cookie")
 async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(require_auth)):
-    validation = validate_cookie(setting.cookie)
-    if not validation["valid"]:
-        return JSONResponse(status_code=400, content={"error": validation["message"]})
-    app_state.set_google_cookie(setting.cookie.strip())
-    app_state.set_project_id(setting.project_id.strip())
-    return JSONResponse(content={"status": "success", "message": validation["message"]})
+    """保存 Cookie 与 Project ID。
+
+    S-1：cookie 传空字符串表示「保持现有 Cookie 不变，只更新 Project ID」，
+    这样前端就不需要为了改 Project ID 而把完整 Cookie 再取回来一次。
+    """
+    new_cookie = (setting.cookie or "").strip()
+    project_id = (setting.project_id or "").strip()
+
+    if new_cookie:
+        validation = validate_cookie(new_cookie)
+        if not validation["valid"]:
+            return JSONResponse(status_code=400, content={"error": validation["message"]})
+        app_state.set_google_cookie(new_cookie)
+        message = validation["message"]
+    else:
+        if not app_state.get_google_cookie():
+            return JSONResponse(status_code=400, content={
+                "error": "尚未配置 Cookie，请粘贴完整的 Google Cookie。"})
+        message = "✅ 已保留原有 Cookie，仅更新 Project ID。"
+
+    if project_id:
+        app_state.set_project_id(project_id)
+    return JSONResponse(content={"status": "success", "message": message})
 
 
 @app.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
     async def log_generator():
-        q = asyncio.Queue()
-        rt_logger.queues.append(q)
+        q = rt_logger.subscribe()
         try:
-            for msg in rt_logger.history:
+            for msg in rt_logger.snapshot_history():
                 yield f"data: {msg}\n\n"
             while True:
                 if await request.is_disconnected():
@@ -792,8 +935,7 @@ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_a
                 except asyncio.TimeoutError:
                     yield ": keep-alive heartbeat\n\n"
         finally:
-            if q in rt_logger.queues:
-                rt_logger.queues.remove(q)
+            rt_logger.unsubscribe(q)
     return StreamingResponse(log_generator(), media_type="text/event-stream")
 
 

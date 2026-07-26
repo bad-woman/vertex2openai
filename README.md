@@ -22,7 +22,7 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 
 - **双上游通道，一键切换**
   - Express API Key：多 Key 随机或轮询调用官方 SDK。
-  - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，模拟网页端调用（含最新预览模型），真流式、防 60s 超时。
+  - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**注意：走的是私有接口，见下方风险提示。**
 - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
 - **管理控制台（浅色风格，单文件，免构建）**
   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
@@ -33,7 +33,8 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
 - **Gemini 能力与适配**
   - 文本对话、流式（SSE）与非流式。
   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）。**注意：函数调用仅在 Express 通道支持；Cookie 直连通道不下发函数声明。**
-  - **安全分类对齐**：两条通道均下发 `HARM_CATEGORY_JAILBREAK`（越狱）等 5 类安全设置为最宽松。缺少该分类时，越狱式（酒馆）预设可能出现"有思考、正文为空"——因为越狱过滤器拦掉了正文而思考照常流出。已修复 Cookie 通道此前缺该分类的问题。
+  - **安全分类对齐**：两条通道下发同一套安全设置（`HARM_CATEGORY_HATE_SPEECH`、`DANGEROUS_CONTENT`、`SEXUALLY_EXPLICIT`、`HARASSMENT`、`JAILBREAK`），阈值最宽松，避免通道间行为不一致。
+    > 📌 **更正**：早期版本曾把"有思考、正文为空"归因于 Cookie 通道缺少 `HARM_CATEGORY_JAILBREAK`。这个解释是错的——按官方文档，**越狱分类器默认就是关闭的**，要打开必须显式把该分类的阈值设成具体的拦截值；不下发它不会启用任何过滤，下发 `OFF` 也只是空操作。该现象的真实成因见下方"3.6-flash 只返回思考"一节（前端恒发 `reasoning_effort=xhigh` 导致原生思考在 HIGH 档跑飞/被截断）。
   - **上游错误如实透传**：模型在当前项目/区域不可用（404）、权限不足（403）、参数非法（400）等，会以对应 HTTP 状态码 + OpenAI 错误格式返回，而非笼统的 500。
   - Google Search 增强：**文本模型**在模型名后加 `-search` 后缀按需开启。
   - 自动保留 Gemini 思考过程（Thinking），以 `reasoning_content` 返回。
@@ -82,8 +83,38 @@ http://localhost:8050
 | `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
+| `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
+| `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
 
 > 提示：`ROUNDROBIN`、`FAKE_STREAMING(_INTERVAL)`、`SAFETY_SCORE` 等环境变量仅作为**初始值**，运行时以控制台设置为准。
+
+---
+
+## 行为变更说明（整改后）
+
+按 `REFACTOR_PLAN.md` 完成整改后，以下行为与旧版本不同，升级时请注意：
+
+| 项目 | 旧行为 | 新行为 |
+|---|---|---|
+| **思考档位兜底** | 非法档位一律抬到 `high`（Pro 上选 minimal 反而变 high） | 就近**向下**夹取：Pro 选 minimal → `low` |
+| **`retry_max` 语义** | Express 通道当作总次数，设 0 时一次请求都不发 | 统一为「重试次数」，总请求数 = `retry_max + 1`，设 0 仍请求一次；取值钳到 0–50 |
+| **并行函数调用（流式）** | 只发第一个，`index` 恒为 0 | 全部下发，`index` 跨 chunk 稳定递增 |
+| **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 短 id（≤40 字符）+ 进程内旁路缓存；旧格式仍可解析；取不回时降级为官方 `skip_thought_signature_validator` 哨兵 |
+| **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 入口返回 400，提示切换到标准模式 |
+| **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对两条通道都生效） |
+| **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
+| **`logprobs` 字段** | 按 Gemini 语义当整数 | 兼容 OpenAI 的 `logprobs: bool` + `top_logprobs: int` |
+| **Express 流式 usage** | 从不下发，客户端显示 0 | 支持 `stream_options.include_usage` |
+| **控制台 Cookie 回显** | 明文返回完整 Cookie | 仅返回掩码；输入框留空＝保持原 Cookie 不变 |
+| **登录** | 无限速、会话 token 为确定值 | 失败 3 次后指数退避；随机会话 token，可单独失效 |
+| **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR` |
+| **文本保真** | 所有消息的多空格/缩进被压平 | 仅在确实抽走内联图片时才压平 |
+| **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
+| **生图比例 `9:21`** | 在白名单里（无官方出处） | 已移除，落到"由模型决定" |
+
+新增两个控制台开关：**思考签名内嵌 tool_call_id**（默认关，多副本部署才需开）与**生图下发 system 指令**（默认关，开启前请真机验证）。
+
+新增 `scripts/check_models.py`：打印各模型的能力判定，用于对着官方文档逐列核对。
 
 ---
 
@@ -131,6 +162,17 @@ http://localhost:8050
 ---
 
 ## Cookie 直连模式配置指引（支持手机与电脑）
+
+> ⚠️ **使用前请先读这段风险提示**
+>
+> Cookie 直连模式的原理是：用硬编码的网页客户端 key 和固定的 `querySignature`，
+> 冒充 Google Cloud 控制台前端去调用其**私有** `batchGraphql` 接口。因此：
+>
+> - **无兼容性承诺**：这是内部接口，Google 改一次 `querySignature` 或参数结构就会全线失效，且不会有任何公告。
+> - **条款风险**：以自动化方式访问非公开接口，可能与 Google Cloud 的使用条款相冲突，存在账号被限制或处置的风险。请仅用自有账号、自担风险。
+> - **凭证敏感度极高**：配置的 Cookie 含 `__Secure-1PSID` 等完整会话凭证，等价于该 Google 账号的完整访问权。请勿把本服务部署到公开可访问的地方，务必设置强 `API_KEY`。
+>
+> 如果你需要的是稳定、可长期依赖的方案，请使用标准模式（Express API Key）。
 
 在控制台切换到 **Agent Platform Studio (Cookie 直连反代)**，需配置 **Cookie** 与 **Project ID**：
 
@@ -226,15 +268,21 @@ curl http://localhost:8050/v1/chat/completions \
   "models": [
     "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
     "gemini-3.1-flash-image",
     "gemini-3-pro-image",
-    "gemini-3-flash-preview",
     "gemini-2.5-pro",
     "gemini-2.5-flash"
   ]
 }
 ```
+
+> ⏰ **停用时间线（核对于 2026-07-26，请自行复核官方 deprecations 页）**
+> - `gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-2.5-flash-lite`：**2026-10-16 停用**。届时 `thinking_budget` 分支与"2.5 原生预填充透传"路径将没有活模型，可整体删除。
+> - `gemini-3-flash-preview`：官方推荐替代为 `gemini-3.5-flash`，但**该模型目前仍可正常调用**（2026-07-26 用 Express Key 实机验证通过），因此**保留在默认清单中**；待官方正式停用后再移除。
+> - `gemini-3.1-flash-image` / `gemini-3-pro-image`：GA 版本（不带 `-preview`），对应的 `-preview` 版本已于 2026-06-25 停用。
 
 `/v1/models` 会自动为**非生图**的 Gemini 模型生成带 `-search` 后缀的别名。新增模型只需把 ID 加进此列表即可（能力自动归类，无需改代码）。
 
@@ -253,7 +301,12 @@ curl http://localhost:8050/v1/chat/completions \
 ## 后续升级与扩展
 
 - **新增模型**：把模型 ID 加入 `vertexModels.json`（或远程 `MODELS_CONFIG_URL`）。`model_capabilities.py` 按**家族/版本模式**自动归类（思考方式、采样裁剪、生图比例/分辨率、预填充），**未知/未来型号按"最新代"前向安全处理**。基本即插即用。
-- **迁移到 Interactions API**：代码按上游通道解耦（`app/upstreams/` 下各类实现 `BaseUpstream`；能力判定、消息转换、参数构建均可复用）。待 Agent Platform 对基础 Gemini 模型开放 Interactions API 后，新增一个 `InteractionsUpstream`（实现 `BaseUpstream`）并在路由层接入即可，能力矩阵与预填充/参数逻辑可直接复用。当前 Agent Platform（Vertex）尚未对基础 Gemini 模型开放 Interactions（仅少数 agent），故暂未内置。
+- **迁移到 Interactions API**：代码按上游通道解耦（`app/upstreams/` 下各类实现 `BaseUpstream`；能力判定、消息转换、参数构建均可复用），新增一个 `InteractionsUpstream` 并在路由层接入即可。
+
+  现状（核对于 2026-07-26）：
+  - **Gemini Developer API 侧**：Interactions API 已于 2026-06 **GA**，官方推荐新项目使用；`generateContent` 被标为 legacy 但继续完整支持。
+  - **Agent Platform 侧**：Interactions API 仍标注为 **experimental**。
+  - **Express 模式**：REST 面只有 `countTokens` / `generateContent` / `streamGenerateContent` —— **这才是本项目暂不迁移的直接原因**（本项目走的正是 Express 通道）。
 
 ---
 

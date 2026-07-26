@@ -26,9 +26,55 @@ SAMPLING_KEYS = {
     "candidate_count", "seed", "stop_sequences", "max_output_tokens",
 }
 
-# 生图分辨率与比例白名单
+# ---- 生图分辨率与比例白名单 ----
+# 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite-image
+#      「1:1, 3:2, 2:3, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9 aspect ratios」（核对于 2026-07-26）
 _PRO_IMAGE_ARS = {"1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
-_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1", "9:21"}
+# 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-image
+#      「New 1:4, 4:1, 1:8 and 8:1 aspect ratios」（核对于 2026-07-26）
+# 注意：曾经这里还有 "9:21"，但官方文档从未提及该比例。发送不支持的比例会 400，
+#      而不在白名单里只会回退成“由模型决定”（不报错），因此按保守策略移除。
+#      若日后真机验证可用，加回来并在此注明验证日期。
+_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1"}
+
+# ---- 思考档位阶梯（由低到高）----
+# 出处：Agent Platform → Get started with Gemini 3（核对于 2026-07-26）
+#   MINIMAL 仅 Gemini 3 Flash / 3.1 Flash-Lite 有；
+#   MEDIUM 覆盖 Gemini 3 Flash / 3.1 Pro / 3.1 Flash-Lite；
+#   LOW / HIGH 所有 3.x 都有。
+_LEVEL_ORDER = ["minimal", "low", "medium", "high"]
+
+
+def _clamp_level(level: str, levels: set) -> str:
+    """把任意档位夹到该模型的合法档位集合内。
+
+    规则：**优先向下就近取**，向下没有再向上。
+    这条方向性很关键——用户把档位调低是为了减少思考，
+    旧实现对非法档位一律兜底成 "high"，导致 Pro 模型上选 minimal 反而拿到 high，
+    与用户意图完全相反（P0-1）。
+    """
+    if not levels:
+        return "low"
+    if level in levels:
+        return level
+    try:
+        idx = _LEVEL_ORDER.index(level)
+    except ValueError:
+        idx = _LEVEL_ORDER.index("high")   # 未知词按最高处理，再向下夹
+    for i in range(idx, -1, -1):           # 先向下找最接近的合法档
+        if _LEVEL_ORDER[i] in levels:
+            return _LEVEL_ORDER[i]
+    for i in range(idx + 1, len(_LEVEL_ORDER)):   # 向下没有再向上
+        if _LEVEL_ORDER[i] in levels:
+            return _LEVEL_ORDER[i]
+    return sorted(levels)[0]
+
+
+def sort_levels(levels) -> list:
+    """按强度而非字典序排列档位，供控制台下拉框使用。"""
+    known = [lv for lv in _LEVEL_ORDER if lv in levels]
+    extra = sorted(lv for lv in levels if lv not in _LEVEL_ORDER)
+    return known + extra
 
 
 def _strip_known_suffixes(name: str) -> str:
@@ -125,8 +171,16 @@ def get_profile(model_name: str) -> Dict[str, Any]:
 
     if major == 2 and minor >= 5:
         # Gemini 2.5：thinking_budget；保留全部采样参数
+        # ⚠️ 停用预告：gemini-2.5-pro / 2.5-flash / 2.5-flash-lite 官方停用日期 2026-10-16。
+        #    届时本分支将没有活模型，可整体删除（连同 DEFAULT_SETTINGS.thinking_g25_budget）。
+        # 预算区间出处：Thinking 文档预算表（核对于 2026-07-26）
+        #   2.5 Pro        128 – 32768，不可关闭
+        #   2.5 Flash        0 – 24576，0 = 关闭
+        #   2.5 Flash-Lite 512 – 24576，0 = 关闭（非零最低 512，不是 0）
         if is_pro:
             budget_min, budget_max, can_zero = 128, 32768, False
+        elif "flash-lite" in name:
+            budget_min, budget_max, can_zero = 512, 24576, True
         else:
             budget_min, budget_max, can_zero = 0, 24576, True
         return {
@@ -230,15 +284,15 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
     if prof["thinking_kind"] == "level":
         levels = prof["thinking_levels"]
         if suppress:
-            # 压制：3.x 无法完全关闭思考 → 压到最低档并隐藏
-            level = "minimal" if "minimal" in levels else "low"
-            return {"mode": "level", "level": level, "include_thoughts": False}
+            # 压制：3.x 无法完全关闭思考 → 压到该模型最低合法档并隐藏
+            return {"mode": "level", "level": _clamp_level("minimal", levels),
+                    "include_thoughts": False}
         level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
         level = str(level).lower()
         if level in ("off", "none"):
-            level = "minimal" if "minimal" in levels else "low"
-        if level not in levels:
-            level = "high" if "high" in levels else sorted(levels)[-1]
+            level = "minimal"
+        # 统一就近向下夹取：Pro 上选 minimal 得到 low，而不是被抬成 high
+        level = _clamp_level(level, levels)
         return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
 
     # budget（2.5）
@@ -267,7 +321,8 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
             budget = -1
     if budget == 0 and not can_zero:
         budget = bmin
-    if budget != -1:
+    # 0 = 关闭思考，是合法值，不能被 max(bmin, ...) 抬成 512/128；仅夹取非 0 非 -1 的值。
+    if budget not in (-1, 0):
         budget = max(bmin, min(bmax, budget))
     return {"mode": "budget", "budget": budget, "include_thoughts": include_thoughts}
 
@@ -292,10 +347,17 @@ def resolve_image_size(model_name: str, request: Any, settings: Dict[str, Any]) 
     size = str(raw).upper().replace("0.5K", "512").replace("512PX", "512")
     if size in sizes:
         return size
-    # 回退：优先给相近的高档，再退 1K
-    for cand in ("4K", "2K", "1K", "512"):
-        if cand in sizes:
-            return "1K" if "1K" in sizes else cand
+    # 回退：就近向下取档（4K→2K→1K→512），向下没有再向上。
+    # 旧实现写成 `for cand in (...): if cand in sizes: return "1K" if "1K" in sizes else cand`，
+    # 因为 1K 在所有白名单里，任何非法值都返回 1K，注释里的“优先给相近的高档”从未生效。
+    ladder = ["512", "1K", "2K", "4K"]
+    idx = ladder.index(size) if size in ladder else len(ladder) - 1
+    for i in range(idx, -1, -1):
+        if ladder[i] in sizes:
+            return ladder[i]
+    for i in range(idx + 1, len(ladder)):
+        if ladder[i] in sizes:
+            return ladder[i]
     return "1K"
 
 
@@ -365,7 +427,8 @@ def capabilities_summary(model_name: str) -> Dict[str, Any]:
     prof = get_profile(model_name)
     thinking: Dict[str, Any] = {"kind": prof["thinking_kind"]}
     if prof["thinking_kind"] == "level":
-        thinking["levels"] = sorted(prof["thinking_levels"])
+        # 按强度排序（minimal→high），不要用字典序（会排成 high, low, medium, minimal）
+        thinking["levels"] = sort_levels(prof["thinking_levels"])
         thinking["can_off"] = False
     elif prof["thinking_kind"] == "budget":
         thinking["budget_min"] = prof["budget_min"]

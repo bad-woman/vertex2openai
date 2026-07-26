@@ -1,0 +1,3258 @@
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/HANDOFF.md vertex2openai-main-refactored/HANDOFF.md
+--- vertex2openai-main/HANDOFF.md	2026-07-24 23:29:48.000000000 +0000
++++ vertex2openai-main-refactored/HANDOFF.md	2026-07-26 08:42:12.411608819 +0000
+@@ -69,13 +69,37 @@
+ - **Cookie 用量**：真机确认 batchGraphql **不回传** `usageMetadata`（大盘 token 恒 0），故仅标准通道统计 token。
+ - 诚实边界：用良性角色扮演提示词无法直接复现"纯空正文"（所有变体都有正文）；但"缺 JAILBREAK 分类"这一通道不对称是确证的，"思考流出而正文被拦"正是安全拦截特征。**建议用你的真实酒馆预设再复测确认**。
+ 
++## 四·补4、第五轮：按 REFACTOR_PLAN.md 全量整改（本轮）
++
++对着官方文档做了一次全量审查，产出 `REFACTOR_PLAN.md` 并按其 PR-1～PR-4 实施完毕。**下面两条推翻了此前的结论，别再重走：**
++
++1. **`HARM_CATEGORY_JAILBREAK` 与"无正文"无因果关系（已定案）。** 官方文档明确：越狱分类器**默认关闭**，要打开必须显式把该分类阈值设为具体拦截值。因此"Cookie 通道缺该分类 → 正文被拦"这一解释在机制上不成立，下发 `OFF` 也只是空操作。README 里的错误因果已删除。第四轮"真正根因是 HIGH 档思考跑飞"的定论仍然有效。
++2. **Interactions API 的说法需修正。** Gemini Developer API 侧它已于 2026-06 GA 且被推荐用于新项目；Agent Platform 侧仍是 experimental。本项目暂不迁移的**真正理由**是：Express 模式的 REST 面只有 `countTokens` / `generateContent` / `streamGenerateContent`。
++
++本轮修复清单（详见 `REFACTOR_PLAN.md` 的 ID 对应）：
++
++- **P0-1** 档位就近向下夹取（`_clamp_level`）——修掉 Pro 上"选 minimal 得到 high"的反向行为。
++- **P0-2** `retry_max` 语义统一为「重试次数」，`retry_max=0` 不再导致 Express 通道一次请求都不发。
++- **P0-3** 流式并行函数调用不再被 `break` 丢弃，`index` 由 `ToolCallIndexer` 跨 chunk 稳定分配。
++- **P0-4** 思考签名改为短 id + `app/signature_store.py` 旁路缓存，旧 `__thought__` 格式兼容解析，取不回时降级为官方哨兵；并修掉同角色合并会把文本 part 插进连续 FC 之间的问题。
++- **P1-1～P1-9 / P2-1～P2-4 / S-1～S-3** 见 README 的「行为变更说明」表。
++
++**仍未做（留给下一轮）：**
++- `print` → `logging` 的完整迁移（本轮只做了第一步：修好线程安全与无界队列，并把 token 统计从正则反解改为直接记账）。
++- `FunctionResponse` 字段名复核（**D-4，唯一需要真机确认的遗留项**）：官方迁移清单要求带 `call_id` + `name`，代码传的是 `id=`。请跑
++  `python -c "from google.genai import types; print(types.FunctionResponse.model_fields.keys())"`
++  确认是别名还是新字段，然后在代码里加注释锁死结论。
++- 生图 `system_instruction`（P1-9）与生图 `google_search` 两通道不一致：已加开关，但默认值保持旧行为，等真机验证后再定。
++- 真机多轮 function calling 压测（本轮只补了单测，无凭证无法端到端验证）。
++
+ ## 五、关键结论 / 已纠正（重要，别重走弯路）
+ - **采样参数**：据官方 `latest-model` 文档——**自 Gemini 3.6 Flash / 3.5 Flash-Lite 起及所有更新/未来模型，`temperature`/`top_p`/`top_k` 已废弃**（现忽略、未来 400，需移除）；更早 3.x（3.0–3.5 非 lite）仍可用但建议保持默认。**所有 3.x 不支持 `candidate_count`**。（`_temp_deprecated()` 实现）
+ - **思考**：3.x 用 `thinking_level`（不可完全关；默认 3.6-flash=medium、pro=high、flash-lite=minimal）；2.5 用 `thinking_budget`（-1 动态；flash 可 0 关闭，pro 最低 128）。**优先级默认 请求 effort > 控制台/专属 > 模型默认**。用 `native_thinking_mode` 统一控制：`off`=忽略前端+压最低+不回传思考（Cookie 通道响应侧剥离），`console`=忽略前端+用控制台档位，`request`=跟随前端。effort 归一化：xhigh/max→high、min/minimal→minimal、auto/空→默认。
+ - **⚠️ batchGraphql 忽略 `includeThoughts`（真机确证）**：Studio/Cookie 通道设 includeThoughts=false 无效，仍回传思考；唯一有效的减思考手段是 `thinkingLevel=MINIMAL`。故"关闭原生思考"在 Cookie 通道靠"压 minimal + 响应侧剥离思考块"实现。标准（Express/SDK）通道原生支持 includeThoughts=false。
+ - **预填充**：3.6+ 拒绝以 model 轮次结尾（400）。`smart`=把末尾 assistant 预填充转成末尾 user 的“续写指令”，模型返回后把预填充**拼回输出开头**（真还原）；`minimal`=仅追加占位 user 防报错；`off`=不处理。**与模型名无关，新模型自动生效。**
+-- **`HARM_CATEGORY_JAILBREAK`**：在 Vertex/Agent Platform 合法（SDK 枚举含），Express 模式不报错；仅 Gemini Developer API 会 400。（曾误判，已确认保留）
+-- **生图比例白名单**：pro-image 10 种；flash-image 15 种（多 `1:4/4:1/1:8/8:1/9:21`）。分辨率：pro `1K/2K/4K`、flash `512/1K/2K/4K`。选到不支持的比例会自动回退“由模型决定”，不报错。
++- **`HARM_CATEGORY_JAILBREAK`**：在 Vertex/Agent Platform 合法（SDK 枚举含），Express 模式不报错；仅 Gemini Developer API 会 400。保留即可。
++  ⚠️ **但它与"有思考无正文"没有因果关系**——官方文档写明该分类器默认关闭，不下发不会启用过滤。详见第四·补4 节。
++- **生图比例白名单**：pro-image 10 种；flash-image 14 种（多 `1:4/4:1/1:8/8:1`）。`9:21` 无官方出处，已移除。分辨率：pro `1K/2K/4K`、flash `512/1K/2K/4K`。选到不支持的比例会自动回退“由模型决定”，不报错。
+ - **Cookie 有效期**：通常数周甚至更久，仅在 `Permission Denied` 时才需重取（不是 1~2 小时）。
+ - **Interactions API 迁移**：Agent Platform（Vertex）当前**不对基础 Gemini 模型开放 Interactions**（仅少数 agent），且 Express（API-key）与 Interactions 端点不兼容 → 暂无法迁移。等开放后新增 `InteractionsUpstream`（实现 `BaseUpstream`）接入路由即可，能力/预填充/参数逻辑可复用。
+ 
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/README.md vertex2openai-main-refactored/README.md
+--- vertex2openai-main/README.md	2026-07-24 23:29:08.000000000 +0000
++++ vertex2openai-main-refactored/README.md	2026-07-26 08:42:12.411486968 +0000
+@@ -22,7 +22,7 @@
+ 
+ - **双上游通道，一键切换**
+   - Express API Key：多 Key 随机或轮询调用官方 SDK。
+-  - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，模拟网页端调用（含最新预览模型），真流式、防 60s 超时。
++  - Cookie 直连反代：Cookie + SAPISIDHASH 直连 `batchGraphql`，走网页端配额（含最新预览模型），真流式、防 60s 超时。**注意：走的是私有接口，见下方风险提示。**
+ - **OpenAI 兼容接口**：`GET /v1/models`、`POST /v1/chat/completions`。
+ - **管理控制台（浅色风格，单文件，免构建）**
+   - **仅密码登录**：打开根路径 `/`，输入密码（即 `API_KEY`）即可，无需账号。
+@@ -33,7 +33,8 @@
+ - **Gemini 能力与适配**
+   - 文本对话、流式（SSE）与非流式。
+   - OpenAI tools / function calling ↔ Gemini function calling 适配（含 Gemini 3.x 多轮所需的 thought signature 编解码）。**注意：函数调用仅在 Express 通道支持；Cookie 直连通道不下发函数声明。**
+-  - **安全分类对齐**：两条通道均下发 `HARM_CATEGORY_JAILBREAK`（越狱）等 5 类安全设置为最宽松。缺少该分类时，越狱式（酒馆）预设可能出现"有思考、正文为空"——因为越狱过滤器拦掉了正文而思考照常流出。已修复 Cookie 通道此前缺该分类的问题。
++  - **安全分类对齐**：两条通道下发同一套安全设置（`HARM_CATEGORY_HATE_SPEECH`、`DANGEROUS_CONTENT`、`SEXUALLY_EXPLICIT`、`HARASSMENT`、`JAILBREAK`），阈值最宽松，避免通道间行为不一致。
++    > 📌 **更正**：早期版本曾把"有思考、正文为空"归因于 Cookie 通道缺少 `HARM_CATEGORY_JAILBREAK`。这个解释是错的——按官方文档，**越狱分类器默认就是关闭的**，要打开必须显式把该分类的阈值设成具体的拦截值；不下发它不会启用任何过滤，下发 `OFF` 也只是空操作。该现象的真实成因见下方"3.6-flash 只返回思考"一节（前端恒发 `reasoning_effort=xhigh` 导致原生思考在 HIGH 档跑飞/被截断）。
+   - **上游错误如实透传**：模型在当前项目/区域不可用（404）、权限不足（403）、参数非法（400）等，会以对应 HTTP 状态码 + OpenAI 错误格式返回，而非笼统的 500。
+   - Google Search 增强：**文本模型**在模型名后加 `-search` 后缀按需开启。
+   - 自动保留 Gemini 思考过程（Thinking），以 `reasoning_content` 返回。
+@@ -82,11 +83,41 @@
+ | `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |
+ | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
+ | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
++| `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
++| `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
+ 
+ > 提示：`ROUNDROBIN`、`FAKE_STREAMING(_INTERVAL)`、`SAFETY_SCORE` 等环境变量仅作为**初始值**，运行时以控制台设置为准。
+ 
+ ---
+ 
++## 行为变更说明（整改后）
++
++按 `REFACTOR_PLAN.md` 完成整改后，以下行为与旧版本不同，升级时请注意：
++
++| 项目 | 旧行为 | 新行为 |
++|---|---|---|
++| **思考档位兜底** | 非法档位一律抬到 `high`（Pro 上选 minimal 反而变 high） | 就近**向下**夹取：Pro 选 minimal → `low` |
++| **`retry_max` 语义** | Express 通道当作总次数，设 0 时一次请求都不发 | 统一为「重试次数」，总请求数 = `retry_max + 1`，设 0 仍请求一次；取值钳到 0–50 |
++| **并行函数调用（流式）** | 只发第一个，`index` 恒为 0 | 全部下发，`index` 跨 chunk 稳定递增 |
++| **思考签名** | base64 拼进 `tool_call_id`（上千字符，易被前端截断） | 短 id（≤40 字符）+ 进程内旁路缓存；旧格式仍可解析；取不回时降级为官方 `skip_thought_signature_validator` 哨兵 |
++| **Cookie 通道 + 函数调用** | 静默把 `role=tool` 折成 model，发出错乱历史 | 入口返回 400，提示切换到标准模式 |
++| **Cookie 通道输入图** | 不压缩、不支持 http(s) 图片、不解析正文内联图 | 与标准通道一致（压缩开关对两条通道都生效） |
++| **`stop` 字段** | 只接受数组，传字符串 422 | 字符串/数组都接受 |
++| **`logprobs` 字段** | 按 Gemini 语义当整数 | 兼容 OpenAI 的 `logprobs: bool` + `top_logprobs: int` |
++| **Express 流式 usage** | 从不下发，客户端显示 0 | 支持 `stream_options.include_usage` |
++| **控制台 Cookie 回显** | 明文返回完整 Cookie | 仅返回掩码；输入框留空＝保持原 Cookie 不变 |
++| **登录** | 无限速、会话 token 为确定值 | 失败 3 次后指数退避；随机会话 token，可单独失效 |
++| **状态文件** | 每次读设置都同步读盘、非原子写 | 内存优先 + 原子写 + 权限 0600 + 支持 `STATE_DIR` |
++| **文本保真** | 所有消息的多空格/缩进被压平 | 仅在确实抽走内联图片时才压平 |
++| **2.5 Flash-Lite 思考预算** | 下限按 0 处理 | 下限 512（`0` 仍表示关闭） |
++| **生图比例 `9:21`** | 在白名单里（无官方出处） | 已移除，落到"由模型决定" |
++
++新增两个控制台开关：**思考签名内嵌 tool_call_id**（默认关，多副本部署才需开）与**生图下发 system 指令**（默认关，开启前请真机验证）。
++
++新增 `scripts/check_models.py`：打印各模型的能力判定，用于对着官方文档逐列核对。
++
++---
++
+ ## 控制台与模型参数
+ 
+ 控制台"模型参数"面板可在线调整全局默认值，并按所选模型显示其支持情况。可调项：思考强度（3.x 档位 / 2.5 预算）、生图分辨率与默认比例、采样默认值（temperature/top_p/max_tokens）、输入图压缩（开关/边长/质量）、重试次数与退避、假流式/轮询/安全分显示、预填充兼容模式与"预填充时压制原生思考"开关、续写指令模板、Cookie 调试日志。
+@@ -132,6 +163,17 @@
+ 
+ ## Cookie 直连模式配置指引（支持手机与电脑）
+ 
++> ⚠️ **使用前请先读这段风险提示**
++>
++> Cookie 直连模式的原理是：用硬编码的网页客户端 key 和固定的 `querySignature`，
++> 冒充 Google Cloud 控制台前端去调用其**私有** `batchGraphql` 接口。因此：
++>
++> - **无兼容性承诺**：这是内部接口，Google 改一次 `querySignature` 或参数结构就会全线失效，且不会有任何公告。
++> - **条款风险**：以自动化方式访问非公开接口，可能与 Google Cloud 的使用条款相冲突，存在账号被限制或处置的风险。请仅用自有账号、自担风险。
++> - **凭证敏感度极高**：配置的 Cookie 含 `__Secure-1PSID` 等完整会话凭证，等价于该 Google 账号的完整访问权。请勿把本服务部署到公开可访问的地方，务必设置强 `API_KEY`。
++>
++> 如果你需要的是稳定、可长期依赖的方案，请使用标准模式（Express API Key）。
++
+ 在控制台切换到 **Agent Platform Studio (Cookie 直连反代)**，需配置 **Cookie** 与 **Project ID**：
+ 
+ ### 1. 获取完整 Google Cookie
+@@ -226,16 +268,22 @@
+   "models": [
+     "gemini-3.6-flash",
+     "gemini-3.5-flash",
++    "gemini-3.5-flash-lite",
+     "gemini-3.1-pro-preview",
++    "gemini-3.1-flash-lite",
+     "gemini-3.1-flash-image",
+     "gemini-3-pro-image",
+-    "gemini-3-flash-preview",
+     "gemini-2.5-pro",
+     "gemini-2.5-flash"
+   ]
+ }
+ ```
+ 
++> ⏰ **停用时间线（核对于 2026-07-26，请自行复核官方 deprecations 页）**
++> - `gemini-2.5-pro` / `gemini-2.5-flash` / `gemini-2.5-flash-lite`：**2026-10-16 停用**。届时 `thinking_budget` 分支与"2.5 原生预填充透传"路径将没有活模型，可整体删除。
++> - `gemini-3-flash-preview`：官方推荐替代为 `gemini-3.5-flash`，已从默认清单移除。
++> - `gemini-3.1-flash-image` / `gemini-3-pro-image`：GA 版本（不带 `-preview`），对应的 `-preview` 版本已于 2026-06-25 停用。
++
+ `/v1/models` 会自动为**非生图**的 Gemini 模型生成带 `-search` 后缀的别名。新增模型只需把 ID 加进此列表即可（能力自动归类，无需改代码）。
+ 
+ ---
+@@ -253,7 +301,12 @@
+ ## 后续升级与扩展
+ 
+ - **新增模型**：把模型 ID 加入 `vertexModels.json`（或远程 `MODELS_CONFIG_URL`）。`model_capabilities.py` 按**家族/版本模式**自动归类（思考方式、采样裁剪、生图比例/分辨率、预填充），**未知/未来型号按"最新代"前向安全处理**。基本即插即用。
+-- **迁移到 Interactions API**：代码按上游通道解耦（`app/upstreams/` 下各类实现 `BaseUpstream`；能力判定、消息转换、参数构建均可复用）。待 Agent Platform 对基础 Gemini 模型开放 Interactions API 后，新增一个 `InteractionsUpstream`（实现 `BaseUpstream`）并在路由层接入即可，能力矩阵与预填充/参数逻辑可直接复用。当前 Agent Platform（Vertex）尚未对基础 Gemini 模型开放 Interactions（仅少数 agent），故暂未内置。
++- **迁移到 Interactions API**：代码按上游通道解耦（`app/upstreams/` 下各类实现 `BaseUpstream`；能力判定、消息转换、参数构建均可复用），新增一个 `InteractionsUpstream` 并在路由层接入即可。
++
++  现状（核对于 2026-07-26）：
++  - **Gemini Developer API 侧**：Interactions API 已于 2026-06 **GA**，官方推荐新项目使用；`generateContent` 被标为 legacy 但继续完整支持。
++  - **Agent Platform 侧**：Interactions API 仍标注为 **experimental**。
++  - **Express 模式**：REST 面只有 `countTokens` / `generateContent` / `streamGenerateContent` —— **这才是本项目暂不迁移的直接原因**（本项目走的正是 Express 通道）。
+ 
+ ---
+ 
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/api_helpers.py vertex2openai-main-refactored/app/api_helpers.py
+--- vertex2openai-main/app/api_helpers.py	2026-07-24 21:03:26.000000000 +0000
++++ vertex2openai-main-refactored/app/api_helpers.py	2026-07-26 08:42:12.414448047 +0000
+@@ -4,13 +4,10 @@
+ import asyncio
+ import httpx
+ import re
+-import random 
+-import base64
+ from typing import List, Dict, Any, Callable, Optional
+ 
+ from fastapi.responses import JSONResponse, StreamingResponse
+ from google.genai import types
+-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+ 
+ from models import OpenAIRequest, OpenAIMessage
+ from message_processing import (
+@@ -36,6 +33,33 @@
+     except Exception:
+         return bool(app_config.SAFETY_SCORE)
+ 
++
++def _embed_signature_in_id() -> bool:
++    """是否退回旧的 `{id}__thought__{base64}` 内嵌格式（默认关，见 signature_store 说明）。"""
++    try:
++        return bool(app_state.get_setting("embed_thought_signature_in_id", False))
++    except Exception:
++        return False
++
++
++def get_retry_settings() -> tuple[int, float]:
++    """读取重试配置。
++
++    **语义（全项目统一）**：`retry_max` 是「失败后的重试次数」，
++    总请求次数 = retry_max + 1。所以循环一律写 `range(retry_max + 1)`。
++    旧实现在 Express 通道写成 `range(retry_max)`，retry_max=0 时一次请求都不发（P0-2）。
++    """
++    try:
++        retry_max = int(app_state.get_setting("retry_max", app_config.DEFAULT_SETTINGS["retry_max"]))
++    except (TypeError, ValueError):
++        retry_max = app_config.DEFAULT_SETTINGS["retry_max"]
++    try:
++        backoff = float(app_state.get_setting(
++            "retry_backoff_seconds", app_config.DEFAULT_SETTINGS["retry_backoff_seconds"]))
++    except (TypeError, ValueError):
++        backoff = float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
++    return max(0, min(50, retry_max)), max(0.0, min(120.0, backoff))
++
+ class StreamingReasoningProcessor:
+     def __init__(self, tag_name: str = VERTEX_REASONING_TAG):
+         self.tag_name = tag_name
+@@ -181,21 +205,6 @@
+         return True
+     return False
+ 
+-def log_retry_attempt(retry_state):
+-    attempt = retry_state.attempt_number
+-    e = retry_state.outcome.exception()
+-    stats.add_retry() # 核心：自动退避重试精准计入大盘
+-    print(f"⚠️ [自动重试] 上游暂时繁忙或触发 Express Mode 配额限制（{e.__class__.__name__}）。正在进行第 {attempt} 次退避重试。")
+-
+-@retry(
+-    stop=stop_after_attempt(20),
+-    wait=wait_exponential(multiplier=1, min=1, max=8),
+-    retry=retry_if_exception(is_retryable_exception),
+-    before_sleep=log_retry_attempt
+-)
+-async def execute_with_retry(func, *args, **kwargs):
+-    return await func(*args, **kwargs)
+-    
+ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
+     config: Dict[str, Any] = {}
+     
+@@ -211,8 +220,15 @@
+                     elif hasattr(part, "text") and isinstance(part.text, str):
+                         system_texts.append(part.text)
+                         
+-    if system_texts and "image" not in request.model.lower():
+-        config["system_instruction"] = "\n".join(system_texts)
++    # P1-9：旧代码无条件剥离生图模型的 system_instruction，且没有注释理由。
++    # 官方并未禁止生图模型使用系统指令，但为避免直接改变既有行为，
++    # 改成控制台开关 image_system_instruction（默认关，保持旧行为）。
++    if system_texts:
++        _is_image_name = "image" in request.model.lower()
++        _allow_sys = (not _is_image_name) or bool(
++            app_state.get_setting("image_system_instruction", False))
++        if _allow_sys:
++            config["system_instruction"] = "\n".join(system_texts)
+     
+     if request.temperature is not None: config["temperature"] = request.temperature
+     if request.max_tokens is not None: 
+@@ -222,15 +238,28 @@
+         
+     if request.top_p is not None: config["top_p"] = request.top_p
+     if request.top_k is not None: config["top_k"] = request.top_k
+-    if request.stop is not None: config["stop_sequences"] = request.stop
++    # P1-3：OpenAI 允许 stop 为字符串，统一规范成数组
++    if request.stop is not None:
++        config["stop_sequences"] = [request.stop] if isinstance(request.stop, str) else list(request.stop)
+     if request.seed is not None: config["seed"] = request.seed
+     if request.n is not None: config["candidate_count"] = request.n
+     
+     if getattr(request, "presence_penalty", None) is not None: config["presence_penalty"] = request.presence_penalty
+     if getattr(request, "frequency_penalty", None) is not None: config["frequency_penalty"] = request.frequency_penalty
+         
+-    if getattr(request, "response_logprobs", None) is not None: config["response_logprobs"] = request.response_logprobs
+-    if getattr(request, "logprobs", None) is not None: config["logprobs"] = request.logprobs
++    # P1-3：OpenAI 语义 logprobs=bool + top_logprobs=int；Gemini 语义 response_logprobs=bool + logprobs=int。
++    _logprobs = getattr(request, "logprobs", None)
++    _top_logprobs = getattr(request, "top_logprobs", None)
++    if getattr(request, "response_logprobs", None) is not None:
++        config["response_logprobs"] = request.response_logprobs
++    if isinstance(_logprobs, bool):
++        if _logprobs:
++            config["response_logprobs"] = True
++            config["logprobs"] = _top_logprobs if isinstance(_top_logprobs, int) else 1
++    elif isinstance(_logprobs, int):
++        config["logprobs"] = _logprobs
++    elif isinstance(_top_logprobs, int):
++        config["logprobs"] = _top_logprobs
+ 
+     if getattr(request, "response_format", None) is not None:
+         fmt = request.response_format
+@@ -344,6 +373,47 @@
+     return config
+ 
+ 
++def _extract_usage(resp: Any) -> tuple[int, int, int]:
++    """从 SDK 响应里取 (prompt, completion, total) token 数。"""
++    um = getattr(resp, "usage_metadata", None)
++    if not um:
++        return 0, 0, 0
++    p_tk = getattr(um, "prompt_token_count", 0) or 0
++    c_tk = getattr(um, "candidates_token_count", 0) or 0
++    t_tk = getattr(um, "total_token_count", None) or (p_tk + c_tk)
++    return p_tk, c_tk, t_tk
++
++
++def _record_usage(resp: Any) -> dict:
++    """记录 token 用量并打印。
++
++    P1-5：直接调 stats.add_tokens()，不再让 logger 用正则从日志文本里反解——
++    那种做法与中文文案强耦合，改一个字就静默失效。
++    """
++    p_tk, c_tk, t_tk = _extract_usage(resp)
++    if p_tk or c_tk:
++        stats.add_tokens(p_tk, c_tk)
++        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
++    return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
++
++
++def wants_usage(request_obj: Any) -> bool:
++    """客户端是否通过 stream_options.include_usage 要求在流末尾附带用量（P1-8）。"""
++    opts = getattr(request_obj, "stream_options", None)
++    if opts is None and getattr(request_obj, "model_extra", None):
++        opts = request_obj.model_extra.get("stream_options")
++    if isinstance(opts, dict):
++        return bool(opts.get("include_usage"))
++    return False
++
++
++def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
++    """OpenAI 风格的用量尾块（choices 为空，仅携带 usage）。"""
++    chunk = {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()),
++             "model": model, "choices": [], "usage": usage}
++    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
++
++
+ def is_gemini_response_valid(response: Any) -> bool:
+     if response is None: return False
+     if hasattr(response, "text") and isinstance(response.text, str) and response.text.strip(): return True
+@@ -358,8 +428,30 @@
+     return False
+ 
+ 
+-def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0) -> str:
+-    from message_processing import parse_gemini_response_for_reasoning_and_content
++class ToolCallIndexer:
++    """一次流式响应内，为 tool_calls 分配稳定递增的 index（P0-3）。
++
++    OpenAI 客户端按 delta.tool_calls[].index 累积函数调用。旧实现把 index 硬编码成 0，
++    多个并行调用会被前端合并成一个；同时旧实现遇到第一个 function_call 就 break，
++    直接丢掉其余并行调用——而官方要求并行调用必须完整按
++    FC1,FC2,FR1,FR2 的顺序回传，缺一个就 400。
++
++    序号必须由调用方持有：并行调用可能分布在不同 chunk 里。
++    每次重试都要新建一个实例（重试会重发整轮，序号需要归零）。
++    """
++
++    def __init__(self):
++        self._next: Dict[int, int] = {}
++
++    def next_index(self, candidate_index: int = 0) -> int:
++        i = self._next.get(candidate_index, 0)
++        self._next[candidate_index] = i + 1
++        return i
++
++
++def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candidate_index: int = 0,
++                            indexer: Optional[ToolCallIndexer] = None) -> str:
++    from message_processing import parse_gemini_response_for_reasoning_and_content, build_tool_call_id
+     delta_payload = {}
+     openai_finish_reason = None
+ 
+@@ -375,57 +467,30 @@
+             elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
+             elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
+ 
+-        function_call_detected_in_chunk = False
++        # 遍历**全部** parts 收集并行函数调用，不再遇到第一个就 break
++        tool_call_deltas = []
+         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
++            embed_sig = _embed_signature_in_id()
+             for part in candidate.content.parts:
+-                if hasattr(part, "function_call") and part.function_call is not None: 
+-                    fc = part.function_call
+-                    
+-                    real_id = getattr(fc, "id", None)
+-                    if not real_id: real_id = getattr(fc, "thought_signature", None)
+-                    
+-                    thought_sig = getattr(part, "thought_signature", None)
+-                    thought_sig_b64 = ""
+-                    if thought_sig:
+-                        if isinstance(thought_sig, bytes):
+-                            thought_sig_b64 = base64.b64encode(thought_sig).decode("utf-8")
+-                        elif isinstance(thought_sig, str):
+-                            thought_sig_b64 = thought_sig
+-                    
+-                    safe_name = fc.name.replace(" ", "_")
+-                    rand_num = int(time.time() * 10000 + random.randint(0, 9999))
+-                    
+-                    if real_id:
+-                        if thought_sig_b64:
+-                            tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
+-                        else:
+-                            tool_call_id = real_id
+-                    else:
+-                        if thought_sig_b64:
+-                            tool_call_id = f"call_{response_id}_{candidate_index}_{safe_name}__thought__{thought_sig_b64}"
+-                        else:
+-                            tool_call_id = f"call_{response_id}_{candidate_index}_{safe_name}_{rand_num}"
+-                    
+-                    current_tool_call_delta = {
+-                        "index": 0, 
+-                        "id": tool_call_id,
+-                        "type": "function",
+-                        "function": {"name": fc.name}
+-                    }
+-                    if fc.args is not None: 
+-                        current_tool_call_delta["function"]["arguments"] = json.dumps(fc.args)
+-                    else: 
+-                        current_tool_call_delta["function"]["arguments"] = "" 
+-
+-                    if "tool_calls" not in delta_payload:
+-                        delta_payload["tool_calls"] = []
+-                    delta_payload["tool_calls"].append(current_tool_call_delta)
+-                    
+-                    delta_payload["content"] = None 
+-                    function_call_detected_in_chunk = True
+-                    break 
++                fc = getattr(part, "function_call", None)
++                if fc is None:
++                    continue
++                tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
++                tool_call_deltas.append({
++                    "index": tc_index,
++                    "id": build_tool_call_id(fc, part, embed_sig),
++                    "type": "function",
++                    "function": {
++                        "name": fc.name,
++                        "arguments": json.dumps(fc.args) if fc.args is not None else "",
++                    },
++                })
++
++        if tool_call_deltas:
++            delta_payload["tool_calls"] = tool_call_deltas
++            delta_payload["content"] = None
+ 
+-        if not function_call_detected_in_chunk:
++        if not tool_call_deltas:
+             reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
+ 
+             if _safety_score_enabled() and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
+@@ -531,13 +596,13 @@
+     if not prefill_text:
+         return openai_dict
+     try:
++        # P2-3：n>1 时每个 choice 都要拼回预填充，旧实现处理完第一个就 break
+         for choice in (openai_dict.get("choices") or []):
+             msg = choice.get("message")
+             if not isinstance(msg, dict) or msg.get("tool_calls"):
+                 continue
+             existing = msg.get("content") or ""
+             msg["content"] = prefill_text + strip_prefill_overlap(prefill_text, existing)
+-            break
+     except Exception:
+         pass
+     return openai_dict
+@@ -591,34 +656,89 @@
+     request_obj: OpenAIRequest,
+     is_auto_attempt: bool,
+     prefill_text: str = "",
++    fastapi_request: Optional[Any] = None,
+ ):
+     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
+-    
+-    api_call_task = asyncio.create_task(
+-        execute_with_retry(
+-            gemini_client_instance.aio.models.generate_content,
+-            model=model_for_api_call, 
+-            contents=prompt_for_api_call, 
+-            config=gen_config_dict_for_api_call
+-        )
+-    )
+-
+-    outer_keep_alive_interval = app_state.get_setting("fake_streaming_interval", app_config.FAKE_STREAMING_INTERVAL_SECONDS)
+-    if outer_keep_alive_interval > 0:
+-        while not api_call_task.done():
+-            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk", "created": int(time.time()), "model": request_obj.model, "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
+-            yield f"data: {json.dumps(keep_alive_data)}\n\n"
+-            await asyncio.sleep(outer_keep_alive_interval)
+-    
++
++    # P1-6：不再使用 tenacity 的硬编码 20 次，改为与真流式/非流式一致的手写退避，
++    # 读取控制台的 retry_max / retry_backoff_seconds，并在等待期间检测客户端断开。
++    max_retries, backoff_sec = get_retry_settings()
++
++    async def _client_gone() -> bool:
++        if fastapi_request is None:
++            return False
++        try:
++            return await fastapi_request.is_disconnected()
++        except Exception:
++            return False
++
++    outer_keep_alive_interval = app_state.get_setting(
++        "fake_streaming_interval", app_config.FAKE_STREAMING_INTERVAL_SECONDS)
++
++    api_call_task = None
++    raw_gemini_response = None
++    last_error = None
++
+     try:
+-        raw_gemini_response = await api_call_task 
++        for attempt in range(max_retries + 1):
++            if await _client_gone():
++                print(f"ℹ️ [客户端断开] 假流式请求前检测到客户端已断开，停止调用模型 {model_for_api_call}。")
++                return
++
++            api_call_task = asyncio.create_task(
++                gemini_client_instance.aio.models.generate_content(
++                    model=model_for_api_call,
++                    contents=prompt_for_api_call,
++                    config=gen_config_dict_for_api_call,
++                )
++            )
++
++            # 等待期间持续吐 keep-alive，避免前端因长时间无字节而超时
++            while not api_call_task.done():
++                if outer_keep_alive_interval > 0:
++                    keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
++                                       "created": int(time.time()), "model": request_obj.model,
++                                       "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
++                    yield f"data: {json.dumps(keep_alive_data)}\n\n"
++                    await asyncio.sleep(outer_keep_alive_interval)
++                else:
++                    await asyncio.sleep(0.2)
++                if await _client_gone():
++                    print("ℹ️ [客户端断开] 假流式等待期间客户端已断开，正在取消上游任务。")
++                    api_call_task.cancel()
++                    return
++
++            try:
++                raw_gemini_response = await api_call_task
++                break
++            except asyncio.CancelledError:
++                raise
++            except Exception as e_call:
++                last_error = e_call
++                if is_retryable_exception(e_call) and attempt < max_retries:
++                    stats.add_retry()
++                    print(f"⚠️ [自动重试] 假流式上游繁忙（{e_call.__class__.__name__}），"
++                          f"第 {attempt + 1} 次退避重试，等待 {backoff_sec} 秒。")
++                    waited = 0.0
++                    while waited < backoff_sec:
++                        step = min(max(0.5, outer_keep_alive_interval or 1.0), backoff_sec - waited)
++                        await asyncio.sleep(step)
++                        waited += step
++                        if await _client_gone():
++                            print("ℹ️ [客户端断开] 假流式退避期间客户端已断开，停止重试。")
++                            return
++                        if outer_keep_alive_interval > 0:
++                            keep_alive_data = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
++                                               "created": int(time.time()), "model": request_obj.model,
++                                               "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}]}
++                            yield f"data: {json.dumps(keep_alive_data)}\n\n"
++                    continue
++                raise
++
++        if raw_gemini_response is None:
++            raise last_error or ValueError("上游未返回任何响应（重试已耗尽）。")
+         
+-        if hasattr(raw_gemini_response, "usage_metadata") and raw_gemini_response.usage_metadata:
+-            um = raw_gemini_response.usage_metadata
+-            p_tk = getattr(um, "prompt_token_count", 0) or 0
+-            c_tk = getattr(um, "candidates_token_count", 0) or 0
+-            t_tk = getattr(um, "total_token_count", p_tk + c_tk) or (p_tk + c_tk)
+-            print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
++        _record_usage(raw_gemini_response)
+ 
+         openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
+         _prepend_prefill(openai_response_dict, prefill_text)
+@@ -664,7 +784,9 @@
+     fastapi_request: Optional[Any] = None,
+     prefill_text: str = "",
+ ):
+-    actual_prompt_for_call = prompt_func(request_obj.messages)
++    # P1-2：prompt 构建内部有远程图片下载与 PIL 压缩（同步阻塞），
++    # 放到线程里执行，避免卡住整个事件循环。
++    actual_prompt_for_call = await asyncio.to_thread(prompt_func, request_obj.messages)
+     print(f"🚀 [上游请求] 正在调用 Agent Platform Express Mode 模型 {model_to_call}，客户端请求模型名为 {request_obj.model}。")
+ 
+     async def _client_gone() -> bool:
+@@ -686,19 +808,18 @@
+                 gemini_fake_stream_generator(
+                     current_client, model_to_call, actual_prompt_for_call,
+                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
++                    fastapi_request=fastapi_request,
+                 ), media_type="text/event-stream"
+             )
+         else: # True Streaming
+             response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
+             async def _gemini_real_stream_generator_inner():
+-                try:
+-                    max_retries = int(app_state.get_setting("retry_max", 20))
+-                except (TypeError, ValueError):
+-                    max_retries = 20
++                max_retries, _backoff = get_retry_settings()
+                 has_yielded = False  # 是否已向客户端输出过内容
+                 # 立即吐一个 SSE 心跳，尽快建立连接（429 重试期间也保活，防前端超时中断）
+                 yield ": keep-alive\n\n"
+-                for attempt in range(max_retries):
++                # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
++                for attempt in range(max_retries + 1):
+                     # 客户端断开则停止重试，避免无谓的上游调用
+                     if await _client_gone():
+                         print(f"ℹ️ [客户端断开] 真流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
+@@ -712,6 +833,8 @@
+ 
+                         # 预填充智能兼容：把预填充文本作为回复开头先发出（仅一次）；
+                         # 同时启用流式去重器，模型若复述预填充开头会被自动裁掉（n>1 时不启用）。
++                        # 每次 attempt 都重置 tool_calls 序号（重试会重发整轮）
++                        tool_indexer = ToolCallIndexer()
+                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
+                         if prefill_text and not has_yielded:
+                             has_yielded = True
+@@ -721,17 +844,16 @@
+                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
+ 
+                         async for chunk_item_call in stream_gen_obj:
+-                            if hasattr(chunk_item_call, "usage_metadata") and chunk_item_call.usage_metadata:
+-                                um = chunk_item_call.usage_metadata
+-                                final_p_tk = getattr(um, "prompt_token_count", 0) or 0
+-                                final_c_tk = getattr(um, "candidates_token_count", 0) or 0
+-                                final_t_tk = getattr(um, "total_token_count", final_p_tk + final_c_tk) or (final_p_tk + final_c_tk)
++                            if getattr(chunk_item_call, "usage_metadata", None):
++                                final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
+ 
+                             # 支持 n>1：按候选序号逐个输出
+                             num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
+                             for ci in range(num_candidates):
+                                 has_yielded = True
+-                                sse_chunk = convert_chunk_to_openai(chunk_item_call, request_obj.model, response_id_for_stream, ci)
++                                sse_chunk = convert_chunk_to_openai(
++                                    chunk_item_call, request_obj.model, response_id_for_stream, ci,
++                                    indexer=tool_indexer)
+                                 if deduper is not None:
+                                     sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
+                                     if sse_chunk is None:
+@@ -746,8 +868,17 @@
+                                 yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+ 
+                         if final_p_tk > 0 or final_c_tk > 0:
++                            stats.add_tokens(final_p_tk, final_c_tk)
+                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
+ 
++                        # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
++                        if wants_usage(request_obj):
++                            yield make_usage_chunk(response_id_for_stream, request_obj.model, {
++                                "prompt_tokens": final_p_tk,
++                                "completion_tokens": final_c_tk,
++                                "total_tokens": final_t_tk,
++                            })
++
+                         yield "data: [DONE]\n\n"
+                         return
+ 
+@@ -763,7 +894,7 @@
+ 
+                         # 关键修复：只有在“尚未向客户端输出任何内容”时才重试；
+                         # 否则重试会导致整段答案重复输出（前半段 + 完整重发）。
+-                        if is_retryable and not has_yielded and attempt < max_retries - 1:
++                        if is_retryable and not has_yielded and attempt < max_retries:
+                             wave_index = attempt % 4
+                             round_num = (attempt // 4) + 1
+                             wait_time = 2 ** wave_index
+@@ -800,12 +931,10 @@
+             return StreamingResponse(_gemini_real_stream_generator_inner(), media_type="text/event-stream")
+     else: # Non-streaming
+         # 手动退避重试循环（替代 tenacity），以便在每次重试前检测客户端断开
+-        try:
+-            max_retries = int(app_state.get_setting("retry_max", 20))
+-        except (TypeError, ValueError):
+-            max_retries = 20
++        max_retries, _backoff = get_retry_settings()
+         response_obj_call = None
+-        for attempt in range(max_retries):
++        # 总尝试次数 = retry_max + 1，retry_max=0 时仍会请求一次
++        for attempt in range(max_retries + 1):
+             if await _client_gone():
+                 print(f"ℹ️ [客户端断开] 非流式请求前检测到客户端已断开，停止调用模型 {model_to_call}。")
+                 return JSONResponse(
+@@ -823,7 +952,7 @@
+                 print(f"ℹ️ [客户端断开] 非流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
+                 raise
+             except Exception as e_call:
+-                if is_retryable_exception(e_call) and attempt < max_retries - 1:
++                if is_retryable_exception(e_call) and attempt < max_retries:
+                     stats.add_retry()
+                     wait_time = min(8, 2 ** (attempt % 4))
+                     print(f"⚠️ [自动重试] 上游繁忙或触发配额限制（{e_call.__class__.__name__}）。第 {attempt + 1} 次退避重试，等待 {wait_time} 秒。")
+@@ -831,6 +960,15 @@
+                     continue
+                 raise
+ 
++        # 兜底：绝不让 None 流到下游的有效性检查里变成一条误导性的“无有效内容”
++        if response_obj_call is None:
++            print(f"❌ [上游无响应] 模型 {model_to_call} 在 {max_retries + 1} 次尝试后仍未返回任何响应。")
++            return JSONResponse(
++                status_code=502,
++                content=create_openai_error_response(
++                    502, "上游未返回任何响应（重试已耗尽）。", "upstream_error"),
++            )
++
+         if hasattr(response_obj_call, "prompt_feedback") and \
+            hasattr(response_obj_call.prompt_feedback, "block_reason") and \
+            response_obj_call.prompt_feedback.block_reason:
+@@ -863,12 +1001,7 @@
+                 error_details += f"Response type: {type(response_obj_call).__name__}"
+             raise ValueError(error_details)
+ 
+-        if hasattr(response_obj_call, "usage_metadata") and response_obj_call.usage_metadata:
+-            um = response_obj_call.usage_metadata
+-            p_tk = getattr(um, "prompt_token_count", 0) or 0
+-            c_tk = getattr(um, "candidates_token_count", 0) or 0
+-            t_tk = getattr(um, "total_token_count", p_tk + c_tk) or (p_tk + c_tk)
+-            print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
++        _record_usage(response_obj_call)
+ 
+         openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
+         _prepend_prefill(openai_response_content, prefill_text)
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/config.py vertex2openai-main-refactored/app/config.py
+--- vertex2openai-main/app/config.py	2026-07-24 22:54:58.000000000 +0000
++++ vertex2openai-main-refactored/app/config.py	2026-07-26 08:42:28.480088566 +0000
+@@ -70,6 +70,8 @@
+     "img_compress_max_mb": 1.5,
+     "img_compress_quality": 85,
+     # 重试
++    # 语义：retry_max = 失败后的**重试**次数，总请求次数 = retry_max + 1。
++    # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
+     "retry_max": 10,
+     "retry_backoff_seconds": 5,
+     # 开关（初始值取环境变量）
+@@ -94,8 +96,18 @@
+     "hide_thoughts": False,
+     # smart 模式续写指令模板（留空=用内置默认；预填充文本会自动附在模板之后）
+     "prefill_instruction": "",
+-    # Cookie 通道调试：打印出站 generationConfig（无正文时的原始响应样本总是自动记录，无需开启）
++    # 出站参数调试：打印两条通道实际发出的 generationConfig / thinkingConfig。
++    # 实机验证思考档位、采样裁剪是否生效时必开。
++    # （旧键名 cookie_debug 保留为别名，只作用于 Cookie 通道的额外诊断）
++    "debug_outbound": False,
+     "cookie_debug": False,
++    # 思考签名内嵌开关（默认关）：
++    #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
++    #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用
++    "embed_thought_signature_in_id": False,
++    # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
++    # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
++    "image_system_instruction": False,
+     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
+     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
+     "model_overrides": {},
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/logger.py vertex2openai-main-refactored/app/logger.py
+--- vertex2openai-main/app/logger.py	2026-07-24 18:56:24.000000000 +0000
++++ vertex2openai-main-refactored/app/logger.py	2026-07-26 08:42:12.415752177 +0000
+@@ -3,18 +3,19 @@
+ import asyncio
+ import re
+ import threading
+-from typing import List
++from typing import List, Optional
+ 
+ original_print = builtins.print
+ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+ 
++
+ class ProxyStats:
+     def __init__(self):
+         self.start_time = time.time()
+         self.total_requests = 0
+         self.success_requests = 0
+         self.error_requests = 0
+-        self.retry_counts = 0  
++        self.retry_counts = 0
+         self.prompt_tokens = 0
+         self.completion_tokens = 0
+         self.lock = threading.Lock()
+@@ -48,80 +49,135 @@
+             self.success_requests += 1
+ 
+     def get_json_stats(self):
+-        return {
+-            "uptime": round(time.time() - self.start_time, 2),
+-            "total": self.total_requests,
+-            "success": self.success_requests,
+-            "error": self.error_requests,
+-            "retries": self.retry_counts,
+-            "prompt_tokens": self.prompt_tokens,
+-            "completion_tokens": self.completion_tokens
+-        }
++        with self.lock:
++            return {
++                "uptime": round(time.time() - self.start_time, 2),
++                "total": self.total_requests,
++                "success": self.success_requests,
++                "error": self.error_requests,
++                "retries": self.retry_counts,
++                "prompt_tokens": self.prompt_tokens,
++                "completion_tokens": self.completion_tokens,
++            }
++
+ 
+ stats = ProxyStats()
+ 
++
+ class SSELogger:
+-    def __init__(self):
+-        self.queues: List[asyncio.Queue] = []
+-        self.max_history = 100
+-        self.history = []
++    """把运行日志推给控制台的 SSE 订阅者。
+ 
+-    def push(self, plain_text):
++    P1-5 修复的三个隐患：
++      - `asyncio.Queue.put_nowait` 不是线程安全的，而 push() 可能从任意线程被调用
++        （图片压缩线程、to_thread 里的消息转换等）。改为 loop.call_soon_threadsafe。
++      - 订阅者列表会被事件循环并发增删，遍历时可能 RuntimeError。改为持锁取快照。
++      - 队列原本无界，慢客户端会把内存撑爆。改为有界 + 满则丢最旧。
++    """
++
++    def __init__(self, max_history: int = 100, queue_size: int = 500):
++        self.max_history = max_history
++        self.queue_size = queue_size
++        self.history: List[str] = []
++        self._subscribers: List[tuple] = []       # [(queue, loop)]
++        self._lock = threading.Lock()
++
++    # ---- 订阅管理 ----
++
++    def subscribe(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> asyncio.Queue:
++        q: asyncio.Queue = asyncio.Queue(maxsize=self.queue_size)
++        loop = loop or asyncio.get_running_loop()
++        with self._lock:
++            self._subscribers.append((q, loop))
++        return q
++
++    def unsubscribe(self, q: asyncio.Queue) -> None:
++        with self._lock:
++            self._subscribers = [(sq, sl) for (sq, sl) in self._subscribers if sq is not q]
++
++    def snapshot_history(self) -> List[str]:
++        with self._lock:
++            return list(self.history)
++
++    # ---- 推送 ----
++
++    @staticmethod
++    def _offer(q: asyncio.Queue, msg: str) -> None:
++        """在事件循环线程里执行：队列满时丢最旧的一条，保证新日志能进来。"""
++        try:
++            q.put_nowait(msg)
++        except asyncio.QueueFull:
++            try:
++                q.get_nowait()
++                q.put_nowait(msg)
++            except Exception:
++                pass
++
++    def push(self, plain_text: str) -> None:
+         timestamp = time.strftime("%H:%M:%S")
+         formatted_msg = f"[{timestamp}] {plain_text}"
+-        self.history.append(formatted_msg)
+-        if len(self.history) > self.max_history:
+-            self.history.pop(0)
+-        for q in self.queues:
++
++        with self._lock:
++            self.history.append(formatted_msg)
++            if len(self.history) > self.max_history:
++                self.history.pop(0)
++            subscribers = list(self._subscribers)
++
++        for q, loop in subscribers:
+             try:
+-                q.put_nowait(formatted_msg)
+-            except asyncio.QueueFull:
++                if loop.is_closed():
++                    continue
++                loop.call_soon_threadsafe(self._offer, q, formatted_msg)
++            except RuntimeError:
++                # 事件循环已停止，忽略即可
+                 pass
+ 
++
+ rt_logger = SSELogger()
+ 
++# 防止 print 钩子内部再触发 print 导致递归
++_in_hook = threading.local()
++
++
+ def custom_print(*args, **kwargs):
++    """把业务 print 同时推到控制台日志流。
++
++    说明（P1-5 第一步）：仍保留对 builtins.print 的接管以兼容现有 6000 行代码里的
++    print 调用，但已经**移除了用正则从日志文本反解 token 数**的逻辑——
++    那与中文文案强耦合，改一个字就静默失效。现在由 api_helpers._record_usage()
++    直接调用 stats.add_tokens()。后续可分批把 print 迁移到 logging。
+     """
+-    精修后的多线程安全打印代理
+-    防御式编程：杜绝双重 file 参数导致的冲突，捕获所有运行时异常
+-    """
+-    import io
+-    buf = io.StringIO()
+-    
+-    # 1. 深度隔离 kwargs，重定向输出到缓冲区
+-    kwargs_for_buffer = kwargs.copy()
+-    kwargs_for_buffer["file"] = buf
+-    
+-    raw_msg = ""
+-    try:
+-        original_print(*args, **kwargs_for_buffer)
+-        raw_msg = buf.getvalue().strip()
+-    except Exception:
+-        pass  # 缓冲写入异常时安全退出，不阻断主输出
+-        
+-    # 2. 调用原始打印，保持原有的控制台输出目标不变
+-    try:
++    if getattr(_in_hook, "active", False):
+         original_print(*args, **kwargs)
+-    except Exception:
+-        pass
+-
+-    if not raw_msg:
+         return
+ 
+-    # Token 统计解析
+-    if "💰" in raw_msg and "Tokens" in raw_msg:
++    _in_hook.active = True
++    try:
++        import io
++        buf = io.StringIO()
++        kwargs_for_buffer = dict(kwargs)
++        kwargs_for_buffer["file"] = buf
++
++        raw_msg = ""
+         try:
+-            m = re.search(r'提示词:\s*(\d+).*?(?:模型)?思考与生成:\s*(\d+)', raw_msg)
+-            if m: 
+-                stats.add_tokens(int(m.group(1)), int(m.group(2)))
++            original_print(*args, **kwargs_for_buffer)
++            raw_msg = buf.getvalue().strip()
+         except Exception:
+             pass
+ 
+-    # 推送至前端大盘日志
+-    try:
+-        plain_msg = ANSI_ESCAPE.sub('', raw_msg)
+-        rt_logger.push(plain_msg)
+-    except Exception:
+-        pass
++        try:
++            original_print(*args, **kwargs)
++        except Exception:
++            pass
++
++        if not raw_msg:
++            return
++
++        try:
++            rt_logger.push(ANSI_ESCAPE.sub('', raw_msg))
++        except Exception:
++            pass
++    finally:
++        _in_hook.active = False
++
+ 
+-builtins.print = custom_print
+\ No newline at end of file
++builtins.print = custom_print
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/main.py vertex2openai-main-refactored/app/main.py
+--- vertex2openai-main/app/main.py	2026-07-24 22:57:46.000000000 +0000
++++ vertex2openai-main-refactored/app/main.py	2026-07-26 08:42:12.415794288 +0000
+@@ -1,6 +1,8 @@
+ import asyncio
++import os
+ import secrets
+-import hashlib
++import threading
++import time
+ from fastapi import FastAPI, Depends, Request, HTTPException
+ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+ from fastapi.middleware.cors import CORSMiddleware
+@@ -26,6 +28,18 @@
+ async def lifespan(app: FastAPI):
+     from model_loader import refresh_models_config_cache
+     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
++
++    # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
++    if config.API_KEY == DEFAULT_API_KEY:
++        public_host = any(os.environ.get(k) for k in ("SPACE_ID", "SPACE_HOST", "HF_SPACE_ID"))
++        if public_host and os.environ.get("ALLOW_DEFAULT_KEY", "").lower() not in ("1", "true", "yes"):
++            raise RuntimeError(
++                "检测到公开托管环境（HuggingFace Space 等）且 API_KEY 仍为默认值 123456。\n"
++                "该口令同时是控制台登录密码，而控制台可以读写完整的 Google 会话 Cookie。\n"
++                "请设置一个强 API_KEY 后重启；确需临时放行可设 ALLOW_DEFAULT_KEY=true。"
++            )
++        print("🔴 [安全警告] API_KEY 仍是默认值 123456！它既是本代理的 Key，也是控制台登录口令，"
++              "请立刻改成强口令。")
+     if express_key_manager.get_total_keys() > 0:
+         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
+     else:
+@@ -65,13 +79,89 @@
+ 
+ # ====== 仅密码登录（Cookie 会话，免输账号）======
+ AUTH_COOKIE = "ap_session"
++DEFAULT_API_KEY = "123456"
++SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
++
++# P2-2：会话 token 改为随机值存内存，不再用 sha256(常量 + API_KEY) 这种确定值。
++# 确定值意味着同一个 API_KEY 永远对应同一个 cookie，无法单独失效某个会话。
++_sessions: dict = {}          # token -> 过期时间戳
++_sessions_lock = threading.Lock()
++
++# 登录失败计数：{ip: [失败次数, 最近失败时间]}，指数退避
++_login_failures: dict = {}
++_login_lock = threading.Lock()
++LOGIN_LOCK_BASE_SECONDS = 2
++LOGIN_LOCK_MAX_SECONDS = 300
++
++
++def _issue_session() -> str:
++    token = secrets.token_urlsafe(32)
++    now = time.time()
++    with _sessions_lock:
++        for t, exp in list(_sessions.items()):     # 顺手清理过期会话
++            if exp < now:
++                _sessions.pop(t, None)
++        _sessions[token] = now + SESSION_TTL_SECONDS
++    return token
++
++
++def _revoke_session(token: str) -> None:
++    with _sessions_lock:
++        _sessions.pop(token, None)
+ 
+-def _session_token() -> str:
+-    # 存 hash 而非明文 key；httponly cookie，前端 JS 读不到
+-    return hashlib.sha256(("agentplatform2api::" + (config.API_KEY or "")).encode()).hexdigest()
+ 
+ def _is_authed(request: Request) -> bool:
+-    return secrets.compare_digest(request.cookies.get(AUTH_COOKIE, ""), _session_token())
++    token = request.cookies.get(AUTH_COOKIE, "")
++    if not token:
++        return False
++    with _sessions_lock:
++        exp = _sessions.get(token)
++        if exp is None:
++            return False
++        if exp < time.time():
++            _sessions.pop(token, None)
++            return False
++    return True
++
++
++def _login_retry_after(ip: str) -> int:
++    """该 IP 还需等待多少秒才能再次尝试登录（0 = 可以尝试）。"""
++    with _login_lock:
++        rec = _login_failures.get(ip)
++        if not rec:
++            return 0
++        count, last = rec
++        if count < 3:
++            return 0
++        wait = min(LOGIN_LOCK_BASE_SECONDS * (2 ** (count - 3)), LOGIN_LOCK_MAX_SECONDS)
++        remain = int(last + wait - time.time())
++        return max(0, remain)
++
++
++def _record_login_failure(ip: str) -> None:
++    with _login_lock:
++        count, _ = _login_failures.get(ip, (0, 0.0))
++        _login_failures[ip] = (count + 1, time.time())
++
++
++def _clear_login_failure(ip: str) -> None:
++    with _login_lock:
++        _login_failures.pop(ip, None)
++
++
++def mask_cookie(cookie_str: str) -> str:
++    """S-1：控制台只回显掩码，不再把完整 Google 会话 Cookie 明文吐回前端。"""
++    if not cookie_str:
++        return ""
++    names = []
++    for seg in cookie_str.split(";"):
++        name = seg.strip().split("=", 1)[0].strip()
++        if name:
++            names.append(name)
++    head = cookie_str.strip()[:6]
++    tail = cookie_str.strip()[-4:]
++    return f"{head}…{tail}（共 {len(names)} 个 cookie 字段，{len(cookie_str)} 字符）"
++
+ 
+ async def require_auth(request: Request):
+     if not _is_authed(request):
+@@ -352,7 +442,10 @@
+           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
+           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
+           <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分</span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
+-          <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道调试日志 <span class="text-xs text-neutral-400">（打印出站参数；无正文诊断总是自动记录）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
++          <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志 <span class="text-xs text-neutral-400">（两条通道都打印实际发出的思考/采样参数，实机验证必开）</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
++          <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断 <span class="text-xs text-neutral-400">（无正文时的原始响应样本总是自动记录，无需开启）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
++          <div class="flex items-center justify-between"><span class="text-sm">思考签名内嵌 tool_call_id <span class="text-xs text-neutral-400">（默认关＝短 id＋内存缓存；多副本部署才需开启）</span></span><label class="switch"><input type="checkbox" id="embed_thought_signature_in_id"><span class="slider"></span></label></div>
++          <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令 <span class="text-xs text-neutral-400">（默认关＝沿用旧行为；开启前请先真机验证目标模型）</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
+           <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式</span>
+             <select id="prefill_mode" class="inp" style="width:130px"><option value="smart">智能</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+           </div>
+@@ -436,7 +529,7 @@
+   let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
+   const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
+   $('cookie-input').value=ck; $('project-input').value=pid;
+-  if(!ck||!pid){ toast('请填写完整 Cookie 和 Project ID'); return; }
++  if(!pid){ toast('请填写 Project ID'); return; }
+   try{
+     const r=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
+     const d=await r.json(); toast(r.ok?(d.message||'已保存并激活'):('❌ '+(d.error||'保存失败')));
+@@ -449,7 +542,15 @@
+     document.querySelector(`input[name=mode][value=${m}]`).checked=true;
+     $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+     $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
+-    if(s.google_cookie) $('cookie-input').value=s.google_cookie;
++    /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
++       输入框留空 = 保持现有 Cookie；填了才更新。 */
++    const ci=$('cookie-input');
++    if(ci){
++      ci.value='';
++      ci.placeholder = s.google_cookie_configured
++        ? ('已配置：'+s.google_cookie+'　（留空则保持不变，需更新时粘贴新 Cookie）')
++        : '粘贴完整 Cookie 头或 Cookie-Editor 导出内容';
++    }
+     if(s.google_project_id) $('project-input').value=s.google_project_id;
+   }catch(e){}
+ }
+@@ -462,7 +563,7 @@
+     GLOBAL_SETTINGS=s;
+     curAR = s.image_aspect_ratio || "";
+     ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
+-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','prefill_suppress_thinking'].forEach(k=>setV(k,s[k]));
++    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','embed_thought_signature_in_id','image_system_instruction'].forEach(k=>setV(k,s[k]));
+     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
+     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
+       if(s.hide_thoughts) setV('native_thinking_mode','off');
+@@ -591,6 +692,9 @@
+     roundrobin:$('roundrobin').checked,
+     safety_score:$('safety_score').checked,
+     cookie_debug:$('cookie_debug').checked,
++    debug_outbound:$('debug_outbound').checked,
++    embed_thought_signature_in_id:$('embed_thought_signature_in_id').checked,
++    image_system_instruction:$('image_system_instruction').checked,
+     prefill_mode:$('prefill_mode').value,
+     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
+     prefill_instruction:$('prefill_instruction').value,
+@@ -663,16 +767,35 @@
+ 
+ 
+ @app.post("/api/login")
+-async def login(body: LoginBody):
++async def login(body: LoginBody, request: Request):
++    ip = request.client.host if request.client else "unknown"
++
++    # P2-2：失败三次后指数退避，避免对口令（同时也是 API Key）无限爆破
++    remain = _login_retry_after(ip)
++    if remain > 0:
++        return JSONResponse(status_code=429,
++                            content={"error": f"尝试过于频繁，请 {remain} 秒后再试"})
++
+     if config.API_KEY and secrets.compare_digest(body.password, config.API_KEY):
++        _clear_login_failure(ip)
+         resp = JSONResponse(content={"ok": True})
+-        resp.set_cookie(AUTH_COOKIE, _session_token(), httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30, path="/")
++        resp.set_cookie(
++            AUTH_COOKIE, _issue_session(),
++            httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS, path="/",
++            # 反代后 request.url.scheme 可能是 http，这里同时看 x-forwarded-proto
++            secure=(request.url.scheme == "https"
++                    or request.headers.get("x-forwarded-proto", "") == "https"),
++        )
+         return resp
++
++    _record_login_failure(ip)
++    print(f"🔐 [登录失败] 来自 {ip} 的密码尝试失败。")
+     return JSONResponse(status_code=401, content={"error": "密码错误"})
+ 
+ 
+ @app.post("/api/logout")
+-async def logout():
++async def logout(request: Request):
++    _revoke_session(request.cookies.get(AUTH_COOKIE, ""))
+     resp = JSONResponse(content={"ok": True})
+     resp.delete_cookie(AUTH_COOKIE, path="/")
+     return resp
+@@ -692,9 +815,13 @@
+ 
+ @app.get("/api/settings/runtime")
+ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
++    cookie = app_state.get_google_cookie()
+     return JSONResponse(content={
+         "use_web_proxy": app_state.is_web_proxy_enabled(),
+-        "google_cookie": app_state.get_google_cookie(),
++        # S-1：只回显掩码。完整 Cookie 等价于该 Google 账号的完整访问权，
++        # 没有任何理由让它出现在前端 JS / 浏览器缓存 / 截图里。
++        "google_cookie": mask_cookie(cookie),
++        "google_cookie_configured": bool(cookie),
+         "google_project_id": app_state.get_project_id(),
+     })
+ 
+@@ -761,27 +888,43 @@
+ 
+ 
+ class CookieSetting(BaseModel):
+-    cookie: str
+-    project_id: str
++    cookie: str = ""          # 留空 = 保持现有 Cookie
++    project_id: str = ""
+ 
+ 
+ @app.post("/api/cookie")
+ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(require_auth)):
+-    validation = validate_cookie(setting.cookie)
+-    if not validation["valid"]:
+-        return JSONResponse(status_code=400, content={"error": validation["message"]})
+-    app_state.set_google_cookie(setting.cookie.strip())
+-    app_state.set_project_id(setting.project_id.strip())
+-    return JSONResponse(content={"status": "success", "message": validation["message"]})
++    """保存 Cookie 与 Project ID。
++
++    S-1：cookie 传空字符串表示「保持现有 Cookie 不变，只更新 Project ID」，
++    这样前端就不需要为了改 Project ID 而把完整 Cookie 再取回来一次。
++    """
++    new_cookie = (setting.cookie or "").strip()
++    project_id = (setting.project_id or "").strip()
++
++    if new_cookie:
++        validation = validate_cookie(new_cookie)
++        if not validation["valid"]:
++            return JSONResponse(status_code=400, content={"error": validation["message"]})
++        app_state.set_google_cookie(new_cookie)
++        message = validation["message"]
++    else:
++        if not app_state.get_google_cookie():
++            return JSONResponse(status_code=400, content={
++                "error": "尚未配置 Cookie，请粘贴完整的 Google Cookie。"})
++        message = "✅ 已保留原有 Cookie，仅更新 Project ID。"
++
++    if project_id:
++        app_state.set_project_id(project_id)
++    return JSONResponse(content={"status": "success", "message": message})
+ 
+ 
+ @app.get("/stream-logs")
+ async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
+     async def log_generator():
+-        q = asyncio.Queue()
+-        rt_logger.queues.append(q)
++        q = rt_logger.subscribe()
+         try:
+-            for msg in rt_logger.history:
++            for msg in rt_logger.snapshot_history():
+                 yield f"data: {msg}\n\n"
+             while True:
+                 if await request.is_disconnected():
+@@ -792,8 +935,7 @@
+                 except asyncio.TimeoutError:
+                     yield ": keep-alive heartbeat\n\n"
+         finally:
+-            if q in rt_logger.queues:
+-                rt_logger.queues.remove(q)
++            rt_logger.unsubscribe(q)
+     return StreamingResponse(log_generator(), media_type="text/event-stream")
+ 
+ 
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/message_processing.py vertex2openai-main-refactored/app/message_processing.py
+--- vertex2openai-main/app/message_processing.py	2026-07-24 19:07:52.000000000 +0000
++++ vertex2openai-main-refactored/app/message_processing.py	2026-07-26 08:42:12.416044940 +0000
+@@ -2,12 +2,15 @@
+ import re
+ import json
+ import time
++import uuid
+ import random 
+ import httpx
+ import concurrent.futures
+-from typing import List, Dict, Any, Tuple
++from typing import List, Dict, Any, Optional, Tuple
+ import config as app_config
++import model_capabilities as mc
+ from runtime_state import app_state
++from signature_store import signature_store, SKIP_VALIDATOR_SENTINEL
+ 
+ from google.genai import types
+ from models import OpenAIMessage, ContentPartText, ContentPartImage
+@@ -79,6 +82,102 @@
+ 
+ SUPPORTED_ROLES = ["user", "model", "function"] 
+ 
++# ============================================================
++# 思考签名（thought signature）的出入站处理（P0-4）
++#
++# 官方约束（核对于 2026-07-26）：
++#   - 函数调用强校验，Gemini 3 缺签名直接 400；纯文本不强校验但会掉质量。
++#   - Gemini 3 的签名总在**第一个** function call part 上，必须原样回传。
++#   - 并行调用必须按 FC1,FC2,FR1,FR2 顺序回传，交错会 400。
++#   - 拿不到签名时可用 skip_thought_signature_validator 哨兵跳过校验（最后手段）。
++#
++# 这里的两个函数是出/入站的唯一入口。此前 api_helpers 与本文件各有一份复制粘贴的
++# 实现，且已经出现细微不一致（一个用 response_id、一个用 base_id 拼 fallback id）。
++# ============================================================
++
++LEGACY_THOUGHT_SEP = "__thought__"
++
++
++def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
++    """从 part / function_call 上取出思考签名，统一成 bytes。"""
++    sig = getattr(part, "thought_signature", None)
++    if sig is None:
++        sig = getattr(fc, "thought_signature", None)
++    if isinstance(sig, bytes):
++        return sig or None
++    if isinstance(sig, str) and sig:
++        try:
++            return base64.b64decode(sig)
++        except Exception:
++            return sig.encode("utf-8")
++    return None
++
++
++def build_tool_call_id(fc: Any, part: Any, embed_signature: bool = False) -> str:
++    """生成 OpenAI 侧的 tool_call_id，并把思考签名登记进旁路缓存。
++
++    默认返回**短 id**（≤40 字符）。旧实现把 base64 签名拼进 id，动辄上千字符，
++    很多前端会截断，回传时签名丢失 → 400。
++    embed_signature=True 可退回旧格式（控制台开关，供多进程部署使用）。
++    """
++    real_id = getattr(fc, "id", None) or ""
++    if not isinstance(real_id, str):
++        real_id = str(real_id)
++    if not real_id:
++        real_id = "call_" + uuid.uuid4().hex[:16]   # 共 21 字符
++
++    sig = _signature_bytes(part, fc)
++    if sig:
++        if embed_signature:
++            return f"{real_id}{LEGACY_THOUGHT_SEP}{base64.b64encode(sig).decode('utf-8')}"
++        signature_store.put(real_id, sig)
++    return real_id
++
++
++def resolve_tool_call_signature(tool_call_id: str,
++                                require_signature: bool = False) -> Tuple[str, Optional[bytes]]:
++    """从客户端回传的 tool_call_id 还原 (真实 id, 思考签名)。
++
++    三层降级：旁路缓存 → 旧的 `__thought__` 内嵌格式 → 官方哨兵值。
++    require_signature=True（Gemini 3.x）时绝不返回 None，避免整个请求 400。
++    """
++    real_id = tool_call_id or ""
++    sig: Optional[bytes] = None
++
++    if LEGACY_THOUGHT_SEP in real_id:
++        real_id, _, encoded = real_id.partition(LEGACY_THOUGHT_SEP)
++        try:
++            sig = base64.b64decode(encoded) or None
++        except Exception:
++            sig = None
++
++    if sig is None:
++        sig = signature_store.get(real_id)
++
++    if sig is None and require_signature:
++        sig = SKIP_VALIDATOR_SENTINEL
++        print("⚠️ [工具调用] 未能恢复思考签名（可能被前端截断或服务已重启），"
++              "已使用官方跳过校验哨兵。请求不会失败，但模型表现会下降。")
++
++    return real_id, sig
++
++
++def _requires_signature(model_name: str) -> bool:
++    """该模型是否强校验思考签名（仅 Gemini 3.x 家族）。"""
++    if not model_name:
++        return False
++    try:
++        return mc.get_profile(model_name)["family"] == "g3"
++    except Exception:
++        return False
++
++
++def _embed_signature_enabled() -> bool:
++    try:
++        return bool(app_state.get_setting("embed_thought_signature_in_id", False))
++    except Exception:
++        return False
++
+ def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
+     if not tag_name or not isinstance(full_text, str):
+         return "", full_text if isinstance(full_text, str) else ""
+@@ -111,8 +210,11 @@
+             except Exception as e:
+                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
+         parts.reverse()
+-    
+-    remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
++        # 仅在**确实抽走了图片**时才压平空白：抠掉 data URL 会留下成片空格。
++        # 旧实现无条件执行，导致所有纯文本消息的缩进/多空格（代码块、ASCII 图、
++        # 酒馆预设的排版）都被悄悄改写。文本保真优先。
++        remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
++
+     return parts, remaining_text
+ 
+ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
+@@ -269,9 +371,26 @@
+         if self.done:
+             return text
+         self.buffer += text
+-        if len(self.buffer) < self.window:
+-            return ""
+-        return self._resolve()
++        # P2-4：只要已经能判定「不可能是预填充的重复」，立刻放行，不必攒满窗口。
++        # 旧实现固定攒到 min(len(prefill)+32, 600) 字符才放行，首 token 延迟明显，
++        # 与注释里的“零额外延迟”不符。
++        if len(self.buffer) >= self.window or not self._still_ambiguous():
++            return self._resolve()
++        return ""
++
++    def _still_ambiguous(self) -> bool:
++        """当前缓冲是否还不足以判定去重量。
++
++        strip_prefill_overlap 只看输出的前 len(prefill) 个字符，因此：
++          - 缓冲长度已达 len(prefill) → 信息完备，重叠量已确定，立即放行；
++          - 否则只有当缓冲仍是预填充的某个子串时，才可能延展成更长的重叠，需要继续等。
++        """
++        buf, pre = self.buffer, self.prefill
++        if not buf or not pre:
++            return False
++        if len(buf) >= len(pre):
++            return False
++        return buf in pre
+ 
+     def flush(self) -> str:
+         if self.done:
+@@ -283,8 +402,14 @@
+         return strip_prefill_overlap(self.prefill, out)
+ 
+ 
+-def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
++def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
++    """OpenAI 消息 → Gemini contents。
++
++    model_name 用于判断是否需要对缺失的思考签名启用官方哨兵（仅 Gemini 3.x 强校验）。
++    留空表示“未知模型”，此时不注入哨兵——调用方（express_sdk）总会传真实模型名。
++    """
+     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
++    require_sig = _requires_signature(model_name)
+     raw_gemini_messages = []
+     for idx, message in enumerate(messages):
+         role = message.role
+@@ -307,15 +432,10 @@
+                 # 让标准 OpenAI 客户端的工具往返也能正确工作（修复退化为纯文本的问题）。
+                 tool_output_data = _coerce_tool_response(message.content)
+ 
+-                real_tool_id = tool_call_id_str
+-                thought_sig_bytes = None
+-                if "__thought__" in tool_call_id_str:
+-                    parts_id = tool_call_id_str.split("__thought__")
+-                    real_tool_id = parts_id[0]
+-                    try:
+-                        thought_sig_bytes = base64.b64decode(parts_id[1])
+-                    except Exception:
+-                        thought_sig_bytes = None
++                # 函数**结果**不需要签名（官方只对 functionCall 强校验），因此不注入哨兵；
++                # 但如果能取回签名就照常带上，保持与上游一致。
++                real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
++                    tool_call_id_str, require_signature=False)
+ 
+                 func_resp_kwargs = {"name": message.name, "response": tool_output_data}
+                 if real_tool_id:
+@@ -346,16 +466,10 @@
+                 except json.JSONDecodeError:
+                     parsed_arguments = {}
+ 
+-                # 无论是否带 __thought__ 后缀，都构造规范的 function_call
+-                real_tool_id = tool_call_id_str
+-                thought_sig_bytes = None
+-                if "__thought__" in tool_call_id_str:
+-                    parts_id = tool_call_id_str.split("__thought__")
+-                    real_tool_id = parts_id[0]
+-                    try:
+-                        thought_sig_bytes = base64.b64decode(parts_id[1])
+-                    except Exception:
+-                        thought_sig_bytes = None
++                # 函数**调用**是强校验点：Gemini 3.x 缺签名直接 400，
++                # 因此这里允许降级到官方哨兵，保证请求不会整体失败。
++                real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
++                    tool_call_id_str, require_signature=require_sig)
+ 
+                 fc_kwargs = {"name": function_name, "args": parsed_arguments}
+                 if real_tool_id:
+@@ -465,10 +579,27 @@
+         if not parts: continue
+         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
+ 
++    def _is_text_only(content: types.Content) -> bool:
++        """该 Content 是否只含文本 part（没有 function_call / function_response / inline_data）。"""
++        for p in content.parts or []:
++            if getattr(p, "function_call", None) is not None:
++                return False
++            if getattr(p, "function_response", None) is not None:
++                return False
++            if getattr(p, "inline_data", None) is not None:
++                return False
++            if getattr(p, "text", None) is None:
++                return False
++        return True
++
+     merged_messages = []
+     for msg in raw_gemini_messages:
+         if merged_messages and merged_messages[-1].role == msg.role:
+-            merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
++            # 只有两侧都是纯文本时才插入 "\n\n" 分隔符。
++            # 若两个连续 model 轮次都带 function call，插入文本 part 会打断
++            # 官方要求的 FC 连续排列，可能触发 Malformed_Function_Call 或签名校验失败。
++            if _is_text_only(merged_messages[-1]) and _is_text_only(msg):
++                merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
+             merged_messages[-1].parts.extend(msg.parts)
+         else:
+             merged_messages.append(msg)
+@@ -478,6 +609,102 @@
+ 
+     return merged_messages
+ 
++def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
++    """同步抓取远程图片，返回 (bytes, mime)。失败返回 None。
++
++    调用方须保证不在事件循环线程里直接调用（Express/Cookie 两条通道都用
++    asyncio.to_thread 包住整个消息转换）。
++    """
++    try:
++        client_args = {"timeout": timeout, "follow_redirects": True}
++        if app_config.PROXY_URL:
++            client_args["proxy"] = app_config.PROXY_URL
++        if getattr(app_config, "SSL_CERT_FILE", None):
++            client_args["verify"] = app_config.SSL_CERT_FILE
++        with httpx.Client(**client_args) as client:
++            resp = client.get(url)
++            resp.raise_for_status()
++            return resp.content, resp.headers.get("content-type", "image/jpeg")
++    except Exception as e:
++        print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{e}")
++        return None
++
++
++def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
++    """压缩后转成 batchGraphql 的 inlineData part（camelCase）。"""
++    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
++    return {"inlineData": {"mimeType": opt_mime,
++                           "data": base64.b64encode(opt_bytes).decode("utf-8")}}
++
++
++def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
++    """OpenAI 的 message.content → batchGraphql 的 parts 列表（P1-2）。
++
++    与 Express 通道行为对齐：
++      - 解析正文里的 markdown data-URL 图片（多轮修图时上一张图不会再被当成巨大文本发出）
++      - data: 与 http(s): 两种 image_url 都支持
++      - 统一走 optimize_image_bytes 做输入图压缩（控制台开关对两条通道都生效）
++    """
++    parts: List[Dict[str, Any]] = []
++    if content is None:
++        return parts
++
++    def _add_text_with_inline_images(text: str):
++        if not text:
++            return
++        img_parts, clean_text = _extract_markdown_images_to_parts(text)
++        if clean_text:
++            parts.append({"text": clean_text})
++        for ip in img_parts:
++            blob = getattr(ip, "inline_data", None)
++            if blob is not None and getattr(blob, "data", None):
++                data = blob.data
++                if isinstance(data, bytes):
++                    data = base64.b64encode(data).decode("utf-8")
++                parts.append({"inlineData": {"mimeType": getattr(blob, "mime_type", "image/jpeg"),
++                                             "data": data}})
++
++    if isinstance(content, str):
++        _add_text_with_inline_images(content)
++        return parts
++
++    if isinstance(content, list):
++        for item in content:
++            if hasattr(item, "model_dump"):
++                item = item.model_dump()
++            if isinstance(item, str):
++                _add_text_with_inline_images(item)
++                continue
++            if not isinstance(item, dict):
++                text_attr = getattr(item, "text", None)
++                if isinstance(text_attr, str):
++                    _add_text_with_inline_images(text_attr)
++                continue
++
++            item_type = item.get("type", "")
++            if item_type == "text":
++                _add_text_with_inline_images(item.get("text", ""))
++            elif item_type == "image_url":
++                url = item.get("image_url", {})
++                if isinstance(url, dict):
++                    url = url.get("url", "")
++                if not isinstance(url, str) or not url:
++                    continue
++                if url.startswith("data:"):
++                    m = re.match(r"data:([^;]+);base64,(.+)", url, re.DOTALL)
++                    if m:
++                        mime_type, b64_data = m.groups()
++                        try:
++                            parts.append(_wire_image_part(base64.b64decode(b64_data), mime_type))
++                        except Exception as e:
++                            print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
++                elif url.startswith("http"):
++                    fetched = fetch_remote_image(url)
++                    if fetched:
++                        parts.append(_wire_image_part(*fetched))
++    return parts
++
++
+ def _create_safety_ratings_html(safety_ratings: list) -> str:
+     if not safety_ratings:
+         return ""
+@@ -591,32 +818,10 @@
+                 for part in candidate.content.parts:
+                     if hasattr(part, "function_call") and part.function_call is not None: 
+                         fc = part.function_call
+-                        
+-                        real_id = getattr(fc, "id", None)
+-                        if not real_id: real_id = getattr(fc, "thought_signature", None)
+-                        
+-                        thought_sig = getattr(part, "thought_signature", None)
+-                        thought_sig_b64 = ""
+-                        if thought_sig:
+-                            if isinstance(thought_sig, bytes):
+-                                thought_sig_b64 = base64.b64encode(thought_sig).decode("utf-8")
+-                            elif isinstance(thought_sig, str):
+-                                thought_sig_b64 = thought_sig
+-
+-                        safe_name = fc.name.replace(" ", "_")
+-                        rand_num = int(time.time() * 10000 + random.randint(0, 9999))
+-
+-                        if real_id:
+-                            if thought_sig_b64:
+-                                tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
+-                            else:
+-                                tool_call_id = real_id
+-                        else:
+-                            if thought_sig_b64:
+-                                tool_call_id = f"call_{base_id}_{i}_{safe_name}__thought__{thought_sig_b64}"
+-                            else:
+-                                tool_call_id = f"call_{base_id}_{i}_{safe_name}_{rand_num}"
+-                        
++
++                        # 统一走 build_tool_call_id：短 id + 签名进旁路缓存
++                        tool_call_id = build_tool_call_id(fc, part, _embed_signature_enabled())
++
+                         if "tool_calls" not in message_payload:
+                             message_payload["tool_calls"] = []
+                         
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/model_capabilities.py vertex2openai-main-refactored/app/model_capabilities.py
+--- vertex2openai-main/app/model_capabilities.py	2026-07-24 22:54:34.000000000 +0000
++++ vertex2openai-main-refactored/app/model_capabilities.py	2026-07-26 08:42:12.416741711 +0000
+@@ -26,9 +26,55 @@
+     "candidate_count", "seed", "stop_sequences", "max_output_tokens",
+ }
+ 
+-# 生图分辨率与比例白名单
++# ---- 生图分辨率与比例白名单 ----
++# 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite-image
++#      「1:1, 3:2, 2:3, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9 aspect ratios」（核对于 2026-07-26）
+ _PRO_IMAGE_ARS = {"1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+-_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1", "9:21"}
++# 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-image
++#      「New 1:4, 4:1, 1:8 and 8:1 aspect ratios」（核对于 2026-07-26）
++# 注意：曾经这里还有 "9:21"，但官方文档从未提及该比例。发送不支持的比例会 400，
++#      而不在白名单里只会回退成“由模型决定”（不报错），因此按保守策略移除。
++#      若日后真机验证可用，加回来并在此注明验证日期。
++_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS | {"1:4", "4:1", "1:8", "8:1"}
++
++# ---- 思考档位阶梯（由低到高）----
++# 出处：Agent Platform → Get started with Gemini 3（核对于 2026-07-26）
++#   MINIMAL 仅 Gemini 3 Flash / 3.1 Flash-Lite 有；
++#   MEDIUM 覆盖 Gemini 3 Flash / 3.1 Pro / 3.1 Flash-Lite；
++#   LOW / HIGH 所有 3.x 都有。
++_LEVEL_ORDER = ["minimal", "low", "medium", "high"]
++
++
++def _clamp_level(level: str, levels: set) -> str:
++    """把任意档位夹到该模型的合法档位集合内。
++
++    规则：**优先向下就近取**，向下没有再向上。
++    这条方向性很关键——用户把档位调低是为了减少思考，
++    旧实现对非法档位一律兜底成 "high"，导致 Pro 模型上选 minimal 反而拿到 high，
++    与用户意图完全相反（P0-1）。
++    """
++    if not levels:
++        return "low"
++    if level in levels:
++        return level
++    try:
++        idx = _LEVEL_ORDER.index(level)
++    except ValueError:
++        idx = _LEVEL_ORDER.index("high")   # 未知词按最高处理，再向下夹
++    for i in range(idx, -1, -1):           # 先向下找最接近的合法档
++        if _LEVEL_ORDER[i] in levels:
++            return _LEVEL_ORDER[i]
++    for i in range(idx + 1, len(_LEVEL_ORDER)):   # 向下没有再向上
++        if _LEVEL_ORDER[i] in levels:
++            return _LEVEL_ORDER[i]
++    return sorted(levels)[0]
++
++
++def sort_levels(levels) -> list:
++    """按强度而非字典序排列档位，供控制台下拉框使用。"""
++    known = [lv for lv in _LEVEL_ORDER if lv in levels]
++    extra = sorted(lv for lv in levels if lv not in _LEVEL_ORDER)
++    return known + extra
+ 
+ 
+ def _strip_known_suffixes(name: str) -> str:
+@@ -125,8 +171,16 @@
+ 
+     if major == 2 and minor >= 5:
+         # Gemini 2.5：thinking_budget；保留全部采样参数
++        # ⚠️ 停用预告：gemini-2.5-pro / 2.5-flash / 2.5-flash-lite 官方停用日期 2026-10-16。
++        #    届时本分支将没有活模型，可整体删除（连同 DEFAULT_SETTINGS.thinking_g25_budget）。
++        # 预算区间出处：Thinking 文档预算表（核对于 2026-07-26）
++        #   2.5 Pro        128 – 32768，不可关闭
++        #   2.5 Flash        0 – 24576，0 = 关闭
++        #   2.5 Flash-Lite 512 – 24576，0 = 关闭（非零最低 512，不是 0）
+         if is_pro:
+             budget_min, budget_max, can_zero = 128, 32768, False
++        elif "flash-lite" in name:
++            budget_min, budget_max, can_zero = 512, 24576, True
+         else:
+             budget_min, budget_max, can_zero = 0, 24576, True
+         return {
+@@ -230,15 +284,15 @@
+     if prof["thinking_kind"] == "level":
+         levels = prof["thinking_levels"]
+         if suppress:
+-            # 压制：3.x 无法完全关闭思考 → 压到最低档并隐藏
+-            level = "minimal" if "minimal" in levels else "low"
+-            return {"mode": "level", "level": level, "include_thoughts": False}
++            # 压制：3.x 无法完全关闭思考 → 压到该模型最低合法档并隐藏
++            return {"mode": "level", "level": _clamp_level("minimal", levels),
++                    "include_thoughts": False}
+         level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
+         level = str(level).lower()
+         if level in ("off", "none"):
+-            level = "minimal" if "minimal" in levels else "low"
+-        if level not in levels:
+-            level = "high" if "high" in levels else sorted(levels)[-1]
++            level = "minimal"
++        # 统一就近向下夹取：Pro 上选 minimal 得到 low，而不是被抬成 high
++        level = _clamp_level(level, levels)
+         return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
+ 
+     # budget（2.5）
+@@ -267,7 +321,8 @@
+             budget = -1
+     if budget == 0 and not can_zero:
+         budget = bmin
+-    if budget != -1:
++    # 0 = 关闭思考，是合法值，不能被 max(bmin, ...) 抬成 512/128；仅夹取非 0 非 -1 的值。
++    if budget not in (-1, 0):
+         budget = max(bmin, min(bmax, budget))
+     return {"mode": "budget", "budget": budget, "include_thoughts": include_thoughts}
+ 
+@@ -292,10 +347,17 @@
+     size = str(raw).upper().replace("0.5K", "512").replace("512PX", "512")
+     if size in sizes:
+         return size
+-    # 回退：优先给相近的高档，再退 1K
+-    for cand in ("4K", "2K", "1K", "512"):
+-        if cand in sizes:
+-            return "1K" if "1K" in sizes else cand
++    # 回退：就近向下取档（4K→2K→1K→512），向下没有再向上。
++    # 旧实现写成 `for cand in (...): if cand in sizes: return "1K" if "1K" in sizes else cand`，
++    # 因为 1K 在所有白名单里，任何非法值都返回 1K，注释里的“优先给相近的高档”从未生效。
++    ladder = ["512", "1K", "2K", "4K"]
++    idx = ladder.index(size) if size in ladder else len(ladder) - 1
++    for i in range(idx, -1, -1):
++        if ladder[i] in sizes:
++            return ladder[i]
++    for i in range(idx + 1, len(ladder)):
++        if ladder[i] in sizes:
++            return ladder[i]
+     return "1K"
+ 
+ 
+@@ -365,7 +427,8 @@
+     prof = get_profile(model_name)
+     thinking: Dict[str, Any] = {"kind": prof["thinking_kind"]}
+     if prof["thinking_kind"] == "level":
+-        thinking["levels"] = sorted(prof["thinking_levels"])
++        # 按强度排序（minimal→high），不要用字典序（会排成 high, low, medium, minimal）
++        thinking["levels"] = sort_levels(prof["thinking_levels"])
+         thinking["can_off"] = False
+     elif prof["thinking_kind"] == "budget":
+         thinking["budget_min"] = prof["budget_min"]
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/models.py vertex2openai-main-refactored/app/models.py
+--- vertex2openai-main/app/models.py	2026-07-23 05:55:38.000000000 +0000
++++ vertex2openai-main-refactored/app/models.py	2026-07-26 08:42:12.416403301 +0000
+@@ -30,15 +30,21 @@
+     top_p: float | None = None
+     top_k: int | None = None
+     stream: bool | None = False
+-    stop: list[str] | None = None
++    # P1-3：OpenAI 允许 stop 是字符串或数组，旧定义只收数组，客户端发字符串会 422。
++    stop: str | list[str] | None = None
+     presence_penalty: float | None = None
+     frequency_penalty: float | None = None
+     seed: int | None = None
+-    logprobs: int | None = None
++    # P1-3：OpenAI 的 logprobs 是 bool、top_logprobs 才是整数；
++    # 这里两种都收下，由 create_generation_config 统一规范成 Gemini 的形状。
++    logprobs: bool | int | None = None
++    top_logprobs: int | None = None
+     response_logprobs: bool | None = None
+     response_format: dict[str, Any] | None = None # 兼容强制 JSON 格式化输出
+     n: int | None = None 
+     tools: list[dict[str, Any]] | None = None
+     tool_choice: str | dict[str, Any] | None = None
++    # 流式用量开关（OpenAI: {"include_usage": true}）
++    stream_options: dict[str, Any] | None = None
+ 
+     model_config = ConfigDict(extra='allow')
+\ No newline at end of file
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/runtime_state.py vertex2openai-main-refactored/app/runtime_state.py
+--- vertex2openai-main/app/runtime_state.py	2026-07-24 19:35:18.000000000 +0000
++++ vertex2openai-main-refactored/app/runtime_state.py	2026-07-26 08:42:12.416686614 +0000
+@@ -1,150 +1,178 @@
++import copy
+ import json
+ import os
++import tempfile
+ import threading
+ 
+ import config as app_config
+ 
+-STATE_FILE = "web_state.json"
++# S-3：允许把状态落到挂载卷，避免 docker compose 重建后设置与 Cookie 全部丢失。
++STATE_DIR = os.environ.get("STATE_DIR", ".")
++STATE_FILE = os.path.join(STATE_DIR, "web_state.json")
++
+ 
+ class AppState:
+-    """
+-    多进程/多线程安全的运行态管理器
+-    支持 I/O 异常降级，确保在任何 Docker 权限受限环境下都不会发生崩溃
++    """运行态管理器（内存优先 + 写时落盘）。
+ 
+-    仅保留 Cookie 直连模式所需的运行态：
+-    - use_web_proxy：是否走 Cookie 直连反代通道
+-    - google_cookie / google_project_id：Cookie 直连凭证
++    P1-4 的改动要点：
++      - 旧实现每个 getter 都调 `_load_state()` 同步读盘。全项目有 20+ 处
++        get_settings/get_setting/get_effective_settings 调用，且全在 async 请求路径上
++        （每压缩一张图片还要再读一次），高并发下会把事件循环串行化。
++        现在只在启动和显式 reload() 时读盘。
++      - 落盘改为「临时文件 + os.replace」，避免进程崩溃时把 web_state.json 写坏。
++      - getter 返回深拷贝，防止调用方无意间改到 model_overrides 这层嵌套字典。
++      - 文件权限 0600：里面存着完整的 Google 会话 Cookie。
+     """
+-    def __init__(self):
+-        self._lock = threading.Lock()
+-        self._memory_state = {"use_web_proxy": False}
+-        self._load_state()
+ 
+-    def _load_state(self) -> dict:
+-        if os.path.exists(STATE_FILE):
+-            try:
+-                with open(STATE_FILE, 'r', encoding='utf-8') as f:
+-                    data = json.load(f)
+-                    # 增量安全合并
+-                    self._memory_state.update(data)
+-            except Exception as e:
+-                print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
+-        return self._memory_state
++    def __init__(self):
++        self._lock = threading.RLock()
++        self._state = {"use_web_proxy": False}
++        self._load_from_disk()
++
++    # ---------- 持久化 ----------
++
++    def _load_from_disk(self) -> None:
++        if not os.path.exists(STATE_FILE):
++            return
++        try:
++            with open(STATE_FILE, "r", encoding="utf-8") as f:
++                data = json.load(f)
++            if isinstance(data, dict):
++                self._state.update(data)
++        except Exception as e:
++            print(f"⚠️ [状态管理器] 无法读取持久化配置文件，已自动降级为内存模式: {e}")
+ 
+-    def _save_state(self, state: dict):
++    def _save(self) -> None:
++        """原子写：先写同目录临时文件再 os.replace（同一文件系统内是原子操作）。"""
+         try:
+-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+-                json.dump(state, f, ensure_ascii=False, indent=2)
++            target_dir = os.path.dirname(STATE_FILE) or "."
++            os.makedirs(target_dir, exist_ok=True)
++            fd, tmp_path = tempfile.mkstemp(prefix=".web_state-", suffix=".tmp", dir=target_dir)
++            try:
++                with os.fdopen(fd, "w", encoding="utf-8") as f:
++                    json.dump(self._state, f, ensure_ascii=False, indent=2)
++                    f.flush()
++                    os.fsync(f.fileno())
++                os.replace(tmp_path, STATE_FILE)
++            except Exception:
++                try:
++                    os.unlink(tmp_path)
++                except OSError:
++                    pass
++                raise
++            try:
++                os.chmod(STATE_FILE, 0o600)   # 里面有完整 Google Cookie
++            except OSError:
++                pass
+         except Exception as e:
+             print(f"⚠️ [状态管理器] 无法保存状态到磁盘: {e}")
+ 
++    def reload(self) -> None:
++        """显式从磁盘重载（外部改了文件时用）。"""
++        with self._lock:
++            self._load_from_disk()
++
++    # ---------- 通道开关与凭证 ----------
++
+     def enable_web_proxy(self, enabled: bool):
+         with self._lock:
+-            state = self._load_state()  # 确保返回非空字典引用
+-            state["use_web_proxy"] = enabled
+-            self._save_state(state)
++            self._state["use_web_proxy"] = bool(enabled)
++            self._save()
+             print(f"🔄 [状态管理器] 网页反代状态已更新：{enabled}")
+ 
+     def is_web_proxy_enabled(self) -> bool:
+         with self._lock:
+-            state = self._load_state()
+-            return state.get("use_web_proxy", False)
++            return bool(self._state.get("use_web_proxy", False))
+ 
+     def set_google_cookie(self, cookie_str: str):
+         with self._lock:
+-            state = self._load_state()
+-            state["google_cookie"] = cookie_str
+-            self._save_state(state)
++            self._state["google_cookie"] = cookie_str
++            self._save()
+             print("🔄 [状态管理器] 谷歌独立 Cookie 已保存到运行状态")
+ 
+     def get_google_cookie(self) -> str:
+         with self._lock:
+-            state = self._load_state()
+-            return state.get("google_cookie", "")
++            return self._state.get("google_cookie", "")
+ 
+     def set_project_id(self, project_id: str):
+         with self._lock:
+-            state = self._load_state()
+-            state["google_project_id"] = project_id
+-            self._save_state(state)
++            self._state["google_project_id"] = project_id
++            self._save()
+             print(f"🔄 [状态管理器] 项目 ID 已保存: {project_id}")
+ 
+     def get_project_id(self) -> str:
+         with self._lock:
+-            state = self._load_state()
+-            return state.get("google_project_id", "")
++            return self._state.get("google_project_id", "")
+ 
+-    # ========== 控制台可调设置 ==========
++    # ---------- 控制台可调设置 ----------
+ 
+     def get_settings(self) -> dict:
+-        """返回完整设置（内置默认 + 持久化覆盖），保证所有键都存在。"""
++        """完整设置（内置默认 + 持久化覆盖），保证所有键都存在；返回深拷贝。"""
+         with self._lock:
+-            state = self._load_state()
+-            merged = dict(app_config.DEFAULT_SETTINGS)
+-            stored = state.get("settings")
++            merged = copy.deepcopy(app_config.DEFAULT_SETTINGS)
++            stored = self._state.get("settings")
+             if isinstance(stored, dict):
+-                merged.update({k: v for k, v in stored.items() if k in merged})
++                for k, v in stored.items():
++                    if k in merged:
++                        merged[k] = copy.deepcopy(v)
+             return merged
+ 
+     def get_setting(self, key: str, default=None):
+-        return self.get_settings().get(key, default)
++        with self._lock:
++            stored = self._state.get("settings")
++            if isinstance(stored, dict) and key in stored:
++                return copy.deepcopy(stored[key])
++            if key in app_config.DEFAULT_SETTINGS:
++                return copy.deepcopy(app_config.DEFAULT_SETTINGS[key])
++            return default
+ 
+     def update_settings(self, patch: dict) -> dict:
+         """合并更新设置，只接受已知键，返回更新后的完整设置。"""
+         if not isinstance(patch, dict):
+             return self.get_settings()
+         with self._lock:
+-            state = self._load_state()
+-            current = state.get("settings")
++            current = self._state.get("settings")
+             current = dict(current) if isinstance(current, dict) else {}
++            accepted = 0
+             for k, v in patch.items():
+                 if k in app_config.DEFAULT_SETTINGS and k != "model_overrides":
+                     current[k] = v
+-            state["settings"] = current
+-            self._save_state(state)
+-            merged = dict(app_config.DEFAULT_SETTINGS)
+-            merged.update(current)
+-            print(f"🔧 [状态管理器] 已更新 {len(patch)} 项运行时设置。")
+-            return merged
+-
+-    # ========== 按模型参数覆盖（per-model overrides） ==========
++                    accepted += 1
++            self._state["settings"] = current
++            self._save()
++            print(f"🔧 [状态管理器] 已更新 {accepted} 项运行时设置。")
++        return self.get_settings()
+ 
+-    def _get_overrides_map(self, state: dict) -> dict:
+-        stored = state.get("settings")
+-        if isinstance(stored, dict) and isinstance(stored.get("model_overrides"), dict):
+-            return dict(stored["model_overrides"])
+-        return {}
++    # ---------- 按模型参数覆盖 ----------
+ 
+     def get_model_overrides(self) -> dict:
+-        """返回全部按模型覆盖映射：{ 模型ID: {键: 值} }。"""
+         with self._lock:
+-            return self._get_overrides_map(self._load_state())
++            stored = self._state.get("settings")
++            if isinstance(stored, dict) and isinstance(stored.get("model_overrides"), dict):
++                return copy.deepcopy(stored["model_overrides"])
++            return {}
+ 
+     def set_model_override(self, model_name: str, patch: dict) -> dict:
+-        """为某模型保存专属参数（仅接受 PER_MODEL_KEYS 中的键）。返回该模型的最新专属值。"""
+         model_name = (model_name or "").strip()
+         if not model_name or not isinstance(patch, dict):
+             return {}
+         clean = {k: v for k, v in patch.items() if k in app_config.PER_MODEL_KEYS}
+         with self._lock:
+-            state = self._load_state()
+-            settings = state.get("settings")
++            settings = self._state.get("settings")
+             settings = dict(settings) if isinstance(settings, dict) else {}
+             overrides = settings.get("model_overrides")
+             overrides = dict(overrides) if isinstance(overrides, dict) else {}
+             overrides[model_name] = clean
+             settings["model_overrides"] = overrides
+-            state["settings"] = settings
+-            self._save_state(state)
++            self._state["settings"] = settings
++            self._save()
+             print(f"🔧 [状态管理器] 已保存模型 {model_name} 的专属参数（{len(clean)} 项）。")
+             return clean
+ 
+     def clear_model_override(self, model_name: str) -> bool:
+-        """清除某模型的专属参数，回退到全局默认。"""
+         model_name = (model_name or "").strip()
+         with self._lock:
+-            state = self._load_state()
+-            settings = state.get("settings")
++            settings = self._state.get("settings")
+             if not isinstance(settings, dict):
+                 return False
+             overrides = settings.get("model_overrides")
+@@ -152,17 +180,13 @@
+                 return False
+             overrides.pop(model_name, None)
+             settings["model_overrides"] = overrides
+-            state["settings"] = settings
+-            self._save_state(state)
++            self._state["settings"] = settings
++            self._save()
+             print(f"🔧 [状态管理器] 已清除模型 {model_name} 的专属参数。")
+             return True
+ 
+     def get_effective_settings(self, model_name: str) -> dict:
+-        """返回“该模型生效的设置”：全局默认叠加该模型专属覆盖（覆盖仅限 PER_MODEL_KEYS）。
+-
+-        用于参数构建：调用方无需感知覆盖逻辑，拿到的字典里
+-        thinking_g3_level/image_size/default_temperature 等已是该模型的最终值。
+-        """
++        """该模型生效的设置：全局默认叠加该模型专属覆盖（仅 PER_MODEL_KEYS）。"""
+         base = self.get_settings()
+         overrides = base.get("model_overrides") or {}
+         ov = overrides.get((model_name or "").strip())
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/signature_store.py vertex2openai-main-refactored/app/signature_store.py
+--- vertex2openai-main/app/signature_store.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/app/signature_store.py	2026-07-26 08:42:12.417990620 +0000
+@@ -0,0 +1,91 @@
++"""思考签名（thought signature）旁路缓存。
++
++背景（官方文档，核对于 2026-07-26）：
++- 签名可以出现在任意 content part 上（text / functionCall）。
++- **函数调用是强校验**：Gemini 3 拿不到签名直接 400。
++- 纯文本不强校验，但省略会降低推理质量。
++- 实在拿不到签名时，可把 thought_signature 设为 `skip_thought_signature_validator`
++  跳过校验，官方明确这是最后手段、会损害模型表现。
++
++旧实现把 base64 签名直接拼进 OpenAI 的 `tool_call_id`
++（`{id}__thought__{base64}`）。签名通常几百到上千字符，很多前端对 tool_call_id
++有长度限制或会截断，一旦截断回传时就解不出签名 → 400，且没有任何降级路径。
++
++现在的策略是三层：
++  1. 出站时生成短 id（≤40 字符），签名存进这里的 TTL LRU；回传时按 id 取回。
++  2. 缓存未命中时，仍尝试解析旧的 `__thought__` 内嵌格式（向后兼容历史会话）。
++  3. 都拿不到时，用官方哨兵值跳过校验，保证请求不会整体失败。
++
++局限：仅进程内有效。多 worker 或重启后落到第 2/3 层。
++这是有意的取舍——把签名持久化到磁盘意味着把模型内部状态落盘，收益不抵复杂度。
++"""
++
++import threading
++import time
++from collections import OrderedDict
++from typing import Optional
++
++# 官方允许的跳过校验哨兵值（会降低模型表现，仅作最后手段）
++SKIP_VALIDATOR_SENTINEL = b"skip_thought_signature_validator"
++
++DEFAULT_TTL_SECONDS = 2 * 60 * 60   # 2 小时：远长于一轮工具往返，远短于无限增长
++DEFAULT_MAX_ENTRIES = 5000
++
++
++class SignatureStore:
++    """tool_call_id -> thought_signature 的短期缓存（线程安全）。"""
++
++    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS,
++                 max_entries: int = DEFAULT_MAX_ENTRIES):
++        self._ttl = ttl_seconds
++        self._max = max_entries
++        self._lock = threading.Lock()
++        self._data: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
++
++    def put(self, call_id: str, signature: Optional[bytes]) -> None:
++        if not call_id or not signature:
++            return
++        now = time.time()
++        with self._lock:
++            self._data[call_id] = (now, signature)
++            self._data.move_to_end(call_id)
++            self._evict(now)
++
++    def get(self, call_id: str) -> Optional[bytes]:
++        if not call_id:
++            return None
++        now = time.time()
++        with self._lock:
++            item = self._data.get(call_id)
++            if item is None:
++                return None
++            ts, sig = item
++            if now - ts > self._ttl:
++                self._data.pop(call_id, None)
++                return None
++            self._data.move_to_end(call_id)
++            return sig
++
++    def _evict(self, now: float) -> None:
++        """调用方须持锁。先按 TTL 清理，再按容量淘汰最久未用的。"""
++        while self._data:
++            oldest_key = next(iter(self._data))
++            ts, _ = self._data[oldest_key]
++            if now - ts > self._ttl:
++                self._data.pop(oldest_key, None)
++                continue
++            break
++        while len(self._data) > self._max:
++            self._data.popitem(last=False)
++
++    def stats(self) -> dict:
++        with self._lock:
++            return {"entries": len(self._data), "ttl_seconds": self._ttl, "max_entries": self._max}
++
++    def clear(self) -> None:
++        with self._lock:
++            self._data.clear()
++
++
++# 单例
++signature_store = SignatureStore()
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/upstreams/cookie_proxy.py vertex2openai-main-refactored/app/upstreams/cookie_proxy.py
+--- vertex2openai-main/app/upstreams/cookie_proxy.py	2026-07-24 23:26:54.000000000 +0000
++++ vertex2openai-main-refactored/app/upstreams/cookie_proxy.py	2026-07-26 08:42:12.417757709 +0000
+@@ -24,8 +24,14 @@
+ from runtime_state import app_state
+ import config as app_config
+ import model_capabilities as mc
+-from message_processing import apply_prefill_compat, strip_prefill_overlap, PrefillDeduper
++from message_processing import (
++    apply_prefill_compat,
++    strip_prefill_overlap,
++    PrefillDeduper,
++    openai_content_to_wire_parts,
++)
+ from logger import stats
++from api_helpers import get_retry_settings
+ 
+ from cookie_auth import (
+     build_headers,
+@@ -34,10 +40,7 @@
+     STREAM_GENERATE_OPERATION_NAME,
+ )
+ 
+-# ========== 重试配置 ==========
+-MAX_RETRIES = 10
+-RETRY_BACKOFF = [5] * 10  # 每次重试等待秒数
+-
++# ========== 重试关键词 ==========
+ # 可重试的错误关键词（429 限流类）
+ RETRYABLE_KEYWORDS = [
+     "resource exhausted",
+@@ -141,7 +144,29 @@
+ 
+ # ========== OpenAI → batchGraphql 消息格式转换 ==========
+ 
++def has_tool_traffic(messages: list, tools: Any = None) -> bool:
++    """请求里是否含函数调用相关内容（P1-1）。
++
++    Cookie 通道不下发 functionDeclarations，也无法表达 functionCall/functionResponse。
++    旧实现把 role="tool" 一律折成 model 轮次、assistant.tool_calls 直接丢弃，
++    发出去的是一段语义错乱的历史——静默出错比明确报错糟糕得多。
++    """
++    if tools:
++        return True
++    for m in messages or []:
++        if getattr(m, "role", None) == "tool":
++            return True
++        if getattr(m, "tool_calls", None):
++            return True
++    return False
++
++
+ def _convert_messages_to_contents(messages: list) -> tuple:
++    """OpenAI messages → batchGraphql contents。
++
++    注意：内部会做远程图片抓取与 PIL 压缩（同步阻塞），
++    调用方须用 asyncio.to_thread 包住（见 chat_completions）。
++    """
+     contents = []
+     system_parts = []
+ 
+@@ -152,37 +177,17 @@
+         if role == "system":
+             if isinstance(content, str):
+                 system_parts.append(content)
++            else:
++                # 分段 system 也要收下，否则酒馆预设的多段 system 会被整段丢弃
++                system_parts.extend(
++                    p.get("text", "") for p in (content or [])
++                    if isinstance(p, dict) and p.get("type") == "text"
++                )
+             continue
+ 
++        # 已在入口用 has_tool_traffic() 拒绝了工具流量，这里只可能是 user / assistant
+         gemini_role = "user" if role == "user" else "model"
+-
+-        parts = []
+-        if isinstance(content, str):
+-            parts.append({"text": content})
+-        elif isinstance(content, list):
+-            for item in content:
+-                if hasattr(item, 'model_dump'):
+-                    item = item.model_dump()
+-
+-                if isinstance(item, dict):
+-                    item_type = item.get("type", "")
+-                    if item_type == "text":
+-                        parts.append({"text": item.get("text", "")})
+-                    elif item_type == "image_url":
+-                        url = item.get("image_url", {})
+-                        if isinstance(url, dict):
+-                            url = url.get("url", "")
+-                        if url.startswith("data:"):
+-                            try:
+-                                header, encoded = url.split(",", 1)
+-                                mime_type = header.split(":")[1].split(";")[0]
+-                                parts.append({
+-                                    "inlineData": {"mimeType": mime_type, "data": encoded}
+-                                })
+-                            except Exception:
+-                                parts.append({"text": "[图片解析失败]"})
+-                elif isinstance(item, str):
+-                    parts.append({"text": item})
++        parts = openai_content_to_wire_parts(content)
+ 
+         if parts:
+             contents.append({"role": gemini_role, "parts": parts})
+@@ -197,10 +202,18 @@
+         else:
+             merged.append(c)
+ 
+-    system_text = "\n".join(system_parts) if system_parts else None
++    system_text = "\n".join(t for t in system_parts if t) if system_parts else None
+     return merged, system_text
+ 
+ 
++async def build_batch_graphql_body_async(project_id: str, model_name: str,
++                                         request: OpenAIRequest,
++                                         prefill_active: bool = False) -> dict:
++    """在线程里构建请求体：内部有远程图片下载与 PIL 压缩，不能阻塞事件循环（P1-2）。"""
++    return await asyncio.to_thread(_build_batch_graphql_body, project_id, model_name,
++                                   request, prefill_active)
++
++
+ def _build_batch_graphql_body(
+     project_id: str,
+     model_name: str,
+@@ -630,7 +643,8 @@
+         if await fastapi_request.is_disconnected():
+             return {"kind": "error", "message": "客户端已断开连接。"}
+         try:
+-            body = _build_batch_graphql_body(project_id, base_model_name, request_obj)
++            body = await build_batch_graphql_body_async(
++                project_id, base_model_name, request_obj)
+             req_headers = build_headers(_get_cookie_string()) or headers
+             async with httpx.AsyncClient(**client_kwargs) as client:
+                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
+@@ -734,6 +748,16 @@
+                 "请确保 Cookie 来自已登录的 console.cloud.google.com 页面。"
+             ), "type": "auth_error"}})
+ 
++        # ===== 2.5 拒绝该通道无法表达的工具流量（P1-1）=====
++        if has_tool_traffic(request_obj.messages, request_obj.tools):
++            print("⛔ [Studio] 请求含函数调用内容，Cookie 直连通道不支持，已明确拒绝。")
++            return JSONResponse(status_code=400, content={"error": {
++                "message": ("Cookie 直连通道暂不支持函数调用（不下发 functionDeclarations，"
++                            "也无法表达 functionCall / functionResponse）。\n"
++                            "请在控制台切换到「标准模式（Express API Key）」后重试。"),
++                "type": "unsupported_feature",
++            }})
++
+         # ===== 3. 解析模型名 =====
+         model_display = request_obj.model
+         base_model_name = model_display
+@@ -768,21 +792,15 @@
+         if app_config.PROXY_URL:
+             client_kwargs["proxy"] = app_config.PROXY_URL
+ 
+-        # 重试配置（控制台可调）
+-        try:
+-            retry_max = int(app_state.get_setting("retry_max", MAX_RETRIES))
+-        except (TypeError, ValueError):
+-            retry_max = MAX_RETRIES
+-        try:
+-            backoff_sec = float(app_state.get_setting("retry_backoff_seconds", RETRY_BACKOFF[0]))
+-        except (TypeError, ValueError):
+-            backoff_sec = float(RETRY_BACKOFF[0])
++        # 重试配置（控制台可调）；语义与 Express 通道统一：总尝试次数 = retry_max + 1
++        retry_max, backoff_sec = get_retry_settings()
+ 
+         is_stream = request_obj.stream
+         response_id = f"chatcmpl-studio-{int(time.time())}"
+         start_time = time.time()
+         want_usage = _wants_usage(request_obj)
+-        cookie_debug = bool(app_state.get_setting("cookie_debug", False))
++        cookie_debug = bool(app_state.get_setting("debug_outbound", False)
++                            or app_state.get_setting("cookie_debug", False))
+ 
+         # batchGraphql(Studio) 会忽略 includeThoughts=false（真机验证），因此当解析出的思考配置
+         # 要求不回传思考时，由本通道在响应侧主动剥离思考块。生图无思考，strip 恒 False。
+@@ -848,8 +866,8 @@
+                         print("ℹ️ [Studio] 客户端已断开连接，停止流式重试。")
+                         return
+ 
+-                    body = _build_batch_graphql_body(project_id, base_model_name, request_obj,
+-                                                     prefill_active=prefill_active)
++                    body = await build_batch_graphql_body_async(
++                        project_id, base_model_name, request_obj, prefill_active=prefill_active)
+                     req_headers = build_headers(_get_cookie_string()) or headers
+                     if cookie_debug:
+                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
+@@ -1011,8 +1029,8 @@
+                         "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
+                     })
+                 try:
+-                    body = _build_batch_graphql_body(project_id, base_model_name, request_obj,
+-                                                     prefill_active=prefill_active)
++                    body = await build_batch_graphql_body_async(
++                        project_id, base_model_name, request_obj, prefill_active=prefill_active)
+                     req_headers = build_headers(_get_cookie_string()) or headers
+                     if cookie_debug:
+                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/app/upstreams/express_sdk.py vertex2openai-main-refactored/app/upstreams/express_sdk.py
+--- vertex2openai-main/app/upstreams/express_sdk.py	2026-07-24 19:35:28.000000000 +0000
++++ vertex2openai-main-refactored/app/upstreams/express_sdk.py	2026-07-26 08:42:12.417708909 +0000
+@@ -1,4 +1,6 @@
+ import re
++from functools import partial
++
+ import google.genai
+ from fastapi import Request
+ from fastapi.responses import JSONResponse
+@@ -69,6 +71,9 @@
+     else:  # budget（Gemini 2.5）
+         thinking_config["thinking_budget"] = t["budget"]
+ 
++    if app_state.get_setting("debug_outbound", False):
++        print(f"🔎 [出站调试] Express 通道 模型={base_model_name} thinkingConfig={thinking_config}")
++
+     return thinking_config
+ 
+ 
+@@ -152,7 +157,18 @@
+                 gen_config_dict["tools"] = [search_tool]
+             print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
+ 
++        # 传入真实模型名：create_gemini_prompt 需要它来判断是否对缺失的思考签名
++        # 启用官方哨兵（仅 Gemini 3.x 强校验，见 message_processing.resolve_tool_call_signature）
++        prompt_func = partial(create_gemini_prompt, model_name=base_model_name)
++
++        if app_state.get_setting("debug_outbound", False):
++            _dbg = {k: v for k, v in gen_config_dict.items()
++                    if k in ("temperature", "top_p", "top_k", "candidate_count",
++                             "max_output_tokens", "stop_sequences", "thinking_config",
++                             "response_modalities", "image_config")}
++            print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
++
+         return await execute_gemini_call(
+-            client_to_use, base_model_name, create_gemini_prompt, gen_config_dict, request_obj,
++            client_to_use, base_model_name, prompt_func, gen_config_dict, request_obj,
+             fastapi_request=fastapi_request, prefill_text=prefill_text,
+         )
+\ No newline at end of file
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/docker-compose.yml vertex2openai-main-refactored/docker-compose.yml
+--- vertex2openai-main/docker-compose.yml	2026-07-23 05:13:36.000000000 +0000
++++ vertex2openai-main-refactored/docker-compose.yml	2026-07-26 08:42:12.411588303 +0000
+@@ -6,9 +6,16 @@
+     container_name: vertex2openai
+     ports:
+       - "8050:7860"
++    volumes:
++      # S-3：不挂卷的话，docker compose up --force-recreate 或升级镜像后
++      # web_state.json 会丢失，Cookie 与全部控制台设置都要重配。
++      - ./data:/app/data
+     environment:
++      # 状态文件目录（web_state.json 落在这里）
++      - STATE_DIR=/app/data
+       # Protect this adapter's OpenAI-compatible API.
+-      - API_KEY=123456
++      # ⚠️ 必须改成强口令：它既是本代理的 API Key，也是控制台登录密码
++      - API_KEY=change-me-please
+       # Required: one or more Gemini Express Mode API keys, separated by commas.
+       - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
+       # Optional: set true to rotate Express keys in order instead of random selection.
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/scripts/check_models.py vertex2openai-main-refactored/scripts/check_models.py
+--- vertex2openai-main/scripts/check_models.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/scripts/check_models.py	2026-07-26 08:42:12.419206216 +0000
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""对着官方文档核对能力矩阵的小工具。
++
++每次 Google 发新模型 / 改文档时跑一遍，比翻代码快：
++
++    python scripts/check_models.py                 # 用 vertexModels.json
++    python scripts/check_models.py gemini-4-pro    # 试算任意模型名
++
++输出的每一列都对应 model_capabilities.py 里的一条判断，
++逐列和官方文档比对即可确认是否需要更新白名单。
++"""
++
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
++
++import model_capabilities as mc  # noqa: E402
++
++
++def load_models() -> list:
++    if len(sys.argv) > 1:
++        return sys.argv[1:]
++    here = os.path.dirname(os.path.abspath(__file__))
++    for path in (os.path.join(here, "..", "vertexModels.json"),
++                 os.path.join(here, "..", "app", "vertexModels.json")):
++        if os.path.exists(path):
++            with open(path, encoding="utf-8") as f:
++                return json.load(f).get("models", [])
++    return []
++
++
++def main() -> int:
++    models = load_models()
++    if not models:
++        print("没有找到模型清单。用法：python scripts/check_models.py [模型名 ...]")
++        return 1
++
++    header = (f"{'模型':<26} {'家族':<6} {'思考':<7} {'档位/预算':<28} "
++              f"{'temp':<5} {'top_p':<6} {'top_k':<6} {'n':<4} 生图")
++    print(header)
++    print("-" * len(header))
++    for m in models:
++        cap = mc.capabilities_summary(m)
++        prof = mc.get_profile(m)
++        th = cap["thinking"]
++        if th["kind"] == "level":
++            detail = f"{'/'.join(th['levels'])} (默认 {prof.get('default_level', '-')})"
++        elif th["kind"] == "budget":
++            detail = f"{th['budget_min']}-{th['budget_max']} 可关={th['can_off']}"
++        else:
++            detail = "-"
++        allowed = prof["allowed_sampling"]
++        yn = lambda k: "✓" if k in allowed else "✗"      # noqa: E731
++        img = (f"{'/'.join(cap['image_sizes'])} · {len(cap['image_aspect_ratios'])} 种比例"
++               if cap["is_image"] else "-")
++        print(f"{m:<26} {cap['family']:<6} {str(th['kind']):<7} {detail:<28} "
++              f"{yn('temperature'):<5} {yn('top_p'):<6} {yn('top_k'):<6} "
++              f"{yn('candidate_count'):<4} {img}")
++
++    print("\n核对清单：")
++    print("  1. temp/top_p/top_k 打 ✓ 的模型，是否确实还没被官方标为弃用？")
++    print("     （官方：自 3.6 Flash 与 3.5 Flash-Lite 起及所有更新模型均已弃用）")
++    print("  2. 思考档位集合与默认值是否与官方模型页一致？")
++    print("  3. 生图分辨率/比例数量是否与官方模型页一致？")
++    print("  4. 是否有官方已停用的模型仍留在清单里？")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/conftest.py vertex2openai-main-refactored/tests/conftest.py
+--- vertex2openai-main/tests/conftest.py	2026-07-24 18:54:30.000000000 +0000
++++ vertex2openai-main-refactored/tests/conftest.py	2026-07-26 08:42:12.420689434 +0000
+@@ -17,13 +17,30 @@
+ 
+ @pytest.fixture(autouse=True)
+ def _isolate_state(tmp_path, monkeypatch):
+-    """状态隔离：CWD 指到临时目录 + 清空内存态。"""
++    """状态隔离：状态文件指到临时目录 + 清空内存态。
++
++    P1-4 之后 AppState 改成内存优先（只在启动/reload 时读盘），
++    因此这里直接重置 `_state`，并把 STATE_FILE 指到临时目录，
++    避免测试互相污染、也避免误写仓库根目录。
++    """
++    import runtime_state
++
+     monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr(runtime_state, "STATE_FILE", str(tmp_path / "web_state.json"))
+     with app_state._lock:
+-        app_state._memory_state = {"use_web_proxy": False}
++        app_state._state = {"use_web_proxy": False}
+     yield
+     with app_state._lock:
+-        app_state._memory_state = {"use_web_proxy": False}
++        app_state._state = {"use_web_proxy": False}
++
++
++@pytest.fixture(autouse=True)
++def _clear_signature_store():
++    """清空思考签名旁路缓存，避免用例之间串扰（P0-4）。"""
++    from signature_store import signature_store
++    signature_store.clear()
++    yield
++    signature_store.clear()
+ 
+ 
+ class FakeReq:
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_cookie_hardening.py vertex2openai-main-refactored/tests/test_cookie_hardening.py
+--- vertex2openai-main/tests/test_cookie_hardening.py	2026-07-24 22:58:40.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_cookie_hardening.py	2026-07-26 08:42:12.420862351 +0000
+@@ -64,7 +64,9 @@
+         OpenAIMessage(role="user", content="a"),
+         OpenAIMessage(role="user", content="b"),
+         OpenAIMessage(role="assistant", content="c"),
+-        OpenAIMessage(role="tool", content="d"),  # tool → model，与前面 assistant 合并
++        # 低层函数仍把未知角色折成 model；含工具的请求已在 chat_completions 入口被
++        # has_tool_traffic() 拒绝（见 test_cookie_tool_rejection.py），这里只测合并逻辑
++        OpenAIMessage(role="tool", content="d"),
+         OpenAIMessage(role="user", content="e"),
+     ]
+     contents, _ = cp._convert_messages_to_contents(msgs)
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_cookie_tool_rejection.py vertex2openai-main-refactored/tests/test_cookie_tool_rejection.py
+--- vertex2openai-main/tests/test_cookie_tool_rejection.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_cookie_tool_rejection.py	2026-07-26 08:42:12.421277437 +0000
+@@ -0,0 +1,49 @@
++# -*- coding: utf-8 -*-
++"""P1-1：Cookie 通道对工具流量应显式报错，而不是静默发出错乱历史。"""
++import pytest
++
++from models import OpenAIMessage
++from upstreams.cookie_proxy import _convert_messages_to_contents, has_tool_traffic
++
++
++def test_detects_tool_role():
++    msgs = [OpenAIMessage(role="user", content="hi"),
++            OpenAIMessage(role="tool", content="{}", name="f", tool_call_id="c1")]
++    assert has_tool_traffic(msgs) is True
++
++
++def test_detects_assistant_tool_calls():
++    msgs = [OpenAIMessage(role="assistant", content=None,
++                          tool_calls=[{"id": "c1", "type": "function",
++                                       "function": {"name": "f", "arguments": "{}"}}])]
++    assert has_tool_traffic(msgs) is True
++
++
++def test_detects_tools_declaration():
++    assert has_tool_traffic([], tools=[{"type": "function",
++                                        "function": {"name": "f"}}]) is True
++
++
++def test_plain_chat_is_not_tool_traffic():
++    msgs = [OpenAIMessage(role="system", content="sys"),
++            OpenAIMessage(role="user", content="hi"),
++            OpenAIMessage(role="assistant", content="hello")]
++    assert has_tool_traffic(msgs) is False
++
++
++def test_multipart_system_is_not_dropped():
++    """分段 system（酒馆预设常见）此前会被整段丢弃。"""
++    msgs = [OpenAIMessage(role="system",
++                          content=[{"type": "text", "text": "A"},
++                                   {"type": "text", "text": "B"}]),
++            OpenAIMessage(role="user", content="hi")]
++    _, system_text = _convert_messages_to_contents(msgs)
++    assert "A" in system_text and "B" in system_text
++
++
++def test_same_role_turns_merged():
++    msgs = [OpenAIMessage(role="user", content="a"),
++            OpenAIMessage(role="user", content="b")]
++    contents, _ = _convert_messages_to_contents(msgs)
++    assert len(contents) == 1
++    assert contents[0]["role"] == "user"
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_model_capabilities.py vertex2openai-main-refactored/tests/test_model_capabilities.py
+--- vertex2openai-main/tests/test_model_capabilities.py	2026-07-24 18:55:06.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_model_capabilities.py	2026-07-26 08:42:12.420699315 +0000
+@@ -68,7 +68,10 @@
+     fl = mc.get_profile("gemini-3.1-flash-image")
+     assert pro["is_image"] and fl["is_image"]
+     assert len(pro["image_aspect_ratios"]) == 10
+-    assert len(fl["image_aspect_ratios"]) == 15
++    # 14 = pro 的 10 种 + flash 新增的 1:4 / 4:1 / 1:8 / 8:1
++    # （曾经是 15，多出的 "9:21" 无官方出处，已移除，见 model_capabilities 注释）
++    assert len(fl["image_aspect_ratios"]) == 14
++    assert "9:21" not in fl["image_aspect_ratios"]
+     assert "1:8" in fl["image_aspect_ratios"] and "1:8" not in pro["image_aspect_ratios"]
+     assert pro["image_sizes"] == {"1K", "2K", "4K"}
+     assert fl["image_sizes"] == {"512", "1K", "2K", "4K"}
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_openai_field_compat.py vertex2openai-main-refactored/tests/test_openai_field_compat.py
+--- vertex2openai-main/tests/test_openai_field_compat.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_openai_field_compat.py	2026-07-26 08:42:12.421245511 +0000
+@@ -0,0 +1,54 @@
++# -*- coding: utf-8 -*-
++"""P1-3：OpenAI 字段兼容性。"""
++import pytest
++
++from models import OpenAIMessage, OpenAIRequest
++
++
++def _req(**kw):
++    # 显式构造 OpenAIMessage，不依赖 pydantic 的嵌套模型强制转换
++    base = {"model": "gemini-2.5-flash",
++            "messages": [OpenAIMessage(role="user", content="hi")]}
++    base.update(kw)
++    return OpenAIRequest(**base)
++
++
++def test_stop_accepts_string():
++    """OpenAI 允许 stop 为字符串，旧定义只收数组会 422。"""
++    assert _req(stop="\n\n").stop == "\n\n"
++
++
++def test_stop_accepts_list():
++    assert _req(stop=["a", "b"]).stop == ["a", "b"]
++
++
++def test_stop_normalized_to_list_in_config():
++    from api_helpers import create_generation_config
++    cfg = create_generation_config(_req(stop="STOP!"))
++    assert cfg["stop_sequences"] == ["STOP!"]
++    cfg = create_generation_config(_req(stop=["a", "b"]))
++    assert cfg["stop_sequences"] == ["a", "b"]
++
++
++def test_logprobs_bool_is_accepted():
++    """OpenAI 的 logprobs 是 bool，Gemini 的是 int，两边语义不同。"""
++    assert _req(logprobs=True).logprobs is True
++
++
++def test_logprobs_bool_maps_to_gemini_shape():
++    from api_helpers import create_generation_config
++    cfg = create_generation_config(_req(logprobs=True, top_logprobs=3))
++    assert cfg["response_logprobs"] is True
++    assert cfg["logprobs"] == 3
++
++
++def test_logprobs_int_passthrough():
++    from api_helpers import create_generation_config
++    cfg = create_generation_config(_req(logprobs=5))
++    assert cfg["logprobs"] == 5
++
++
++def test_stream_options_include_usage():
++    from api_helpers import wants_usage
++    assert wants_usage(_req(stream_options={"include_usage": True})) is True
++    assert wants_usage(_req()) is False
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_prefill_dedup.py vertex2openai-main-refactored/tests/test_prefill_dedup.py
+--- vertex2openai-main/tests/test_prefill_dedup.py	2026-07-24 19:05:50.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_prefill_dedup.py	2026-07-26 08:42:12.420976069 +0000
+@@ -43,9 +43,21 @@
+ 
+ 
+ def test_deduper_short_reply_flush():
++    """短回复且与预填充毫无重叠时立即放行（P2-4 之前会一直攒到窗口上限）。
++
++    不变量：feed + flush 的总输出恒等于原文，只是放行时机提前了。
++    """
+     d = PrefillDeduper("这是一个非常长的预填充" * 10)
+-    assert d.feed("短回复") == ""  # 攒着
+-    assert d.flush() == "短回复"
++    out = d.feed("短回复")
++    assert out + d.flush() == "短回复"
++    assert out == "短回复", "与预填充无重叠时不应再无谓地攒着"
++
++
++def test_deduper_buffers_only_while_overlap_possible():
++    """仍可能是预填充复述时才继续攒。"""
++    d = PrefillDeduper("这是一个非常长的预填充")
++    assert d.feed("这是一个") == ""
++    assert d.flush() == "这是一个"
+ 
+ 
+ def test_deduper_no_overlap_passthrough():
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_prefill_dedup_latency.py vertex2openai-main-refactored/tests/test_prefill_dedup_latency.py
+--- vertex2openai-main/tests/test_prefill_dedup_latency.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_prefill_dedup_latency.py	2026-07-26 08:42:12.421417601 +0000
+@@ -0,0 +1,50 @@
++# -*- coding: utf-8 -*-
++"""P2-4：去重器应在能判定时立即放行，而不是固定攒满窗口。"""
++from message_processing import PrefillDeduper, strip_prefill_overlap
++
++
++def test_releases_immediately_when_clearly_different():
++    """输出开头与预填充毫无关系时，第一个 chunk 就该放行。"""
++    d = PrefillDeduper("从前有座山，" * 30)      # 长预填充 → 旧实现窗口很大
++    out = d.feed("完全不相干的开头")
++    assert out == "完全不相干的开头"
++    assert d.done is True
++
++
++def test_still_buffers_while_ambiguous():
++    d = PrefillDeduper("从前有座山")
++    assert d.feed("从前") == ""                 # 仍可能是复述，先攒着
++    assert d.done is False
++
++
++def test_strips_full_repetition():
++    d = PrefillDeduper("从前有座山")
++    out = d.feed("从前有座山，山里有座庙")
++    assert out == "，山里有座庙"
++
++
++def test_strips_tail_overlap():
++    """注意 min_overlap 默认为 8：短于 8 个字符的重叠会被有意忽略，避免误伤正文。"""
++    pre = "夜色渐深，她轻声说道，声音很轻："      # 结尾 11 字与输出开头重合
++    assert strip_prefill_overlap(pre, "她轻声说道，声音很轻：好的") == "好的"
++
++
++def test_short_overlap_is_intentionally_kept():
++    assert strip_prefill_overlap("……他说：", "他说：你好") == "他说：你好"
++
++
++def test_char_by_char_feeding():
++    d = PrefillDeduper("从前有座山")
++    out = "".join(d.feed(c) for c in "从前有座山，山里有座庙")
++    assert out == "，山里有座庙"
++
++
++def test_flush_returns_buffered_tail():
++    d = PrefillDeduper("从前有座山")
++    d.feed("从前")
++    assert d.flush() == "从前"
++
++
++def test_empty_prefill_is_passthrough():
++    d = PrefillDeduper("")
++    assert d.feed("abc") == "abc"
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_prefill_enhanced.py vertex2openai-main-refactored/tests/test_prefill_enhanced.py
+--- vertex2openai-main/tests/test_prefill_enhanced.py	2026-07-24 22:58:28.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_prefill_enhanced.py	2026-07-26 08:42:12.420988581 +0000
+@@ -272,14 +272,34 @@
+     assert json.loads(out3[6:])["choices"][0]["delta"]["content"] == "尾部"
+ 
+ 
++def _collect_sse_content(chunks):
++    """把若干 SSE chunk 里的 delta.content 拼起来（放行时机可能变，总量不能变）。"""
++    text = ""
++    for c in chunks:
++        if c is None:
++            continue
++        text += json.loads(c[6:])["choices"][0]["delta"].get("content") or ""
++    return text
++
++
+ def test_dedup_sse_finish_forces_flush():
++    """finish chunk 必须把攒着的正文一并放出，且总正文量守恒。
++
++    P2-4 之后，与预填充无重叠的正文会更早放行（out1 不再必然是 None），
++    因此断言改为检查**聚合结果**而不是某一个 chunk 的内容。
++    """
+     d = PrefillDeduper("很长很长很长很长很长很长的预填充")
+     out1 = _dedup_sse_chunk_content(_sse(content="短"), d)
+-    assert out1 is None
+     out2 = _dedup_sse_chunk_content(_sse(content="回复", finish="stop"), d)
+-    payload = json.loads(out2[6:])
+-    assert payload["choices"][0]["delta"]["content"] == "短回复"
+-    assert payload["choices"][0]["finish_reason"] == "stop"
++    assert _collect_sse_content([out1, out2]) == "短回复"
++    assert json.loads(out2[6:])["choices"][0]["finish_reason"] == "stop"
++
++
++def test_dedup_sse_strips_repeated_prefill_across_chunks():
++    """模型复述预填充时，跨 chunk 也要裁干净。"""
++    d = PrefillDeduper("从前有座山")
++    outs = [_dedup_sse_chunk_content(_sse(content=c), d) for c in "从前有座山，山里有座庙"]
++    assert _collect_sse_content(outs) == "，山里有座庙"
+ 
+ 
+ def test_dedup_sse_keeps_reasoning_chunks():
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_retry_semantics.py vertex2openai-main-refactored/tests/test_retry_semantics.py
+--- vertex2openai-main/tests/test_retry_semantics.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_retry_semantics.py	2026-07-26 08:42:12.421406293 +0000
+@@ -0,0 +1,49 @@
++# -*- coding: utf-8 -*-
++"""P0-2：retry_max 的语义与边界。
++
++回归的 bug：Express 通道写成 range(retry_max)，retry_max=0 时一次请求都不发——
++非流式返回误导性的“无有效内容”，真流式只吐一个心跳就关流。
++"""
++import pytest
++
++from api_helpers import get_retry_settings
++from runtime_state import app_state
++
++
++def test_default_matches_config():
++    import config as app_config
++    app_state.update_settings({})
++    retry_max, backoff = get_retry_settings()
++    assert retry_max == app_config.DEFAULT_SETTINGS["retry_max"]
++    assert backoff == float(app_config.DEFAULT_SETTINGS["retry_backoff_seconds"])
++
++
++def test_zero_is_allowed_and_means_one_attempt():
++    app_state.update_settings({"retry_max": 0})
++    retry_max, _ = get_retry_settings()
++    assert retry_max == 0
++    # 语义约定：总尝试次数 = retry_max + 1
++    assert retry_max + 1 == 1
++
++
++def test_negative_clamped_to_zero():
++    app_state.update_settings({"retry_max": -5})
++    assert get_retry_settings()[0] == 0
++
++
++def test_absurdly_large_is_clamped():
++    app_state.update_settings({"retry_max": 99999})
++    assert get_retry_settings()[0] == 50
++
++
++def test_garbage_falls_back_to_default():
++    import config as app_config
++    app_state.update_settings({"retry_max": "abc"})
++    assert get_retry_settings()[0] == app_config.DEFAULT_SETTINGS["retry_max"]
++
++
++def test_backoff_clamped():
++    app_state.update_settings({"retry_backoff_seconds": 9999})
++    assert get_retry_settings()[1] == 120.0
++    app_state.update_settings({"retry_backoff_seconds": -1})
++    assert get_retry_settings()[1] == 0.0
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_signature_store.py vertex2openai-main-refactored/tests/test_signature_store.py
+--- vertex2openai-main/tests/test_signature_store.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_signature_store.py	2026-07-26 08:42:12.421079129 +0000
+@@ -0,0 +1,103 @@
++# -*- coding: utf-8 -*-
++"""P0-4：思考签名的短 id 运输与三层降级。"""
++import time
++
++import pytest
++
++import message_processing as mp
++from signature_store import SKIP_VALIDATOR_SENTINEL, SignatureStore, signature_store
++
++
++class FakeFC:
++    def __init__(self, name="get_weather", fc_id=None):
++        self.name = name
++        self.id = fc_id
++        self.args = {"city": "Tokyo"}
++
++
++class FakePart:
++    def __init__(self, sig=None):
++        self.thought_signature = sig
++
++
++LONG_SIG = b"x" * 900       # 真实签名量级：几百到上千字节
++
++
++def test_tool_call_id_is_short():
++    """核心回归：旧实现把 base64 签名拼进 id，动辄上千字符会被前端截断。"""
++    call_id = mp.build_tool_call_id(FakeFC(), FakePart(LONG_SIG))
++    assert len(call_id) <= 40, f"tool_call_id 过长：{len(call_id)}"
++
++
++def test_signature_roundtrip_via_store():
++    call_id = mp.build_tool_call_id(FakeFC(fc_id="fc_abc"), FakePart(LONG_SIG))
++    real_id, sig = mp.resolve_tool_call_signature(call_id, require_signature=True)
++    assert real_id == "fc_abc"
++    assert sig == LONG_SIG
++
++
++def test_upstream_id_is_preserved():
++    call_id = mp.build_tool_call_id(FakeFC(fc_id="fc_from_google"), FakePart(LONG_SIG))
++    assert call_id == "fc_from_google"
++
++
++def test_generated_id_when_upstream_has_none():
++    call_id = mp.build_tool_call_id(FakeFC(fc_id=None), FakePart(LONG_SIG))
++    assert call_id.startswith("call_")
++    assert mp.resolve_tool_call_signature(call_id)[1] == LONG_SIG
++
++
++def test_fallback_to_sentinel_for_gemini3():
++    """缓存丢失（重启/多进程）时必须降级到官方哨兵，而不是让请求 400。"""
++    signature_store.clear()
++    real_id, sig = mp.resolve_tool_call_signature("call_never_seen", require_signature=True)
++    assert real_id == "call_never_seen"
++    assert sig == SKIP_VALIDATOR_SENTINEL
++
++
++def test_no_sentinel_when_not_required():
++    signature_store.clear()
++    assert mp.resolve_tool_call_signature("call_never_seen", require_signature=False)[1] is None
++
++
++def test_legacy_embedded_format_still_parsed():
++    """升级前发出的历史会话仍要能工作。"""
++    import base64
++    legacy = "fc_old" + mp.LEGACY_THOUGHT_SEP + base64.b64encode(LONG_SIG).decode()
++    real_id, sig = mp.resolve_tool_call_signature(legacy)
++    assert real_id == "fc_old"
++    assert sig == LONG_SIG
++
++
++def test_embed_mode_produces_legacy_format():
++    call_id = mp.build_tool_call_id(FakeFC(fc_id="fc_x"), FakePart(LONG_SIG), True)
++    assert mp.LEGACY_THOUGHT_SEP in call_id
++    assert mp.resolve_tool_call_signature(call_id)[1] == LONG_SIG
++
++
++def test_requires_signature_only_for_gemini3():
++    assert mp._requires_signature("gemini-3.6-flash") is True
++    assert mp._requires_signature("gemini-2.5-flash") is False
++    assert mp._requires_signature("") is False          # 未知模型不注入哨兵
++
++
++def test_store_ttl_expiry():
++    store = SignatureStore(ttl_seconds=0, max_entries=10)
++    store.put("a", b"sig")
++    time.sleep(0.01)
++    assert store.get("a") is None
++
++
++def test_store_lru_eviction():
++    store = SignatureStore(ttl_seconds=3600, max_entries=3)
++    for i in range(5):
++        store.put(f"k{i}", f"s{i}".encode())
++    assert store.get("k0") is None      # 最早的被淘汰
++    assert store.get("k4") == b"s4"
++
++
++def test_store_ignores_empty():
++    store = SignatureStore()
++    store.put("", b"x")
++    store.put("k", None)
++    assert store.get("k") is None
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_stats.py vertex2openai-main-refactored/tests/test_stats.py
+--- vertex2openai-main/tests/test_stats.py	2026-07-24 18:57:48.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_stats.py	2026-07-26 08:42:12.420848720 +0000
+@@ -12,15 +12,50 @@
+     assert s.get_json_stats()["prompt_tokens"] == 0
+ 
+ 
+-def test_express_token_line_parsed_into_stats():
++def test_usage_recorded_directly_not_by_log_regex():
++    """P1-5：token 统计改为在产生 usage 的地方直接记账。
++
++    旧实现用正则从中文日志文本里反解，改一句文案就静默失效。
++    """
++    from api_helpers import _record_usage
++
++    class FakeUM:
++        prompt_token_count = 111
++        candidates_token_count = 222
++        total_token_count = 333
++
++    class FakeResp:
++        usage_metadata = FakeUM()
++
+     before = logger.stats.get_json_stats()
+-    print("💰 [算力消耗统计] 提示词: 111 | 思考与生成: 222 | 总计: 333 Tokens")
++    usage = _record_usage(FakeResp())
+     after = logger.stats.get_json_stats()
++    assert usage == {"prompt_tokens": 111, "completion_tokens": 222, "total_tokens": 333}
+     assert after["prompt_tokens"] - before["prompt_tokens"] == 111
+     assert after["completion_tokens"] - before["completion_tokens"] == 222
+     assert after["success"] - before["success"] == 1
+ 
+ 
++def test_printing_token_line_does_not_double_count():
++    """关键不变量：日志钩子不得再解析 💰 行，否则每次统计都会翻倍。"""
++    before = logger.stats.get_json_stats()
++    print("💰 [算力消耗统计] 提示词: 111 | 思考与生成: 222 | 总计: 333 Tokens")
++    after = logger.stats.get_json_stats()
++    assert after["prompt_tokens"] == before["prompt_tokens"]
++    assert after["success"] == before["success"]
++
++
++def test_no_usage_metadata_is_noop():
++    from api_helpers import _record_usage
++
++    class Empty:
++        usage_metadata = None
++
++    before = logger.stats.get_json_stats()
++    assert _record_usage(Empty()) == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
++    assert logger.stats.get_json_stats()["success"] == before["success"]
++
++
+ def test_cookie_map_usage_no_token_line(capsys):
+     before = logger.stats.get_json_stats()
+     usage = cp._map_usage({"promptTokenCount": 9, "candidatesTokenCount": 4})
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_thinking_clamp.py vertex2openai-main-refactored/tests/test_thinking_clamp.py
+--- vertex2openai-main/tests/test_thinking_clamp.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_thinking_clamp.py	2026-07-26 08:42:12.420673126 +0000
+@@ -0,0 +1,76 @@
++# -*- coding: utf-8 -*-
++"""P0-1：思考档位的就近向下夹取。
++
++回归的 bug：Pro 模型没有 minimal 档，旧实现对非法档位一律兜底到 "high"，
++于是"控制台选 minimal + 强制用上方档位"在 3.1-pro 上实际发出 HIGH——
++与用户想减少思考的意图完全相反。
++"""
++import pytest
++
++import model_capabilities as mc
++
++PRO = "gemini-3.1-pro-preview"
++FLASH = "gemini-3.6-flash"
++LITE = "gemini-3.5-flash-lite"
++
++
++class Req:
++    """模拟 SillyTavern：每次请求都恒发 reasoning_effort=xhigh。"""
++    def __init__(self, effort="xhigh"):
++        self.reasoning_effort = effort
++        self.model_extra = {"reasoning_effort": effort} if effort else {}
++
++
++def lvl(model, mode, console_level=None, effort="xhigh"):
++    settings = {"native_thinking_mode": mode}
++    if console_level:
++        settings["thinking_g3_level"] = console_level
++    return mc.resolve_thinking(model, Req(effort), settings)["level"]
++
++
++@pytest.mark.parametrize("want,expect", [
++    ("minimal", "low"),      # ← 核心回归：Pro 无 minimal，必须向下取 low，不能变成 high
++    ("low", "low"),
++    ("medium", "medium"),
++    ("high", "high"),
++])
++def test_pro_console_level_clamps_downward(want, expect):
++    assert lvl(PRO, "console", want) == expect
++
++
++@pytest.mark.parametrize("want", ["minimal", "low", "medium", "high"])
++def test_flash_console_level_is_exact(want):
++    assert lvl(FLASH, "console", want) == want
++
++
++def test_off_mode_uses_lowest_available_level():
++    assert lvl(FLASH, "off") == "minimal"
++    assert lvl(PRO, "off") == "low"          # Pro 最低是 low
++    assert lvl(LITE, "off") == "minimal"
++
++
++def test_off_mode_hides_thoughts():
++    assert mc.resolve_thinking(FLASH, Req(), {"native_thinking_mode": "off"})["include_thoughts"] is False
++
++
++def test_request_mode_still_follows_frontend():
++    assert lvl(FLASH, "request") == "high"   # xhigh → high
++    assert lvl(PRO, "request") == "high"
++
++
++def test_unknown_level_word_clamps_down_not_up():
++    """未知档位词按最高处理再向下夹，不应把 Pro 抬到 high 之外的非法值。"""
++    assert lvl(PRO, "console", "ludicrous") in {"low", "medium", "high"}
++
++
++def test_clamp_helper_directly():
++    assert mc._clamp_level("minimal", {"low", "medium", "high"}) == "low"
++    assert mc._clamp_level("high", {"minimal", "low"}) == "low"
++    assert mc._clamp_level("medium", {"minimal", "low", "medium", "high"}) == "medium"
++    assert mc._clamp_level("anything", set()) == "low"
++
++
++def test_levels_sorted_by_strength_not_alphabet():
++    """控制台下拉必须是 minimal→high，字典序会排成 high, low, medium, minimal。"""
++    assert mc.capabilities_summary(FLASH)["thinking"]["levels"] == \
++        ["minimal", "low", "medium", "high"]
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/tests/test_tool_call_streaming.py vertex2openai-main-refactored/tests/test_tool_call_streaming.py
+--- vertex2openai-main/tests/test_tool_call_streaming.py	1970-01-01 00:00:00.000000000 +0000
++++ vertex2openai-main-refactored/tests/test_tool_call_streaming.py	2026-07-26 08:42:12.421232706 +0000
+@@ -0,0 +1,95 @@
++# -*- coding: utf-8 -*-
++"""P0-3：流式并行函数调用。
++
++回归的 bug：旧实现遇到第一个 function_call 就 break，其余并行调用被丢弃；
++且 delta.tool_calls[].index 恒为 0，OpenAI 客户端会把它们合并成一个。
++官方要求并行调用必须完整按 FC1,FC2,FR1,FR2 回传，缺一个就 400。
++"""
++import json
++
++import pytest
++
++from api_helpers import ToolCallIndexer, convert_chunk_to_openai
++
++
++class FakeFC:
++    def __init__(self, name, args=None, fc_id=None):
++        self.name = name
++        self.args = args or {}
++        self.id = fc_id
++
++
++class FakePart:
++    def __init__(self, fc=None, text=None, sig=None):
++        self.function_call = fc
++        self.text = text
++        self.thought_signature = sig
++        self.thought = False
++
++
++class FakeContent:
++    def __init__(self, parts):
++        self.parts = parts
++
++
++class FakeCandidate:
++    def __init__(self, parts, finish_reason=None):
++        self.content = FakeContent(parts)
++        self.finish_reason = finish_reason
++        self.safety_ratings = None
++
++
++class FakeChunk:
++    def __init__(self, parts, finish_reason=None):
++        self.candidates = [FakeCandidate(parts, finish_reason)]
++
++
++def parse(sse: str) -> dict:
++    return json.loads(sse[len("data: "):].strip())
++
++
++def test_parallel_calls_in_one_chunk_all_emitted():
++    chunk = FakeChunk([
++        FakePart(FakeFC("get_weather", {"city": "Tokyo"}, "fc1"), sig=b"s1"),
++        FakePart(FakeFC("get_time", {"tz": "JST"}, "fc2")),
++    ])
++    payload = parse(convert_chunk_to_openai(chunk, "gemini-3.6-flash", "resp1", 0,
++                                            indexer=ToolCallIndexer()))
++    calls = payload["choices"][0]["delta"]["tool_calls"]
++    assert len(calls) == 2, "并行函数调用被丢弃了"
++    assert [c["index"] for c in calls] == [0, 1]
++    assert [c["function"]["name"] for c in calls] == ["get_weather", "get_time"]
++    assert calls[0]["id"] != calls[1]["id"]
++
++
++def test_index_is_stable_across_chunks():
++    """并行调用可能分布在不同 chunk 里，序号必须由调用方持有。"""
++    indexer = ToolCallIndexer()
++    first = parse(convert_chunk_to_openai(
++        FakeChunk([FakePart(FakeFC("a", fc_id="fa"))]), "m", "r", 0, indexer=indexer))
++    second = parse(convert_chunk_to_openai(
++        FakeChunk([FakePart(FakeFC("b", fc_id="fb"))]), "m", "r", 0, indexer=indexer))
++    assert first["choices"][0]["delta"]["tool_calls"][0]["index"] == 0
++    assert second["choices"][0]["delta"]["tool_calls"][0]["index"] == 1
++
++
++def test_indexer_is_per_candidate():
++    indexer = ToolCallIndexer()
++    assert indexer.next_index(0) == 0
++    assert indexer.next_index(1) == 0
++    assert indexer.next_index(0) == 1
++
++
++def test_arguments_serialized():
++    payload = parse(convert_chunk_to_openai(
++        FakeChunk([FakePart(FakeFC("f", {"k": "v"}, "fc"))]), "m", "r", 0,
++        indexer=ToolCallIndexer()))
++    call = payload["choices"][0]["delta"]["tool_calls"][0]
++    assert json.loads(call["function"]["arguments"]) == {"k": "v"}
++
++
++def test_text_chunk_unaffected():
++    payload = parse(convert_chunk_to_openai(
++        FakeChunk([FakePart(text="hello")]), "m", "r", 0, indexer=ToolCallIndexer()))
++    assert "tool_calls" not in payload["choices"][0]["delta"]
++    assert payload["choices"][0]["delta"]["content"] == "hello"
+diff -ruN -x __pycache__ -x '*.pyc' vertex2openai-main/vertexModels.json vertex2openai-main-refactored/vertexModels.json
+--- vertex2openai-main/vertexModels.json	2026-07-21 19:16:38.000000000 +0000
++++ vertex2openai-main-refactored/vertexModels.json	2026-07-26 08:42:12.411598243 +0000
+@@ -2,10 +2,11 @@
+   "models": [
+     "gemini-3.6-flash",
+     "gemini-3.5-flash",
++    "gemini-3.5-flash-lite",
+     "gemini-3.1-pro-preview",
++    "gemini-3.1-flash-lite",
+     "gemini-3.1-flash-image",
+     "gemini-3-pro-image",
+-    "gemini-3-flash-preview",
+     "gemini-2.5-pro",
+     "gemini-2.5-flash"
+   ]

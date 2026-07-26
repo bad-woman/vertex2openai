@@ -1,4 +1,6 @@
 import re
+from functools import partial
+
 import google.genai
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -68,6 +70,9 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
             print(f"⚠️ [推理配置] 当前 google-genai 版本 {genai_version_str} 不支持 thinking_level，已自动跳过该参数。")
     else:  # budget（Gemini 2.5）
         thinking_config["thinking_budget"] = t["budget"]
+
+    if app_state.get_setting("debug_outbound", False):
+        print(f"🔎 [出站调试] Express 通道 模型={base_model_name} thinkingConfig={thinking_config}")
 
     return thinking_config
 
@@ -152,7 +157,18 @@ class ExpressSDKUpstream(BaseUpstream):
                 gen_config_dict["tools"] = [search_tool]
             print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
 
+        # 传入真实模型名：create_gemini_prompt 需要它来判断是否对缺失的思考签名
+        # 启用官方哨兵（仅 Gemini 3.x 强校验，见 message_processing.resolve_tool_call_signature）
+        prompt_func = partial(create_gemini_prompt, model_name=base_model_name)
+
+        if app_state.get_setting("debug_outbound", False):
+            _dbg = {k: v for k, v in gen_config_dict.items()
+                    if k in ("temperature", "top_p", "top_k", "candidate_count",
+                             "max_output_tokens", "stop_sequences", "thinking_config",
+                             "response_modalities", "image_config")}
+            print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
+
         return await execute_gemini_call(
-            client_to_use, base_model_name, create_gemini_prompt, gen_config_dict, request_obj,
+            client_to_use, base_model_name, prompt_func, gen_config_dict, request_obj,
             fastapi_request=fastapi_request, prefill_text=prefill_text,
         )

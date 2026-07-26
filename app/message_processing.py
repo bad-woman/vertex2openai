@@ -2,12 +2,15 @@ import base64
 import re
 import json
 import time
+import uuid
 import random 
 import httpx
 import concurrent.futures
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
+import model_capabilities as mc
 from runtime_state import app_state
+from signature_store import signature_store, SKIP_VALIDATOR_SENTINEL
 
 from google.genai import types
 from models import OpenAIMessage, ContentPartText, ContentPartImage
@@ -79,6 +82,102 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
 
 SUPPORTED_ROLES = ["user", "model", "function"] 
 
+# ============================================================
+# 思考签名（thought signature）的出入站处理（P0-4）
+#
+# 官方约束（核对于 2026-07-26）：
+#   - 函数调用强校验，Gemini 3 缺签名直接 400；纯文本不强校验但会掉质量。
+#   - Gemini 3 的签名总在**第一个** function call part 上，必须原样回传。
+#   - 并行调用必须按 FC1,FC2,FR1,FR2 顺序回传，交错会 400。
+#   - 拿不到签名时可用 skip_thought_signature_validator 哨兵跳过校验（最后手段）。
+#
+# 这里的两个函数是出/入站的唯一入口。此前 api_helpers 与本文件各有一份复制粘贴的
+# 实现，且已经出现细微不一致（一个用 response_id、一个用 base_id 拼 fallback id）。
+# ============================================================
+
+LEGACY_THOUGHT_SEP = "__thought__"
+
+
+def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
+    """从 part / function_call 上取出思考签名，统一成 bytes。"""
+    sig = getattr(part, "thought_signature", None)
+    if sig is None:
+        sig = getattr(fc, "thought_signature", None)
+    if isinstance(sig, bytes):
+        return sig or None
+    if isinstance(sig, str) and sig:
+        try:
+            return base64.b64decode(sig)
+        except Exception:
+            return sig.encode("utf-8")
+    return None
+
+
+def build_tool_call_id(fc: Any, part: Any, embed_signature: bool = False) -> str:
+    """生成 OpenAI 侧的 tool_call_id，并把思考签名登记进旁路缓存。
+
+    默认返回**短 id**（≤40 字符）。旧实现把 base64 签名拼进 id，动辄上千字符，
+    很多前端会截断，回传时签名丢失 → 400。
+    embed_signature=True 可退回旧格式（控制台开关，供多进程部署使用）。
+    """
+    real_id = getattr(fc, "id", None) or ""
+    if not isinstance(real_id, str):
+        real_id = str(real_id)
+    if not real_id:
+        real_id = "call_" + uuid.uuid4().hex[:16]   # 共 21 字符
+
+    sig = _signature_bytes(part, fc)
+    if sig:
+        if embed_signature:
+            return f"{real_id}{LEGACY_THOUGHT_SEP}{base64.b64encode(sig).decode('utf-8')}"
+        signature_store.put(real_id, sig)
+    return real_id
+
+
+def resolve_tool_call_signature(tool_call_id: str,
+                                require_signature: bool = False) -> Tuple[str, Optional[bytes]]:
+    """从客户端回传的 tool_call_id 还原 (真实 id, 思考签名)。
+
+    三层降级：旁路缓存 → 旧的 `__thought__` 内嵌格式 → 官方哨兵值。
+    require_signature=True（Gemini 3.x）时绝不返回 None，避免整个请求 400。
+    """
+    real_id = tool_call_id or ""
+    sig: Optional[bytes] = None
+
+    if LEGACY_THOUGHT_SEP in real_id:
+        real_id, _, encoded = real_id.partition(LEGACY_THOUGHT_SEP)
+        try:
+            sig = base64.b64decode(encoded) or None
+        except Exception:
+            sig = None
+
+    if sig is None:
+        sig = signature_store.get(real_id)
+
+    if sig is None and require_signature:
+        sig = SKIP_VALIDATOR_SENTINEL
+        print("⚠️ [工具调用] 未能恢复思考签名（可能被前端截断或服务已重启），"
+              "已使用官方跳过校验哨兵。请求不会失败，但模型表现会下降。")
+
+    return real_id, sig
+
+
+def _requires_signature(model_name: str) -> bool:
+    """该模型是否强校验思考签名（仅 Gemini 3.x 家族）。"""
+    if not model_name:
+        return False
+    try:
+        return mc.get_profile(model_name)["family"] == "g3"
+    except Exception:
+        return False
+
+
+def _embed_signature_enabled() -> bool:
+    try:
+        return bool(app_state.get_setting("embed_thought_signature_in_id", False))
+    except Exception:
+        return False
+
 def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     if not tag_name or not isinstance(full_text, str):
         return "", full_text if isinstance(full_text, str) else ""
@@ -111,8 +210,11 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
             except Exception as e:
                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
         parts.reverse()
-    
-    remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
+        # 仅在**确实抽走了图片**时才压平空白：抠掉 data URL 会留下成片空格。
+        # 旧实现无条件执行，导致所有纯文本消息的缩进/多空格（代码块、ASCII 图、
+        # 酒馆预设的排版）都被悄悄改写。文本保真优先。
+        remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
+
     return parts, remaining_text
 
 def _coerce_tool_response(content: Any) -> Dict[str, Any]:
@@ -269,9 +371,26 @@ class PrefillDeduper:
         if self.done:
             return text
         self.buffer += text
-        if len(self.buffer) < self.window:
-            return ""
-        return self._resolve()
+        # P2-4：只要已经能判定「不可能是预填充的重复」，立刻放行，不必攒满窗口。
+        # 旧实现固定攒到 min(len(prefill)+32, 600) 字符才放行，首 token 延迟明显，
+        # 与注释里的“零额外延迟”不符。
+        if len(self.buffer) >= self.window or not self._still_ambiguous():
+            return self._resolve()
+        return ""
+
+    def _still_ambiguous(self) -> bool:
+        """当前缓冲是否还不足以判定去重量。
+
+        strip_prefill_overlap 只看输出的前 len(prefill) 个字符，因此：
+          - 缓冲长度已达 len(prefill) → 信息完备，重叠量已确定，立即放行；
+          - 否则只有当缓冲仍是预填充的某个子串时，才可能延展成更长的重叠，需要继续等。
+        """
+        buf, pre = self.buffer, self.prefill
+        if not buf or not pre:
+            return False
+        if len(buf) >= len(pre):
+            return False
+        return buf in pre
 
     def flush(self) -> str:
         if self.done:
@@ -283,8 +402,14 @@ class PrefillDeduper:
         return strip_prefill_overlap(self.prefill, out)
 
 
-def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
+def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
+    """OpenAI 消息 → Gemini contents。
+
+    model_name 用于判断是否需要对缺失的思考签名启用官方哨兵（仅 Gemini 3.x 强校验）。
+    留空表示“未知模型”，此时不注入哨兵——调用方（express_sdk）总会传真实模型名。
+    """
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
+    require_sig = _requires_signature(model_name)
     raw_gemini_messages = []
     for idx, message in enumerate(messages):
         role = message.role
@@ -307,15 +432,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 # 让标准 OpenAI 客户端的工具往返也能正确工作（修复退化为纯文本的问题）。
                 tool_output_data = _coerce_tool_response(message.content)
 
-                real_tool_id = tool_call_id_str
-                thought_sig_bytes = None
-                if "__thought__" in tool_call_id_str:
-                    parts_id = tool_call_id_str.split("__thought__")
-                    real_tool_id = parts_id[0]
-                    try:
-                        thought_sig_bytes = base64.b64decode(parts_id[1])
-                    except Exception:
-                        thought_sig_bytes = None
+                # 函数**结果**不需要签名（官方只对 functionCall 强校验），因此不注入哨兵；
+                # 但如果能取回签名就照常带上，保持与上游一致。
+                real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
+                    tool_call_id_str, require_signature=False)
 
                 func_resp_kwargs = {"name": message.name, "response": tool_output_data}
                 if real_tool_id:
@@ -346,16 +466,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
                 except json.JSONDecodeError:
                     parsed_arguments = {}
 
-                # 无论是否带 __thought__ 后缀，都构造规范的 function_call
-                real_tool_id = tool_call_id_str
-                thought_sig_bytes = None
-                if "__thought__" in tool_call_id_str:
-                    parts_id = tool_call_id_str.split("__thought__")
-                    real_tool_id = parts_id[0]
-                    try:
-                        thought_sig_bytes = base64.b64decode(parts_id[1])
-                    except Exception:
-                        thought_sig_bytes = None
+                # 函数**调用**是强校验点：Gemini 3.x 缺签名直接 400，
+                # 因此这里允许降级到官方哨兵，保证请求不会整体失败。
+                real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
+                    tool_call_id_str, require_signature=require_sig)
 
                 fc_kwargs = {"name": function_name, "args": parsed_arguments}
                 if real_tool_id:
@@ -465,10 +579,27 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
         if not parts: continue
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
 
+    def _is_text_only(content: types.Content) -> bool:
+        """该 Content 是否只含文本 part（没有 function_call / function_response / inline_data）。"""
+        for p in content.parts or []:
+            if getattr(p, "function_call", None) is not None:
+                return False
+            if getattr(p, "function_response", None) is not None:
+                return False
+            if getattr(p, "inline_data", None) is not None:
+                return False
+            if getattr(p, "text", None) is None:
+                return False
+        return True
+
     merged_messages = []
     for msg in raw_gemini_messages:
         if merged_messages and merged_messages[-1].role == msg.role:
-            merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
+            # 只有两侧都是纯文本时才插入 "\n\n" 分隔符。
+            # 若两个连续 model 轮次都带 function call，插入文本 part 会打断
+            # 官方要求的 FC 连续排列，可能触发 Malformed_Function_Call 或签名校验失败。
+            if _is_text_only(merged_messages[-1]) and _is_text_only(msg):
+                merged_messages[-1].parts.append(types.Part.from_text(text="\n\n"))
             merged_messages[-1].parts.extend(msg.parts)
         else:
             merged_messages.append(msg)
@@ -477,6 +608,102 @@ def create_gemini_prompt(messages: List[OpenAIMessage]) -> List[types.Content]:
         merged_messages.append(types.Content(role="user", parts=[types.Part.from_text(text="继续")]))
 
     return merged_messages
+
+def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
+    """同步抓取远程图片，返回 (bytes, mime)。失败返回 None。
+
+    调用方须保证不在事件循环线程里直接调用（Express/Cookie 两条通道都用
+    asyncio.to_thread 包住整个消息转换）。
+    """
+    try:
+        client_args = {"timeout": timeout, "follow_redirects": True}
+        if app_config.PROXY_URL:
+            client_args["proxy"] = app_config.PROXY_URL
+        if getattr(app_config, "SSL_CERT_FILE", None):
+            client_args["verify"] = app_config.SSL_CERT_FILE
+        with httpx.Client(**client_args) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.content, resp.headers.get("content-type", "image/jpeg")
+    except Exception as e:
+        print(f"⚠️ [图片处理] 获取远程图片失败，已跳过：{url[:120]}，原因：{e}")
+        return None
+
+
+def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
+    """压缩后转成 batchGraphql 的 inlineData part（camelCase）。"""
+    opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
+    return {"inlineData": {"mimeType": opt_mime,
+                           "data": base64.b64encode(opt_bytes).decode("utf-8")}}
+
+
+def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
+    """OpenAI 的 message.content → batchGraphql 的 parts 列表（P1-2）。
+
+    与 Express 通道行为对齐：
+      - 解析正文里的 markdown data-URL 图片（多轮修图时上一张图不会再被当成巨大文本发出）
+      - data: 与 http(s): 两种 image_url 都支持
+      - 统一走 optimize_image_bytes 做输入图压缩（控制台开关对两条通道都生效）
+    """
+    parts: List[Dict[str, Any]] = []
+    if content is None:
+        return parts
+
+    def _add_text_with_inline_images(text: str):
+        if not text:
+            return
+        img_parts, clean_text = _extract_markdown_images_to_parts(text)
+        if clean_text:
+            parts.append({"text": clean_text})
+        for ip in img_parts:
+            blob = getattr(ip, "inline_data", None)
+            if blob is not None and getattr(blob, "data", None):
+                data = blob.data
+                if isinstance(data, bytes):
+                    data = base64.b64encode(data).decode("utf-8")
+                parts.append({"inlineData": {"mimeType": getattr(blob, "mime_type", "image/jpeg"),
+                                             "data": data}})
+
+    if isinstance(content, str):
+        _add_text_with_inline_images(content)
+        return parts
+
+    if isinstance(content, list):
+        for item in content:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump()
+            if isinstance(item, str):
+                _add_text_with_inline_images(item)
+                continue
+            if not isinstance(item, dict):
+                text_attr = getattr(item, "text", None)
+                if isinstance(text_attr, str):
+                    _add_text_with_inline_images(text_attr)
+                continue
+
+            item_type = item.get("type", "")
+            if item_type == "text":
+                _add_text_with_inline_images(item.get("text", ""))
+            elif item_type == "image_url":
+                url = item.get("image_url", {})
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if not isinstance(url, str) or not url:
+                    continue
+                if url.startswith("data:"):
+                    m = re.match(r"data:([^;]+);base64,(.+)", url, re.DOTALL)
+                    if m:
+                        mime_type, b64_data = m.groups()
+                        try:
+                            parts.append(_wire_image_part(base64.b64decode(b64_data), mime_type))
+                        except Exception as e:
+                            print(f"⚠️ [图片处理] 解析内联图片失败，已跳过：{e}")
+                elif url.startswith("http"):
+                    fetched = fetch_remote_image(url)
+                    if fetched:
+                        parts.append(_wire_image_part(*fetched))
+    return parts
+
 
 def _create_safety_ratings_html(safety_ratings: list) -> str:
     if not safety_ratings:
@@ -591,32 +818,10 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 for part in candidate.content.parts:
                     if hasattr(part, "function_call") and part.function_call is not None: 
                         fc = part.function_call
-                        
-                        real_id = getattr(fc, "id", None)
-                        if not real_id: real_id = getattr(fc, "thought_signature", None)
-                        
-                        thought_sig = getattr(part, "thought_signature", None)
-                        thought_sig_b64 = ""
-                        if thought_sig:
-                            if isinstance(thought_sig, bytes):
-                                thought_sig_b64 = base64.b64encode(thought_sig).decode("utf-8")
-                            elif isinstance(thought_sig, str):
-                                thought_sig_b64 = thought_sig
 
-                        safe_name = fc.name.replace(" ", "_")
-                        rand_num = int(time.time() * 10000 + random.randint(0, 9999))
+                        # 统一走 build_tool_call_id：短 id + 签名进旁路缓存
+                        tool_call_id = build_tool_call_id(fc, part, _embed_signature_enabled())
 
-                        if real_id:
-                            if thought_sig_b64:
-                                tool_call_id = f"{real_id}__thought__{thought_sig_b64}"
-                            else:
-                                tool_call_id = real_id
-                        else:
-                            if thought_sig_b64:
-                                tool_call_id = f"call_{base_id}_{i}_{safe_name}__thought__{thought_sig_b64}"
-                            else:
-                                tool_call_id = f"call_{base_id}_{i}_{safe_name}_{rand_num}"
-                        
                         if "tool_calls" not in message_payload:
                             message_payload["tool_calls"] = []
                         

@@ -6,9 +6,16 @@ services:
     container_name: vertex2openai
     ports:
       - "8050:7860"
+    volumes:
+      # S-3：不挂卷的话，docker compose up --force-recreate 或升级镜像后
+      # web_state.json 会丢失，Cookie 与全部控制台设置都要重配。
+      - ./data:/app/data
     environment:
+      # 状态文件目录（web_state.json 落在这里）
+      - STATE_DIR=/app/data
       # Protect this adapter's OpenAI-compatible API.
-      - API_KEY=123456
+      # ⚠️ 必须改成强口令：它既是本代理的 API Key，也是控制台登录密码
+      - API_KEY=change-me-please
       # Required: one or more Gemini Express Mode API keys, separated by commas.
       - VERTEX_EXPRESS_API_KEY=your_vertex_express_api_key
       # Optional: set true to rotate Express keys in order instead of random selection.
