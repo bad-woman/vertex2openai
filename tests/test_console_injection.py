@@ -168,3 +168,30 @@ def test_both_upstreams_share_the_same_template_rule():
     for tpl in ("", "  ", "自定义"):
         for img in (True, False):
             assert a(tpl, img) == b(tpl, img)
+
+
+def test_console_can_actually_save_injection_per_model():
+    """后端把注入键放进 PER_MODEL_KEYS，控制台就必须真的能存/取它们。
+
+    此前只改了后端：`PER_MODEL_KEYS` 含注入键，但控制台的
+    saveModelOverride 不提交、applyModelParamFields 也不回显，
+    说明文字却让用户去点“保存为该模型专属”——承诺了做不到的事。
+    """
+    main_py = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text(encoding="utf-8")
+    for key in ("inject_system_instruction", "inject_prefill"):
+        assert key in app_config.PER_MODEL_KEYS, key
+        # 前端的 PER_MODEL_KEYS 常量（决定切换模型时的回显）
+        js_list = main_py.split("const PER_MODEL_KEYS = [", 1)[1].split("]", 1)[0]
+        assert key in js_list, f"前端 PER_MODEL_KEYS 缺 {key}"
+        # 专属保存的 patch
+        patch = main_py.split("async function saveModelOverride()", 1)[1].split("};", 1)[0]
+        assert key in patch, f"saveModelOverride 未提交 {key}"
+
+
+def test_backend_and_frontend_per_model_keys_agree():
+    main_py = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text(encoding="utf-8")
+    js_list = main_py.split("const PER_MODEL_KEYS = [", 1)[1].split("]", 1)[0]
+    js_keys = {k.strip().strip("'\"") for k in js_list.split(",") if k.strip()}
+    assert js_keys == set(app_config.PER_MODEL_KEYS), (
+        f"前后端 PER_MODEL_KEYS 不一致：仅前端 {js_keys - set(app_config.PER_MODEL_KEYS)}，"
+        f"仅后端 {set(app_config.PER_MODEL_KEYS) - js_keys}")

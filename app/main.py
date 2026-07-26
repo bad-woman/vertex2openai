@@ -367,7 +367,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
       </div>
-      <p class="text-xs text-neutral-500 mt-3">下方参数默认为<b>全局默认值</b>（对所有模型生效）。可为<b>当前所选模型</b>单独保存专属值：<b>思考、生图、采样默认</b>这三类支持按模型覆盖。优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
+      <p class="text-xs text-neutral-500 mt-3">下方参数默认为<b>全局默认值</b>（对所有模型生效）。可为<b>当前所选模型</b>单独保存专属值：<b>思考、生图、采样默认、控制台注入</b>这四类支持按模型覆盖。优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
       <div class="flex items-center gap-2 mt-3 flex-wrap">
         <button class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
         <button class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
@@ -422,6 +422,30 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div><div class="lbl mb-1">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
         </div>
         <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
+      </div>
+
+      <!-- 控制台注入（可按模型覆盖） -->
+      <div class="card p-5">
+        <div class="text-sm font-semibold mb-3">控制台注入 <span class="text-xs font-normal text-neutral-400">（留空＝不启用；支持按模型专属）</span></div>
+        <div class="space-y-3">
+
+          <div>
+            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
+            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
+          </div>
+          <div>
+            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
+            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injp" class="helpbox">
+              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
+              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
+              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
+              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
+              <b>只填内容还不够</b>：填完必须点保存——点“保存全局设置”＝对所有模型生效；点上方“保存为该模型专属”＝只对当前所选模型生效。（生图模型还需额外打开上面的“生图也注入预填充”开关，那个开关只是放行，内容仍取自这里。）<br>强烈建议按模型分开配：生图要的是画风描述，角色扮演要的是思考块开标签，两者内容完全不同；问答用的模型则应留空（否则每条回复开头都会多出这段文字，原生思考也会被压制、影响答题深度）。
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- 输入图压缩 -->
@@ -499,25 +523,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。</div>
           </div>
 
-          <div class="pt-1 border-t border-neutral-100"></div>
-          <div class="text-xs font-semibold text-neutral-500 pt-1">控制台注入 <span class="text-neutral-400 font-normal">（留空＝不启用）</span></div>
-
-          <div>
-            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
-            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
-          </div>
-          <div>
-            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
-            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injp" class="helpbox">
-              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
-              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
-              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
-              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
-              建议配合右上角<b>“保存为该模型专属”</b>：只给跑角色扮演的模型开，问答模型保持干净（否则每条回复开头都会多出这段文字，而且原生思考会被压制、影响答题深度）。
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -545,7 +550,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens'];
+const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill'];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
@@ -664,6 +669,8 @@ async function saveModelOverride(){
     default_temperature:numOrNull('default_temperature'),
     default_top_p:numOrNull('default_top_p'),
     default_max_tokens:numOrNull('default_max_tokens'),
+    inject_system_instruction:$('inject_system_instruction').value,
+    inject_prefill:$('inject_prefill').value,
   };
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
