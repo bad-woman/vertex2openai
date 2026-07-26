@@ -83,6 +83,20 @@ _NO_BODY_HINT = (
 )
 
 
+def _prefill_log(mode: str, prefill_text: str) -> str:
+    """按模式说明预填充被怎么处理了——三种模式的差别对使用者影响很大。"""
+    n = len(prefill_text)
+    if mode == "keep_turn":
+        return (f"🩹 [预填充兼容] 预填充（{n} 字）保留为 model 轮次，其后补一句续写推动语；"
+                "输出会把它拼回开头。")
+    if mode == "minimal":
+        return ("🩹 [预填充兼容] 仅补占位 user 保证不报错；预填充**不会**拼回输出开头"
+                "（预设的思考开标签可能因此缺失，酒馆正则会抓不到）。")
+    return (f"🩹 [预填充兼容] 预填充（{n} 字）已并入末尾 user 消息作为续写指令，并将拼回输出开头。"
+            "注意：模型会把它当成“用户给的参考文本”而非“自己写了一半”，"
+            "预设思维链场景建议改用「保留模型轮次」。")
+
+
 def _is_retryable_error(error_msg: str) -> bool:
     """判断错误是否可重试（429 限流类）"""
     lower = error_msg.lower()
@@ -769,7 +783,7 @@ class CookieProxyUpstream(BaseUpstream):
         _profile = mc.get_profile(base_model_name)
         prefill_text = ""
         prefill_active = False
-        _prefill_mode = app_state.get_setting("prefill_mode", "smart")
+        _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
         if _prefill_mode != "off":
             _new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
@@ -778,10 +792,15 @@ class CookieProxyUpstream(BaseUpstream):
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})
-                if prefill_text:
-                    print(f"🩹 [预填充兼容] 已将末尾 assistant 预填充转为续写指令（{len(prefill_text)} 字），并将拼回输出开头。")
+                print(_prefill_log(_prefill_mode, prefill_text))
             elif prefill_text:
                 print(f"🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传（{len(prefill_text)} 字），模型将直接续写。")
+            else:
+                # 没检测到预填充也要说一声：很多人以为整个预设就是预填充，
+                # 实际只有「最后一条 assistant 消息」才算。没有它，压制原生思考也不会触发。
+                print("ℹ️ [预填充兼容] 未检测到预填充（请求最后一条不是 assistant 消息）。"
+                      "预设里的思维链指令属于 system/user 条目，不是预填充；"
+                      "若要用预设思维链顶掉原生思考，需在预设末尾放一条 assistant 条目（通常是思考块的开标签）。")
             if prefill_active and app_state.get_setting("prefill_suppress_thinking", True):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
