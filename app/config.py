@@ -80,7 +80,11 @@ DEFAULT_SETTINGS = {
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
     # 预填充兼容模式: smart|minimal|off
-    "prefill_mode": "smart",
+    # keep_turn：保留预填充所在的 model 轮次，只补一句极短推动语。
+    # 实机对照（预设思维链场景，gemini-3.6-flash × 3 次）：smart 切题 0/3、连
+    # <thinking> 格式都丢；keep_turn 切题 3/3 且格式完整。smart 会把预填充塞进
+    # user 消息，模型于是当成"用户贴来的参考文本"，而非"自己已写了一半"。
+    "prefill_mode": "keep_turn",
     # 预填充触发时压制原生思考（“卡思维链”核心开关）：
     # 3.x 压到最低档（minimal/低于则 low）并关闭思考回传；2.5-flash 预算设 0 全关、2.5-pro 降到最低 128。
     # 此路径会忽略前端 effort（预填充时优先）。
@@ -104,7 +108,6 @@ DEFAULT_SETTINGS = {
     # 思考签名内嵌开关（默认关）：
     #   关 = 生成短 tool_call_id，签名存进进程内旁路缓存（推荐，避免被前端截断）
     #   开 = 退回旧的 `{id}__thought__{base64}` 内嵌格式，供多进程/多副本部署使用
-    "embed_thought_signature_in_id": False,
     # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
     # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
     "image_system_instruction": False,

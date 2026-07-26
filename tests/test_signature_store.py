@@ -69,9 +69,16 @@ def test_legacy_embedded_format_still_parsed():
     assert sig == LONG_SIG
 
 
-def test_embed_mode_produces_legacy_format():
-    call_id = mp.build_tool_call_id(FakeFC(fc_id="fc_x"), FakePart(LONG_SIG), True)
-    assert mp.LEGACY_THOUGHT_SEP in call_id
+def test_legacy_format_is_never_generated():
+    """内嵌开关已移除：只保留对旧格式的解析，不再生成它。
+
+    该开关原本是给多副本部署用的，但取不回签名时还有哨兵兜底（请求不会失败），
+    而单进程部署（默认 Dockerfile 即是）根本用不上它。
+    """
+    call_id = mp.build_tool_call_id(FakeFC(fc_id="fc_x"), FakePart(LONG_SIG))
+    assert mp.LEGACY_THOUGHT_SEP not in call_id
+    assert len(call_id) <= 40
+    # 签名进了旁路缓存，仍能取回
     assert mp.resolve_tool_call_signature(call_id)[1] == LONG_SIG
 
 

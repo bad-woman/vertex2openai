@@ -444,14 +444,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分</span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志 <span class="text-xs text-neutral-400">（两条通道都打印实际发出的思考/采样参数，实机验证必开）</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断 <span class="text-xs text-neutral-400">（无正文时的原始响应样本总是自动记录，无需开启）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between"><span class="text-sm">思考签名内嵌 tool_call_id <span class="text-xs text-neutral-400">（默认关＝短 id＋内存缓存；多副本部署才需开启）</span></span><label class="switch"><input type="checkbox" id="embed_thought_signature_in_id"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令 <span class="text-xs text-neutral-400">（默认关＝沿用旧行为；开启前请先真机验证目标模型）</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式</span>
-            <select id="prefill_mode" class="inp" style="width:130px"><option value="smart">智能</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+          <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式 <span class="text-xs text-neutral-400">（3.x 起官方取消预填充。「保留模型轮次」把预填充留在模型自己的轮次里，预设思维链才不会被当成参考文本）</span></span>
+            <select id="prefill_mode" class="inp" style="width:190px"><option value="keep_turn">保留模型轮次（默认）</option><option value="smart">智能（旧行为）</option><option value="minimal">最小</option><option value="off">关闭</option></select>
           </div>
           <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考 <span class="text-xs text-neutral-400">（卡思维链）</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
           <div>
-            <div class="lbl mb-1">续写指令模板（留空=内置默认；预填充文本自动附在其后）</div>
+            <div class="lbl mb-1">续写指令模板 <span class="text-xs text-neutral-400">（留空=内置默认。「智能」模式下预填充文本会附在其后；「保留模型轮次」模式下它只是末尾那句推动语）</span></div>
             <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，不要重复开头内容，也不要添加任何前言、解释或标注："></textarea>
           </div>
           <p class="text-xs text-neutral-500 leading-relaxed">智能模式：2.5 及更早模型<b>原生透传</b>预填充（模型直接续写）；3.x 拒绝 model 结尾，自动转为末尾 user 续写指令。两者都会把预填充拼回输出开头并自动去重。压制思考时：3.x 压至最低档并不回传思考（无法全关），2.5-flash 预算 0 全关、2.5-pro 降至 128。<b>注意：预填充压制仅在请求真的带预填充时触发；若你的酒馆预设把思维链写在 system 提示里（无预填充），请改用上方“思考强度”卡片的“强制用此设置”。</b></p>
@@ -563,7 +562,7 @@ async function loadParams(){
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
     ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','embed_thought_signature_in_id','image_system_instruction'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -693,7 +692,6 @@ async function saveSettings(){
     safety_score:$('safety_score').checked,
     cookie_debug:$('cookie_debug').checked,
     debug_outbound:$('debug_outbound').checked,
-    embed_thought_signature_in_id:$('embed_thought_signature_in_id').checked,
     image_system_instruction:$('image_system_instruction').checked,
     prefill_mode:$('prefill_mode').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,

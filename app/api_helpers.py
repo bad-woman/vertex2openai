@@ -34,13 +34,6 @@ def _safety_score_enabled() -> bool:
         return bool(app_config.SAFETY_SCORE)
 
 
-def _embed_signature_in_id() -> bool:
-    """是否退回旧的 `{id}__thought__{base64}` 内嵌格式（默认关，见 signature_store 说明）。"""
-    try:
-        return bool(app_state.get_setting("embed_thought_signature_in_id", False))
-    except Exception:
-        return False
-
 
 def get_retry_settings() -> tuple[int, float]:
     """读取重试配置。
@@ -470,7 +463,6 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         # 遍历**全部** parts 收集并行函数调用，不再遇到第一个就 break
         tool_call_deltas = []
         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
-            embed_sig = _embed_signature_in_id()
             for part in candidate.content.parts:
                 fc = getattr(part, "function_call", None)
                 if fc is None:
@@ -478,7 +470,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
                 tool_call_deltas.append({
                     "index": tc_index,
-                    "id": build_tool_call_id(fc, part, embed_sig),
+                    "id": build_tool_call_id(fc, part),
                     "type": "function",
                     "function": {
                         "name": fc.name,

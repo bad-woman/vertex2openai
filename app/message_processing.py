@@ -113,12 +113,14 @@ def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
     return None
 
 
-def build_tool_call_id(fc: Any, part: Any, embed_signature: bool = False) -> str:
+def build_tool_call_id(fc: Any, part: Any) -> str:
     """生成 OpenAI 侧的 tool_call_id，并把思考签名登记进旁路缓存。
 
-    默认返回**短 id**（≤40 字符）。旧实现把 base64 签名拼进 id，动辄上千字符，
+    返回**短 id**（≤40 字符）。旧实现把 base64 签名拼进 id，动辄上千字符，
     很多前端会截断，回传时签名丢失 → 400。
-    embed_signature=True 可退回旧格式（控制台开关，供多进程部署使用）。
+
+    注意：这里只是不再**生成**旧的内嵌格式，`resolve_tool_call_signature` 仍然
+    **解析**它——升级前发出的 id 可能还留在客户端的对话历史里。
     """
     real_id = getattr(fc, "id", None) or ""
     if not isinstance(real_id, str):
@@ -128,8 +130,6 @@ def build_tool_call_id(fc: Any, part: Any, embed_signature: bool = False) -> str
 
     sig = _signature_bytes(part, fc)
     if sig:
-        if embed_signature:
-            return f"{real_id}{LEGACY_THOUGHT_SEP}{base64.b64encode(sig).decode('utf-8')}"
         signature_store.put(real_id, sig)
     return real_id
 
@@ -171,12 +171,6 @@ def _requires_signature(model_name: str) -> bool:
     except Exception:
         return False
 
-
-def _embed_signature_enabled() -> bool:
-    try:
-        return bool(app_state.get_setting("embed_thought_signature_in_id", False))
-    except Exception:
-        return False
 
 def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     if not tag_name or not isinstance(full_text, str):
@@ -271,6 +265,13 @@ DEFAULT_PREFILL_INSTRUCTION = (
 )
 
 
+# keep_turn 模式用的收尾指令。预填充留在 model 轮次里，这里只需要一句极短的推动，
+# 越短越不干扰预设本身。
+DEFAULT_KEEP_TURN_NUDGE = (
+    "[继续] 从你上一条的断点处无缝往下写，不要重复已写内容，不要任何前言或解释。"
+)
+
+
 def apply_prefill_compat(
     messages: List[OpenAIMessage],
     mode: str = "smart",
@@ -287,7 +288,16 @@ def apply_prefill_compat(
         消息保持原样发给上游，模型直接续写末尾轮次，最忠实；
       * 否则（3.x 等）→ 把末尾 assistant 预填充取出，转成末尾 user 的“续写指令”
         （模板可用 instruction_template 自定义，留空用内置默认）。
-      两种情况都返回 prefill 文本，由上游把它拼回输出开头（配合去重）。
+    - mode="keep_turn"（3.x 上比 smart 更贴合原意）：
+      **保留** assistant 预填充作为 model 轮次，只在其后补一句极短的 user 推动语。
+      3.x 拒绝的是“以 model 轮次**结尾**”，并不禁止 model 轮次出现在中间。
+      smart 把预填充塞进 user 消息，模型于是把自己写的话当成“用户给的参考文本”，
+      倾向另起一句；keep_turn 让预填充留在模型自己的声音里，续写是逐字接续的。
+      预填充的主要用途是用预设自带的思维链顶掉原生思维链，此时预填充往往是
+      `<thinking>` 这类**未闭合的开头**——它必须处在 model 轮次里，模型才会
+      当作“自己已经写了一半”继续填充，而不是当成用户贴来的样例。
+      2.5 系仍走原生透传，不受影响。
+      以上模式都返回 prefill 文本，由上游把它拼回输出开头（配合去重）。
 
     返回 (处理后的消息列表, 需拼回输出开头的预填充文本, 是否检测到预填充)。
     第三项供“预填充时压制原生思考”等联动逻辑使用。
@@ -316,9 +326,17 @@ def apply_prefill_compat(
         new_msgs.append(OpenAIMessage(role="user", content="(请继续)"))
         return new_msgs, "", True
 
-    # smart + 模型支持 model 结尾 → 原生预填充透传（不改消息，模型直接续写）
+    # 模型支持 model 结尾 → 原生预填充透传（不改消息，模型直接续写）
     if allow_model_last:
         return messages, prefill, True
+
+    if mode == "keep_turn":
+        # 保留预填充所在的 assistant 轮次，只补一句极短 user 推动语。
+        # 必须截到 idx+1：预填充后面可能还跟着空消息，带上它们会再次以非 user 结尾。
+        new_msgs = list(messages[:idx + 1])
+        nudge = (instruction_template or "").strip() or DEFAULT_KEEP_TURN_NUDGE
+        new_msgs.append(OpenAIMessage(role="user", content=nudge))
+        return new_msgs, prefill, True
 
     # smart：丢弃末尾预填充 assistant（及其后的空消息），转成续写指令
     new_msgs = list(messages[:idx])
@@ -863,7 +881,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                         fc = part.function_call
 
                         # 统一走 build_tool_call_id：短 id + 签名进旁路缓存
-                        tool_call_id = build_tool_call_id(fc, part, _embed_signature_enabled())
+                        tool_call_id = build_tool_call_id(fc, part)
 
                         if "tool_calls" not in message_payload:
                             message_payload["tool_calls"] = []
