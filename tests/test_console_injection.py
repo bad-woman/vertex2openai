@@ -195,3 +195,37 @@ def test_backend_and_frontend_per_model_keys_agree():
     assert js_keys == set(app_config.PER_MODEL_KEYS), (
         f"前后端 PER_MODEL_KEYS 不一致：仅前端 {js_keys - set(app_config.PER_MODEL_KEYS)}，"
         f"仅后端 {set(app_config.PER_MODEL_KEYS) - js_keys}")
+
+
+def test_custom_template_no_longer_silently_breaks_image_generation():
+    """冲突点：`_prefill_tpl` 里用户自定义模板优先级最高，会盖掉给生图准备的那句。
+
+    只有一份全局模板时，为文本模型调好的“接着往下写”会串到生图模型上，
+    实测结果是吐 ASCII 字符画而不是图片。解法是让模板也能按模型分开配。
+    """
+    from upstreams.express_sdk import _prefill_tpl
+    from message_processing import DEFAULT_IMAGE_PREFILL_NUDGE
+
+    text_tpl = "[继续] 从断点处无缝往下写。"
+    # 冲突仍然存在（这是设计：用户显式填了就听用户的）
+    assert _prefill_tpl(text_tpl, is_image_model=True) == text_tpl
+    # 但现在可以给生图模型单独配一份，因此模板必须是可按模型覆盖的
+    assert "prefill_instruction" in app_config.PER_MODEL_KEYS
+    # 未自定义时生图仍自动拿到要图片的那句
+    assert _prefill_tpl("", is_image_model=True) == DEFAULT_IMAGE_PREFILL_NUDGE
+
+
+def test_effective_settings_resolve_template_per_model():
+    """按模型覆盖必须真的能取到不同的模板。"""
+    from runtime_state import app_state
+    app_state.update_settings({"prefill_instruction": "全局：接着往下写"})
+    app_state.set_model_override("gemini-3.1-flash-image",
+                                 {"prefill_instruction": "直接输出图片，不要任何文字"})
+    try:
+        text = app_state.get_effective_settings("gemini-3.6-flash")["prefill_instruction"]
+        image = app_state.get_effective_settings("gemini-3.1-flash-image")["prefill_instruction"]
+        assert text == "全局：接着往下写"
+        assert image == "直接输出图片，不要任何文字"
+    finally:
+        app_state.clear_model_override("gemini-3.1-flash-image")
+        app_state.update_settings({"prefill_instruction": ""})

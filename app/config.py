@@ -143,4 +143,7 @@ PER_MODEL_KEYS = [
     # 注入项按模型区分很常见：只给跑角色扮演的模型开，问答模型保持干净。
     "inject_system_instruction",
     "inject_prefill",
+    # 续写指令也必须能按模型分开：文本模型要"接着往下写"，生图模型要"直接输出图片"，
+    # 只有一份全局模板时，为文本调好的那句会让生图吐字符画。
+    "prefill_instruction",
 ]

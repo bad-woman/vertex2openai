@@ -817,7 +817,7 @@ class CookieProxyUpstream(BaseUpstream):
             _new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not _profile["requires_user_last_turn"],
-                instruction_template=_prefill_tpl(app_state.get_setting("prefill_instruction", ""), _profile["is_image"]),
+                instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})

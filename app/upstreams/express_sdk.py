@@ -175,7 +175,7 @@ class ExpressSDKUpstream(BaseUpstream):
             new_msgs, prefill_text, prefill_active = apply_prefill_compat(
                 request_obj.messages, _prefill_mode,
                 allow_model_last=not profile["requires_user_last_turn"],
-                instruction_template=_prefill_tpl(app_state.get_setting("prefill_instruction", ""), is_image_model),
+                instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), is_image_model),
             )
             if new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": new_msgs})
