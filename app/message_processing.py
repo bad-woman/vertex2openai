@@ -272,6 +272,70 @@ DEFAULT_KEEP_TURN_NUDGE = (
 )
 
 
+def apply_console_injection(
+    messages: List[OpenAIMessage],
+    system_text: str = "",
+    prefill_text: str = "",
+    has_tools: bool = False,
+    is_image_model: bool = False,
+) -> Tuple[List[OpenAIMessage], List[str]]:
+    """把控制台配置的 system 指令 / 预填充注入到消息里。
+
+    面向 RikkaHub 这类轻量前端：它们没有酒馆的预设系统，尤其**从不发送
+    assistant 预填充**，因此在这些前端下预填充这个杠杆完全用不上，
+    "预填充时压制原生思考"也永远不会触发。
+
+    注入发生在 `apply_prefill_compat` **之前**，注入完的消息与"前端自己发了
+    预填充"完全同形，下游四种兼容模式原样复用，不引入新分支。
+
+    四条护栏（缺一个就会和现有功能打架）：
+      1. 客户端已经发了预填充 → 不注入，否则两段预填充叠一起（酒馆场景）；
+      2. 请求带 tools → 不注入，凭空多一个 model 轮次会打乱函数调用往返；
+      3. 生图模型 → 不注入预填充（给生图请求塞一段旁白没有意义）；
+      4. 两个字段都留空 → 整个函数是空操作。
+
+    返回 (新消息列表, 说明做了什么的日志行列表)。
+    """
+    notes: List[str] = []
+    system_text = (system_text or "").strip()
+    prefill_text = (prefill_text or "").strip()
+    if not system_text and not prefill_text:
+        return messages, notes
+
+    new_msgs = list(messages or [])
+
+    if system_text:
+        # 追加在客户端 system 之后：越靠后越不容易被前面的内容淹没，
+        # 也保证前端自己的系统提示仍然在场。
+        insert_at = 0
+        for i, m in enumerate(new_msgs):
+            if m.role == "system":
+                insert_at = i + 1
+        new_msgs.insert(insert_at, OpenAIMessage(role="system", content=system_text))
+        notes.append(f"💉 [控制台注入] 已追加 system 指令（{len(system_text)} 字）。")
+
+    if prefill_text:
+        if has_tools:
+            notes.append("💉 [控制台注入] 请求带函数调用，已跳过预填充注入（避免打乱工具往返）。")
+        elif is_image_model:
+            notes.append("💉 [控制台注入] 生图模型，已跳过预填充注入。")
+        else:
+            idx = len(new_msgs) - 1
+            while idx >= 0 and _is_empty_message(new_msgs[idx]):
+                idx -= 1
+            client_has_prefill = (idx >= 0 and new_msgs[idx].role == "assistant"
+                                  and not getattr(new_msgs[idx], "tool_calls", None))
+            if client_has_prefill:
+                notes.append("💉 [控制台注入] 客户端已自带预填充，跳过注入（不覆盖前端预设）。")
+            else:
+                new_msgs = new_msgs[:idx + 1]
+                new_msgs.append(OpenAIMessage(role="assistant", content=prefill_text))
+                notes.append(f"💉 [控制台注入] 已注入预填充（{len(prefill_text)} 字），"
+                             "下面按预填充兼容模式处理。")
+
+    return new_msgs, notes
+
+
 def apply_prefill_compat(
     messages: List[OpenAIMessage],
     mode: str = "smart",

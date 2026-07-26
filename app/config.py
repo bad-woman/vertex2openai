@@ -116,6 +116,10 @@ DEFAULT_SETTINGS = {
     # 生图请求是否下发 system_instruction（默认关，保持既有行为）。
     # 官方未禁止生图模型使用系统指令，但旧代码一直剥离；打开前请先真机验证目标模型。
     "image_system_instruction": False,
+    # 轻量前端（RikkaHub 等）注入：留空 = 不启用，酒馆用户不受影响。
+    # 这两项解决的是"前端本身没有预设系统"的场景，见 message_processing.apply_console_injection。
+    "inject_system_instruction": "",
+    "inject_prefill": "",
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},
@@ -132,4 +136,7 @@ PER_MODEL_KEYS = [
     "default_temperature",
     "default_top_p",
     "default_max_tokens",
+    # 注入项按模型区分很常见：只给跑角色扮演的模型开，问答模型保持干净。
+    "inject_system_instruction",
+    "inject_prefill",
 ]

@@ -257,6 +257,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   input:checked + .slider{background:var(--accent)}
   input:checked + .slider:before{transform:translateX(18px)}
   .hero { background:linear-gradient(180deg,#fff, #fbfbfd); border:1px solid var(--border); border-radius:16px; }
+  /* 说明收纳：面板功能很多，长说明平铺会挤爆版面，但说明本身不能省。
+     统一收进 ⓘ 折叠块——默认只占一个图标，点开才展开详细文字。 */
+  .helpq { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
+           border-radius:50%; border:1px solid #d4d4d8; color:#a1a1aa; font-size:10px; line-height:1;
+           cursor:pointer; user-select:none; vertical-align:middle; margin-left:5px; transition:.15s; }
+  .helpq:hover { border-color:var(--accent); color:var(--accent); background:rgba(79,70,229,.06); }
+  .helpq.on { border-color:var(--accent); color:#fff; background:var(--accent); }
+  .helpbox { display:none; margin-top:7px; padding:9px 11px; border-radius:9px; background:#f7f7fa;
+             border:1px solid #ececf1; font-size:12px; line-height:1.75; color:#52525b; }
+  .helpbox.show { display:block; }
+  .helpbox b { color:var(--fg); }
+  .helpbox code { background:#e9e9ef; padding:1px 4px; border-radius:4px; font-size:11px; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -442,18 +454,65 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分</span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志 <span class="text-xs text-neutral-400">（两条通道都打印实际发出的思考/采样参数，实机验证必开）</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断 <span class="text-xs text-neutral-400">（无正文时的原始响应样本总是自动记录，无需开启）</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令 <span class="text-xs text-neutral-400">（默认关＝沿用旧行为；开启前请先真机验证目标模型）</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
-          <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式 <span class="text-xs text-neutral-400">（3.x 起官方取消预填充。预填充停在半截词/半截标签时改用「保留模型轮次」更贴合；以完整句子收尾则用「智能」）</span></span>
-            <select id="prefill_mode" class="inp" style="width:190px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
-          </div>
-          <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考 <span class="text-xs text-neutral-400">（卡思维链）</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
           <div>
-            <div class="lbl mb-1">续写指令模板 <span class="text-xs text-neutral-400">（留空=内置默认。「智能」模式下预填充文本会附在其后；「保留模型轮次」模式下它只是末尾那句推动语）</span></div>
-            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，不要重复开头内容，也不要添加任何前言、解释或标注："></textarea>
+            <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
+            <div id="h_dbg" class="helpbox">两条通道都会在运行日志里打印<b>实际发出</b>的思考档位与采样参数。排查“设置没生效”时先开这个——日志里看到什么，模型就收到了什么。平时可关。</div>
           </div>
-          <p class="text-xs text-neutral-500 leading-relaxed">智能模式：2.5 及更早模型<b>原生透传</b>预填充（模型直接续写）；3.x 拒绝 model 结尾，自动转为末尾 user 续写指令。两者都会把预填充拼回输出开头并自动去重。压制思考时：3.x 压至最低档并不回传思考（无法全关），2.5-flash 预算 0 全关、2.5-pro 降至 128。<b>注意：预填充压制仅在请求真的带预填充时触发；若你的酒馆预设把思维链写在 system 提示里（无预填充），请改用上方“思考强度”卡片的“强制用此设置”。</b></p>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
+            <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。<b>无正文时的原始响应样本总是会自动记录，不需要开这个</b>。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
+            <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
+          </div>
+
+          <div class="pt-1 border-t border-neutral-100"></div>
+          <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
+
+          <div>
+            <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
+              <select id="prefill_mode" class="inp" style="width:150px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+            </div>
+            <div id="h_pfm" class="helpbox">
+              <b>什么是预填充</b>：请求里<b>最后一条 assistant 消息</b>（酒馆预设里通常是最底部那条“助手”条目，内容多为思维链的开标签）。它替模型写好了回复开头，模型只能顺着往下写——这是破限最强的杠杆，也用来顶掉原生思维链。预设里那些 system 条目<b>不是</b>预填充。<br>
+              <b>为什么需要兼容</b>：Gemini 3.x 拒绝以 assistant 结尾的请求（400），必须改造成 user 结尾。<br><br>
+              <b>智能（默认）</b>：删掉那条 assistant，把它的文字并进最后一条 user。模型视角＝“用户给了我一段参考文字”。输出干净（实测开闭标签各 1 个），但模型没有“说过”这句话，破限杠杆最弱。<br>
+              <b>保留模型轮次</b>：assistant 原样留着，后面补一句很短的 user 推动语。模型视角＝“这是我自己写了一半的”，破限杠杆保留。代价是模型容易当成新一轮、<b>把开标签再写一遍</b>（实测 3/3）。<br>
+              <b>最小</b>：只补占位 user 保证不报错，<b>不把预填充拼回输出</b>——思考开标签会缺失，前端正则可能抓不到。<br>
+              <b>关闭</b>：原样发出，3.x 直接 400；而且代理检测不到预填充，思考压制也不会触发。<br><br>
+              2.5 及更早的模型不受影响，走的是<b>原生透传</b>，效果等同老式预填充。
+            </div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
+            <div id="h_pst" class="helpbox">检测到预填充时，把模型的<b>原生思维链压到最低并不回传</b>，让预设自带的思维链接管（写作效果通常更好，也避免“只有思考没有正文”）。<br>3.x 压到最低档（无法完全关闭），2.5-flash 预算 0 全关，2.5-pro 降到 128。<br><b>只在请求真的带预填充时才触发</b>；若你的预设把思维链写在 system 里、没有 assistant 条目，请改用上方“思考强度”卡片的“关闭原生思考”。</div>
+          </div>
+          <div>
+            <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
+            <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
+            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。</div>
+          </div>
+
+          <div class="pt-1 border-t border-neutral-100"></div>
+          <div class="text-xs font-semibold text-neutral-500 pt-1">控制台注入 <span class="text-neutral-400 font-normal">（留空＝不启用）</span></div>
+
+          <div>
+            <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
+            <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
+          </div>
+          <div>
+            <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
+            <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
+            <div id="h_injp" class="helpbox">
+              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
+              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
+              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
+              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 跳过；④ 留空 → 完全不启用。<br>
+              建议配合右上角<b>“保存为该模型专属”</b>：只给跑角色扮演的模型开，问答模型保持干净（否则每条回复开头都会多出这段文字，而且原生思考会被压制、影响答题深度）。
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -561,7 +620,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
@@ -677,6 +736,8 @@ function renderCaps(){
 }
 function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
 function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
+// 说明折叠：点 ⓘ 展开/收起对应的说明块
+function hlp(el,id){const b=document.getElementById(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);}
 async function saveSettings(){
   // 基础设施级设置：始终作为全局保存
   const patch={
@@ -694,6 +755,8 @@ async function saveSettings(){
     debug_outbound:$('debug_outbound').checked,
     image_system_instruction:$('image_system_instruction').checked,
     prefill_mode:$('prefill_mode').value,
+    inject_system_instruction:$('inject_system_instruction').value,
+    inject_prefill:$('inject_prefill').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
     prefill_instruction:$('prefill_instruction').value,
   };

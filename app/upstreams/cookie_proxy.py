@@ -25,6 +25,7 @@ from runtime_state import app_state
 import config as app_config
 import model_capabilities as mc
 from message_processing import (
+    apply_console_injection,
     apply_prefill_compat,
     strip_prefill_overlap,
     PrefillDeduper,
@@ -782,6 +783,21 @@ class CookieProxyUpstream(BaseUpstream):
         _profile = mc.get_profile(base_model_name)
         prefill_text = ""
         prefill_active = False
+        # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
+        # 本通道入口已拒绝工具流量，故 has_tools 恒为 False。
+        _inj_settings = app_state.get_effective_settings(base_model_name)
+        _injected, _inj_notes = apply_console_injection(
+            request_obj.messages,
+            system_text=_inj_settings.get("inject_system_instruction", ""),
+            prefill_text=_inj_settings.get("inject_prefill", ""),
+            has_tools=False,
+            is_image_model=_profile["is_image"],
+        )
+        for _n in _inj_notes:
+            print(_n)
+        if _injected is not request_obj.messages:
+            request_obj = request_obj.model_copy(update={"messages": _injected})
+
         _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
         if _prefill_mode != "off":
             _new_msgs, prefill_text, prefill_active = apply_prefill_compat(

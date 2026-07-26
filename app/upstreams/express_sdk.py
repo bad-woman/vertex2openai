@@ -13,7 +13,8 @@ from api_helpers import (
     execute_gemini_call,
     create_openai_error_response,
 )
-from message_processing import create_gemini_prompt, apply_prefill_compat
+from message_processing import (create_gemini_prompt, apply_prefill_compat,
+                                apply_console_injection)
 from http_options import get_http_options
 import model_capabilities as mc
 from runtime_state import app_state
@@ -141,6 +142,21 @@ class ExpressSDKUpstream(BaseUpstream):
         # - 两者都会把预填充文本拼回输出开头（带去重）。
         prefill_text = ""
         prefill_active = False
+        # 控制台注入（轻量前端用；两个字段都留空时是空操作）。
+        # 必须在 apply_prefill_compat 之前，注入后的消息与前端自发预填充同形。
+        _inj_settings = app_state.get_effective_settings(base_model_name)
+        _injected, _inj_notes = apply_console_injection(
+            request_obj.messages,
+            system_text=_inj_settings.get("inject_system_instruction", ""),
+            prefill_text=_inj_settings.get("inject_prefill", ""),
+            has_tools=bool(getattr(request_obj, "tools", None)),
+            is_image_model=is_image_model,
+        )
+        for _n in _inj_notes:
+            print(_n)
+        if _injected is not request_obj.messages:
+            request_obj = request_obj.model_copy(update={"messages": _injected})
+
         _prefill_mode = app_state.get_setting("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
         if _prefill_mode != "off":
             new_msgs, prefill_text, prefill_active = apply_prefill_compat(
