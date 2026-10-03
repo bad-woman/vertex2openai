@@ -20,8 +20,24 @@ import model_capabilities as mc
 from model_loader import get_express_models
 
 from cookie_auth import validate_cookie
+import express_key_probe
+from resumable import resumable_store
 
 express_key_manager = ExpressKeyManager()
+
+
+async def _probe_express_projects_on_startup() -> None:
+    """启动后异步探测尚无 Project ID 的 Express Key（失败不影响服务）。"""
+    try:
+        pending = [r["key"] for r in app_state.get_express_keys() if not r.get("project_id")]
+        if not pending:
+            return
+        print(f"🔎 [密钥探测] 启动探测：{len(pending)} 个 Key 尚无 Project ID，正在用不存在的模型名调 generateContent 探测。")
+        await express_key_probe.probe_all(keys=pending)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"⚠️ [密钥探测] 启动探测失败（不影响服务）：{type(e).__name__} - {e}")
 
 
 @asynccontextmanager
@@ -40,12 +56,28 @@ async def lifespan(app: FastAPI):
             )
         print("🔴 [安全警告] API_KEY 仍是默认值 123456！它既是本代理的 Key，也是控制台登录口令，"
               "请立刻改成强口令。")
+    # 多账号 Express Key：环境变量只做**一次性**初始导入，之后以控制台保存的列表为准。
+    # （用户在控制台把列表清空并保存后，这里不会再把环境变量里的 Key 复种回来。）
+    app_state.import_env_express_keys_once(config.VERTEX_EXPRESS_API_KEY_VAL)
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:
-        print("⚠️ [密钥配置] 未检测到 VERTEX_EXPRESS_API_KEY。若不启用 Cookie 直连模式，聊天请求将会报错。")
+        print("⚠️ [密钥配置] 未配置任何 Express API Key（控制台「通道与凭证」页可随时添加）。"
+              "若不启用 Cookie 直连模式，聊天请求将会报错。")
     await refresh_models_config_cache()
-    yield
+
+    # 启动时自动探测各 Key 归属的 GCP Project ID（location 钉定要用）。
+    # 放后台任务里跑：探测走外网，绝不能阻塞服务启动。
+    _probe_task = asyncio.create_task(_probe_express_projects_on_startup())
+    # 过期缓冲清理器（弱网续传用，见 resumable.py）
+    _sweeper_task = asyncio.create_task(resumable_store.sweeper_loop())
+    try:
+        yield
+    finally:
+        for _t in (_probe_task, _sweeper_task):
+            if not _t.done():
+                _t.cancel()
+        resumable_store.cancel_all_pumps()
 
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
 
@@ -345,6 +377,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </label>
       </div>
     </div>
+    <!-- Express API Key 列表（多账号，热编辑） -->
+    <div class="card p-5 mb-4">
+      <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div>
+          <div class="text-sm font-semibold">Express API Key 列表<span class="helpq" onclick="hlp(this,'h_keys')">?</span></div>
+          <div class="text-xs text-neutral-500 mt-0.5">多个谷歌账号的 Key 可一起放这里，按「多 Key 轮询」开关随机或轮询使用</div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="keys-count" class="pill" style="text-transform:none">0 个</span>
+          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="probeAllKeys()">🔎 探测全部项目</button>
+          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addKeyRow()">＋ 添加 Key</button>
+          <button class="btn px-4 py-1.5 text-sm" onclick="saveExpressKeys()">保存 Key 列表</button>
+        </div>
+      </div>
+      <div id="h_keys" class="helpbox">
+        <b>热编辑</b>：增删改后点「保存 Key 列表」立即生效，<b>不需要重启服务</b>。列表存在 <code>web_state.json</code>（文件权限 0600）。<br>
+        <b>Project ID</b>：每个 Key 属于不同的谷歌账号/项目，标准模式的 location 钉定会用<b>这个 Key 自己的项目</b>拼资源路径 <code>projects/{project}/locations/{location}/...</code>，不再共用 Cookie 通道那份全局 Project ID。<br>
+        启动时自动探测填入（用不存在的模型名调一次 generateContent，从上游 404 错误信息里解析项目，不消耗配额；来源显示 <code>auto</code>）；也可点每行的「探测」单独重探，或直接手填（来源变 <code>manual</code>，探测不会覆盖手填值）。<br>
+        探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。<br>
+        <b>环境变量</b> <code>VERTEX_EXPRESS_API_KEY</code> 只在<b>首次启动</b>时一次性导入这里；此后以本列表为准——<b>把列表清空并保存后，重启也不会被环境变量复种</b>。<br>
+        <b>明文显示</b>：本列表按需要明文展示 Key（控制台本身有密码保护）；运行日志里只打掩码。
+      </div>
+      <div id="keys-list" class="space-y-2"></div>
+      <p id="keys-empty" class="text-xs text-neutral-500 mt-2 hidden">当前没有任何 Express Key。点「＋ 添加 Key」粘贴一个，再点「保存 Key 列表」。</p>
+    </div>
+
     <div id="cookie-box" class="card p-5 hidden">
       <div class="lbl mb-2">Google Cookie（含 HttpOnly 字段）</div>
       <textarea id="cookie-input" rows="3" class="inp log mb-3" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Cookie-Editor 导出的 JSON / Header String，自动解析）"></textarea>
@@ -573,6 +631,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="space-y-3">
           <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）</span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
+            <div id="h_rsm" class="helpbox">反代收到 Google 的完整回复后先放进服务端缓冲区再吐给前端；前端断线可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传，也可轮询 <code>/v1/resumable/{id}</code> 拉分片。关掉则回到原有直通行为。</div>
+          </div>
+          <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
@@ -717,6 +781,96 @@ async function loadRuntime(){
   }catch(e){}
 }
 
+/* ---------- Express Key 列表（多账号，热编辑） ---------- */
+let KEYS = [];
+function keySrcPill(rec){
+  if(rec.project_source==='auto') return '<span class="pill" style="text-transform:none">来源 auto</span>';
+  if(rec.project_source==='manual') return '<span class="pill" style="text-transform:none">来源 manual</span>';
+  return '<span class="pill" style="text-transform:none;color:#b45309">未探测</span>';
+}
+function renderKeys(){
+  const box=$('keys-list');
+  box.innerHTML = KEYS.map((rec,i)=>`
+    <div class="border border-neutral-200 rounded-lg p-3" data-i="${i}">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="pill" style="text-transform:none">#${i+1}</span>
+        <input class="inp log k-key" style="flex:1" placeholder="粘贴 Express API Key（明文显示）" value="${(rec.key||'').replace(/"/g,'&quot;')}">
+        <label class="flex items-center gap-1 text-xs text-neutral-500 whitespace-nowrap"><input type="checkbox" class="k-enabled" ${rec.enabled===false?'':'checked'}>启用</label>
+        <button class="px-2 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="probeOneKey(${i})">探测</button>
+        <button class="px-2 py-1 text-xs rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50" onclick="removeKeyRow(${i})">删除</button>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="lbl whitespace-nowrap">Project ID</span>
+        <input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 等待自动探测" value="${(rec.project_id||'').replace(/"/g,'&quot;')}">
+        ${keySrcPill(rec)}
+        <span class="text-xs text-neutral-400">${rec.detected_at?('探测于 '+new Date(rec.detected_at*1000).toLocaleString()):''}</span>
+      </div>
+      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-rose-600':'text-neutral-500'}">${rec._msg||''}</div>
+    </div>`).join('');
+  $('keys-count').textContent = KEYS.length + ' 个';
+  $('keys-empty').classList.toggle('hidden', KEYS.length>0);
+}
+function collectKeys(){
+  // 以输入框的当前内容为准（用户可能改了还没保存）
+  [...document.querySelectorAll('#keys-list [data-i]')].forEach(row=>{
+    const i=Number(row.dataset.i);
+    if(!KEYS[i]) return;
+    KEYS[i].key = row.querySelector('.k-key').value.trim();
+    const pid = row.querySelector('.k-project').value.trim();
+    if(pid !== (KEYS[i].project_id||'')){ KEYS[i].project_id = pid; KEYS[i].project_source = pid?'manual':''; }
+    KEYS[i].enabled = row.querySelector('.k-enabled').checked;
+  });
+  return KEYS.filter(r=>r.key);
+}
+function addKeyRow(){ collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',enabled:true}); renderKeys(); }
+function removeKeyRow(i){ collectKeys(); KEYS.splice(i,1); renderKeys(); }
+async function loadExpressKeys(){
+  try{
+    const d=await (await fetch('/api/express-keys')).json();
+    KEYS=(d.keys||[]).map(r=>Object.assign({},r));
+    renderKeys();
+  }catch(e){}
+}
+async function saveExpressKeys(){
+  const payload=collectKeys();
+  if(payload.length===0 && !confirm('将保存为“空 Key 列表”。\n保存后即使环境变量 VERTEX_EXPRESS_API_KEY 有值，重启也不会再导入。\n确定吗？')) { renderKeys(); return; }
+  try{
+    const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
+    const d=await r.json();
+    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
+    else toast('❌ '+(d.error||'保存失败'));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function probeOneKey(i){
+  collectKeys();
+  const rec=KEYS[i]; if(!rec||!rec.key){ toast('请先填入 Key'); return; }
+  toast('正在探测…');
+  try{
+    const r=await fetch('/api/express-keys/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:rec.key,force:true})});
+    const d=await r.json();
+    if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
+    const res=(d.results||[])[0]||{};
+    await loadExpressKeys();
+    const hit=KEYS.find(x=>x.key===rec.key);
+    if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; renderKeys(); }
+    toast(res.ok?('项目：'+(res.project_id||'—')):('❌ '+(res.message||'探测失败')));
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function probeAllKeys(){
+  collectKeys();
+  toast('正在探测全部 Key…');
+  try{
+    const r=await fetch('/api/express-keys/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true,force:true})});
+    const d=await r.json();
+    if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
+    const results=d.results||[];
+    await loadExpressKeys();
+    results.forEach(res=>{ const hit=KEYS.find(x=>x.key===res.key); if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; } });
+    renderKeys();
+    toast('探测完成：成功 '+results.filter(x=>x.ok).length+' / '+results.length);
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+
 /* ---------- Params ---------- */
 function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
@@ -724,8 +878,8 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','thinking_g25_budget','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
+    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -898,6 +1052,9 @@ async function saveSettings(){
     prefill_mode:$('prefill_mode').value,
     express_location:$('express_location').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
+    resumable_enabled:$('resumable_enabled').checked,
+    resumable_ttl_seconds:numOr('resumable_ttl_seconds',1800),
+    resumable_max_streams:numOr('resumable_max_streams',200),
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
   // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
@@ -928,7 +1085,7 @@ function logLine(t){
   else if(t.includes('❌')||t.includes('ERROR')){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
   else if(t.includes('💰')){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
   let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
-  return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px">${s}</div>`;
+  return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px;white-space:pre-wrap;word-break:break-word">${s}</div>`;
 }
 try{
   const es=new EventSource('/stream-logs');
@@ -940,7 +1097,7 @@ $('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); 
 $('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
 
 /* init */
-fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams();
+fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
 </script>
 </body>
 </html>
@@ -1080,6 +1237,88 @@ async def delete_model_override(model_name: str, _auth: bool = Depends(require_a
     return JSONResponse(content={"status": "success" if ok else "not_found", "model": model_name})
 
 
+# ==========================================
+# Express API Key 列表（多账号，热编辑）
+# ==========================================
+class ExpressKeysBody(BaseModel):
+    keys: list = []
+
+
+class ProbeBody(BaseModel):
+    key: str = ""             # 指定单个 Key 探测
+    all: bool = False         # 探测全部
+    force: bool = False       # 忽略「已有 Project ID / 人工填写」的跳过规则
+
+
+class KeyProjectBody(BaseModel):
+    key: str
+    project_id: str = ""
+
+
+def _express_keys_payload() -> dict:
+    """控制台按用户要求**明文**返回 Key（控制台本身有密码保护）；日志里仍打掩码。"""
+    records = app_state.get_express_keys()
+    return {
+        "keys": records,
+        "total": len(records),
+        "enabled": sum(1 for r in records if r.get("enabled", True)),
+        "roundrobin": bool(app_state.get_setting("roundrobin", config.ROUNDROBIN)),
+        "env_import_done": True,
+    }
+
+
+@app.get("/api/express-keys")
+async def list_express_keys(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=_express_keys_payload())
+
+
+@app.post("/api/express-keys")
+async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require_auth)):
+    """整表覆盖保存（增删改都走这里），立即热生效，无需重启。
+
+    保存空列表是合法操作：之后即使环境变量 VERTEX_EXPRESS_API_KEY 仍有值，
+    启动时也不会再把 Key 复种回来（见 runtime_state.import_env_express_keys_once）。
+    """
+    if not isinstance(body.keys, list):
+        return JSONResponse(status_code=400, content={"error": "keys 必须是数组。"})
+    saved = app_state.set_express_keys(body.keys)
+    express_key_manager.refresh_keys()
+    # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
+    pending = [r["key"] for r in saved if not r.get("project_id")]
+    if pending:
+        asyncio.create_task(express_key_probe.probe_all(keys=pending))
+    payload = _express_keys_payload()
+    payload["status"] = "success"
+    return JSONResponse(content=payload)
+
+
+@app.post("/api/express-keys/probe")
+async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth)):
+    """手动触发探测：指定单个 Key，或 all=true 探测全部。"""
+    if body.all:
+        results = await express_key_probe.probe_all(force=body.force)
+    else:
+        key = (body.key or "").strip()
+        if not key:
+            return JSONResponse(status_code=400, content={"error": "请提供 key，或设 all=true。"})
+        results = [await express_key_probe.probe_and_store(key, force=body.force)]
+    payload = _express_keys_payload()
+    payload["results"] = results
+    return JSONResponse(content=payload)
+
+
+@app.post("/api/express-keys/project")
+async def set_express_key_project(body: KeyProjectBody, _auth: bool = Depends(require_auth)):
+    """人工覆盖某个 Key 的 Project ID（来源标记为 manual，自动探测不会再覆盖它）。"""
+    ok = app_state.update_express_key_project(
+        body.key, body.project_id, source=("manual" if body.project_id.strip() else ""))
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "该 Key 不在列表中。"})
+    payload = _express_keys_payload()
+    payload["status"] = "success"
+    return JSONResponse(content=payload)
+
+
 class CookieSetting(BaseModel):
     cookie: str = ""          # 留空 = 保持现有 Cookie
     project_id: str = ""
@@ -1114,17 +1353,28 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
 
 @app.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
+    def _event_chunks(msg: str):
+        # SSE 规范写法：多行消息必须拆成多个 `data:` 行，浏览器会用换行拼回 e.data。
+        # 之前是 yield f"data: {msg}\n\n"，msg 里的裸换行会导致换行后的每一行被浏览器
+        # 当成未知字段直接丢弃——多行诊断、traceback 在控制台永远只剩第一行，
+        # 只能去 Docker 日志看完整版（2026-10-04 修复）。
+        for line in msg.splitlines() or [""]:
+            yield f"data: {line}\n"
+        yield "\n"
+
     async def log_generator():
         q = rt_logger.subscribe()
         try:
             for msg in rt_logger.snapshot_history():
-                yield f"data: {msg}\n\n"
+                for chunk in _event_chunks(msg):
+                    yield chunk
             while True:
                 if await request.is_disconnected():
                     break
                 try:
                     msg = await asyncio.wait_for(q.get(), timeout=1.0)
-                    yield f"data: {msg}\n\n"
+                    for chunk in _event_chunks(msg):
+                        yield chunk
                 except asyncio.TimeoutError:
                     yield ": keep-alive heartbeat\n\n"
         finally:
