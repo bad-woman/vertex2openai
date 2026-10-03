@@ -237,8 +237,14 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     if request.seed is not None: config["seed"] = request.seed
     if request.n is not None: config["candidate_count"] = request.n
     
-    if getattr(request, "presence_penalty", None) is not None: config["presence_penalty"] = request.presence_penalty
-    if getattr(request, "frequency_penalty", None) is not None: config["frequency_penalty"] = request.frequency_penalty
+    # 第三轮：惩罚参数默认剥离 —— 前端仍可传这两个字段，但反代不发给 Google
+    # （新版 Gemini 收到非零 presence_penalty / frequency_penalty 直接 400）。
+    # 这里不再下发；model_capabilities.sanitize_sampling 按档案做最终兜底剥离。
+    for _pk in ("presence_penalty", "frequency_penalty"):
+        _pv = getattr(request, _pk, None)
+        if _pv:  # 只有非零值才值得提示（0 不会触发 400）
+            if app_state.get_setting("debug_outbound", False):
+                print(f"🔎 [出站调试] 已剥离 {_pk}={_pv}：新版 Gemini 不接受非零惩罚参数，该值不会发给 Google。")
         
     # P1-3：OpenAI 语义 logprobs=bool + top_logprobs=int；Gemini 语义 response_logprobs=bool + logprobs=int。
     _logprobs = getattr(request, "logprobs", None)

@@ -25,7 +25,9 @@ BATCH_GRAPHQL_URL = (
 )
 
 # StreamGenerateContent 的固定签名（登录模式）
-STREAM_GENERATE_QUERY_SIGNATURE = "2/VMwZooA0XN10Wuu2r5N9Hw+S9X+WG4G8k423Pl7/oqw="
+# 2026-10-04 更新：Google 作废了旧签名（QUERY_SIGNATURE_NOT_FOUND），
+# 从 Cloud Console 前端 batchGraphql 请求中重新抓取
+STREAM_GENERATE_QUERY_SIGNATURE = "2/Hc4FpJfYmM+gO5TB0hcjYY0Iwj0rqLIVDZOhurBbu/I="
 STREAM_GENERATE_OPERATION_NAME = "StreamGenerateContent"
 
 # SAPISIDHASH 计算使用的 origin

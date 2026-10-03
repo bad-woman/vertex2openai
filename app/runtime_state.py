@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 
 import config as app_config
 
@@ -103,6 +104,120 @@ class AppState:
     def get_project_id(self) -> str:
         with self._lock:
             return self._state.get("google_project_id", "")
+
+    # ---------- Express API Key（多账号，可热编辑） ----------
+    # 记录形态：{"key":..., "project_id":..., "project_source":"auto|manual|", 
+    #            "detected_at": 时间戳, "note":..., "enabled": True}
+    # 一个 Key 对应一个谷歌账号/项目，所以 Project ID 必须**跟着 Key 走**，
+    # 不能共用 Cookie 通道那份全局 Project ID（见 express_sdk.resolve_express_model_path）。
+
+    @staticmethod
+    def _normalize_express_record(item) -> dict:
+        if isinstance(item, str):
+            item = {"key": item}
+        if not isinstance(item, dict):
+            return {}
+        key = str(item.get("key", "") or "").strip()
+        if not key:
+            return {}
+        source = str(item.get("project_source", "") or "").strip().lower()
+        if source not in ("auto", "manual"):
+            source = ""
+        return {
+            "key": key,
+            "project_id": str(item.get("project_id", "") or "").strip(),
+            "project_source": source,
+            "detected_at": item.get("detected_at") or 0,
+            "note": str(item.get("note", "") or "").strip(),
+            "enabled": bool(item.get("enabled", True)),
+        }
+
+    def get_express_keys(self) -> list:
+        with self._lock:
+            stored = self._state.get("express_keys")
+            if not isinstance(stored, list):
+                return []
+            out = []
+            for item in stored:
+                rec = self._normalize_express_record(item)
+                if rec:
+                    out.append(rec)
+            return out
+
+    def set_express_keys(self, records: list) -> list:
+        """整表覆盖保存（控制台的增删改都走这里）。
+
+        同时打上 express_keys_initialized 标记：**用户保存空列表后，
+        启动时不得再从环境变量把 Key 导回来**（否则删不掉）。
+        """
+        clean, seen = [], set()
+        for item in (records or []):
+            rec = self._normalize_express_record(item)
+            if not rec or rec["key"] in seen:
+                continue
+            seen.add(rec["key"])
+            clean.append(rec)
+        with self._lock:
+            self._state["express_keys"] = clean
+            self._state["express_keys_initialized"] = True
+            self._save()
+            print(f"🔑 [状态管理器] 已保存 {len(clean)} 个 Express API Key（明文存于 web_state.json，权限 0600）。")
+        return clean
+
+    def update_express_key_project(self, key: str, project_id: str, source: str = "auto") -> bool:
+        """写回某个 Key 的 Project ID（自动探测或人工覆盖）。"""
+        key = (key or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            stored = self._state.get("express_keys")
+            if not isinstance(stored, list):
+                return False
+            changed = False
+            new_list = []
+            for item in stored:
+                rec = self._normalize_express_record(item)
+                if not rec:
+                    continue
+                if rec["key"] == key:
+                    rec["project_id"] = (project_id or "").strip()
+                    rec["project_source"] = source if source in ("auto", "manual") else ""
+                    rec["detected_at"] = time.time()
+                    changed = True
+                new_list.append(rec)
+            if changed:
+                self._state["express_keys"] = new_list
+                self._save()
+            return changed
+
+    def import_env_express_keys_once(self, env_keys: list) -> int:
+        """把环境变量 VERTEX_EXPRESS_API_KEY 做**一次性**初始导入。
+
+        只在从未保存过（没有 express_keys_initialized 标记）时执行，
+        因此用户在控制台把 Key 全删光并保存后，重启也不会被环境变量重新灌回来。
+        """
+        with self._lock:
+            if self._state.get("express_keys_initialized"):
+                return 0
+            existing = self._state.get("express_keys")
+            if isinstance(existing, list) and existing:
+                self._state["express_keys_initialized"] = True
+                self._save()
+                return 0
+            clean, seen = [], set()
+            for k in (env_keys or []):
+                k = str(k or "").strip()
+                if not k or k in seen:
+                    continue
+                seen.add(k)
+                clean.append(self._normalize_express_record({"key": k}))
+            self._state["express_keys"] = clean
+            self._state["express_keys_initialized"] = True
+            self._save()
+            if clean:
+                print(f"📥 [状态管理器] 已从环境变量 VERTEX_EXPRESS_API_KEY 一次性导入 {len(clean)} 个 Key，"
+                      "此后以控制台保存的列表为准。")
+            return len(clean)
 
     # ---------- 控制台可调设置 ----------
 

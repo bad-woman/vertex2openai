@@ -28,6 +28,13 @@ SAMPLING_KEYS = {
     "candidate_count", "seed", "stop_sequences", "max_output_tokens",
 }
 
+# 惩罚参数：新版 Gemini 收到非零 presence_penalty / frequency_penalty 直接 400。
+# 默认从所有模型档案的 allowed_sampling 剔除（由 sanitize_sampling 自动剥离）；
+# 前端仍可传这两个字段，但反代不会把它们发给 Google。
+PENALTY_KEYS = {
+    "presence_penalty", "frequency_penalty",
+}
+
 # ---- 生图分辨率与比例白名单 ----
 # 出处：ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite-image
 #      「1:1, 3:2, 2:3, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9 aspect ratios」（核对于 2026-07-26）
@@ -173,6 +180,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             default_level = "medium"
         allowed = set(SAMPLING_KEYS)
         allowed.discard("candidate_count")  # 所有 Gemini 3.x 不支持 candidate_count
+        allowed -= PENALTY_KEYS  # 惩罚参数默认剥离：新版 Gemini 收到非零值直接 400
         temp_dep = _temp_deprecated(name)
         if temp_dep:
             allowed -= {"temperature", "top_p", "top_k"}
@@ -209,7 +217,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "budget_min": budget_min,
             "budget_max": budget_max,
             "budget_can_zero": can_zero,
-            "allowed_sampling": set(SAMPLING_KEYS),
+            "allowed_sampling": set(SAMPLING_KEYS) - PENALTY_KEYS,
             "supports_search": True,
             "requires_user_last_turn": False,
         }
@@ -219,7 +227,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         "family": "legacy",
         "is_image": False,
         "thinking_kind": None,
-        "allowed_sampling": set(SAMPLING_KEYS),
+        "allowed_sampling": set(SAMPLING_KEYS) - PENALTY_KEYS,
         "supports_search": True,
         "requires_user_last_turn": False,
     }
