@@ -32,7 +32,7 @@ async def _probe_express_projects_on_startup() -> None:
         pending = [r["key"] for r in app_state.get_express_keys() if not r.get("project_id")]
         if not pending:
             return
-        print(f"🔎 [密钥探测] 启动探测：{len(pending)} 个 Key 尚无 Project ID，正在通过 Identity Toolkit 查询。")
+        print(f"🔎 [密钥探测] 启动探测：{len(pending)} 个 Key 尚无 Project ID，正在用不存在的模型名调 generateContent 探测。")
         await express_key_probe.probe_all(keys=pending)
     except asyncio.CancelledError:
         raise
@@ -394,7 +394,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div id="h_keys" class="helpbox">
         <b>热编辑</b>：增删改后点「保存 Key 列表」立即生效，<b>不需要重启服务</b>。列表存在 <code>web_state.json</code>（文件权限 0600）。<br>
         <b>Project ID</b>：每个 Key 属于不同的谷歌账号/项目，标准模式的 location 钉定会用<b>这个 Key 自己的项目</b>拼资源路径 <code>projects/{project}/locations/{location}/...</code>，不再共用 Cookie 通道那份全局 Project ID。<br>
-        启动时自动通过 Identity Toolkit 接口探测填入（来源显示 <code>auto</code>）；也可点每行的「探测」单独重探，或直接手填（来源变 <code>manual</code>，探测不会覆盖手填值）。<br>
+        启动时自动探测填入（用不存在的模型名调一次 generateContent，从上游 404 错误信息里解析项目，不消耗配额；来源显示 <code>auto</code>）；也可点每行的「探测」单独重探，或直接手填（来源变 <code>manual</code>，探测不会覆盖手填值）。<br>
         探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。<br>
         <b>环境变量</b> <code>VERTEX_EXPRESS_API_KEY</code> 只在<b>首次启动</b>时一次性导入这里；此后以本列表为准——<b>把列表清空并保存后，重启也不会被环境变量复种</b>。<br>
         <b>明文显示</b>：本列表按需要明文展示 Key（控制台本身有密码保护）；运行日志里只打掩码。
