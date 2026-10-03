@@ -139,7 +139,8 @@ def _log_resolved_endpoint(client: Any) -> None:
         print(f"⚠️ [上游端点] 读取端点解析结果失败（不影响调用）：{e}")
 
 
-def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
+def resolve_express_model_path(base_model_name: str, settings: dict,
+                               key_project_id: str = "") -> str:
     """把模型名解析成实际下发给 SDK 的 model 值。
 
     留空 express_location → 返回裸模型名，走 express 端点格式：
@@ -153,9 +154,11 @@ def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
       google-genai 的 t_model() 对以 "projects/" 开头的 model 原样透传，
       因此不需要（也不能）给 Client 传 location —— api_key 与 project/location 互斥。
 
-    项目 ID 直接取「通道与凭证」页填的那个（或环境变量 GOOGLE_PROJECT_ID）——
-    一个人通常只有一个 Express 项目，不再单独配一份。
-    拿不到项目 ID 就退回裸模型名（并提示），绝不拼出半截路径。
+    项目 ID 的取值顺序（多账号支持）：
+      ① 本次选中的那个 Express Key **自己的** Project ID（启动时自动探测或人工填写）；
+      ② 环境变量 GOOGLE_PROJECT_ID / 「通道与凭证」里的全局 Project ID（旧行为兜底）；
+      ③ 都没有 → 退回裸模型名（并提示），绝不拼出半截路径。
+    ①在多账号轮换时是必须的：Key 与项目一一对应，用别人的项目会 403（需要计费/无权）。
     """
     if base_model_name.startswith(("projects/", "publishers/", "models/")):
         return base_model_name          # 客户端已自带完整路径，尊重它
@@ -164,10 +167,13 @@ def resolve_express_model_path(base_model_name: str, settings: dict) -> str:
     if not location:
         return base_model_name
 
-    project = (app_config.GOOGLE_PROJECT_ID or app_state.get_project_id() or "").strip()
+    project = (str(key_project_id or "").strip()
+               or app_config.GOOGLE_PROJECT_ID
+               or app_state.get_project_id() or "").strip()
     if not project:
-        print("⚠️ [上游端点] 已选择钉定 location，但没有可用的 Project ID"
-              "（请在控制台「通道与凭证」页填写 Project ID，或设环境变量 GOOGLE_PROJECT_ID），"
+        print("⚠️ [上游端点] 已选择钉定 location，但该 Key 没有可用的 Project ID"
+              "（请在控制台「通道与凭证」页触发探测或手动填写该 Key 的 Project ID，"
+              "也可设环境变量 GOOGLE_PROJECT_ID 兜底），"
               "本次退回默认路由。")
         return base_model_name
 
@@ -199,15 +205,16 @@ class ExpressSDKUpstream(BaseUpstream):
             )
 
         if express_key_manager_instance.get_total_keys() == 0:
-            error_msg = "未配置 VERTEX_EXPRESS_API_KEY，无法调用 Gemini Express Mode。"
+            error_msg = ("未配置任何 Express API Key，无法调用 Gemini Express Mode"
+                         "（请在控制台「通道与凭证」页添加，或设环境变量 VERTEX_EXPRESS_API_KEY）。")
             print(f"❌ [密钥配置] {error_msg}")
             return JSONResponse(
                 status_code=401,
                 content=create_openai_error_response(401, error_msg, "authentication_error"),
             )
 
-        key_tuple = express_key_manager_instance.get_express_api_key()
-        if not key_tuple:
+        key_record = express_key_manager_instance.get_express_record()
+        if not key_record:
             error_msg = "没有可用的 Express API Key。"
             print(f"❌ [密钥配置] {error_msg}")
             return JSONResponse(
@@ -215,9 +222,11 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(401, error_msg, "authentication_error"),
             )
 
-        _, express_api_key = key_tuple
+        express_api_key = key_record["key"]
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        model_to_call = resolve_express_model_path(base_model_name, _inj_settings)
+        # 多账号：location 钉定用**这个 Key 自己的**项目，而不是 Cookie 通道的全局项目
+        model_to_call = resolve_express_model_path(base_model_name, _inj_settings,
+                                                   key_project_id=key_record.get("project_id", ""))
         priority_paygo = should_use_priority_paygo(model_to_call)
 
         client_to_use = genai.Client(
