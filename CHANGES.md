@@ -44,14 +44,14 @@
   `DetachedRequest` 解绑、容量淘汰、TTL 配置。
 - 与原包全量 md5 比对：修改 8 文件、新增 2 文件，无其他改动。
 
-## 修复补丁（2026-09-30，Railway 免费 VM 内 agent 修复、补跑验证）
+## 修复补丁（修复、补跑验证）
 1. 并发去重竞态：`resumable.py` 新增 `ResumableStore.create_if_absent()`（持锁原子占位）；
    `routes/chat_api.py` 的 `_resumable_stream` / `_resumable_json` 改走原子占位，并发同体请求只打一次上游，
    上游失败/非流式响应时经 `_abort_placeholder` 撤占位（给跟读者补错误帧+终止帧）。
 2. 轮询缺 `mark_delivered`：`resumable_poll` 在 `done && end >= next_seq` 时标记已交付，
    纯轮询读完后再发同一请求走新生成而非重放。
 
-## 审计修复（2026-10-02，清宵审计并修复，13 条断言验证通过）
+## 审计修复（2026-10-02，审计并修复，13 条断言验证通过）
 1. 流式占位防僵尸：`_resumable_stream` 在 `await _call_upstream` 期间若任务被取消（客户端断开），
    原 `except Exception` 抓不到 `CancelledError`，占位缓冲会烂在 store 里无人认领——
    同指纹重试会跟读这个死缓冲直到被清扫（默认配置下最长 2 小时）。新增 `except asyncio.CancelledError`
