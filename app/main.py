@@ -1085,7 +1085,7 @@ function logLine(t){
   else if(t.includes('❌')||t.includes('ERROR')){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
   else if(t.includes('💰')){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
   let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
-  return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px">${s}</div>`;
+  return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px;white-space:pre-wrap;word-break:break-word">${s}</div>`;
 }
 try{
   const es=new EventSource('/stream-logs');
@@ -1353,17 +1353,28 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
 
 @app.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
+    def _event_chunks(msg: str):
+        # SSE 规范写法：多行消息必须拆成多个 `data:` 行，浏览器会用换行拼回 e.data。
+        # 之前是 yield f"data: {msg}\n\n"，msg 里的裸换行会导致换行后的每一行被浏览器
+        # 当成未知字段直接丢弃——多行诊断、traceback 在控制台永远只剩第一行，
+        # 只能去 Docker 日志看完整版（2026-10-04 修复）。
+        for line in msg.splitlines() or [""]:
+            yield f"data: {line}\n"
+        yield "\n"
+
     async def log_generator():
         q = rt_logger.subscribe()
         try:
             for msg in rt_logger.snapshot_history():
-                yield f"data: {msg}\n\n"
+                for chunk in _event_chunks(msg):
+                    yield chunk
             while True:
                 if await request.is_disconnected():
                     break
                 try:
                     msg = await asyncio.wait_for(q.get(), timeout=1.0)
-                    yield f"data: {msg}\n\n"
+                    for chunk in _event_chunks(msg):
+                        yield chunk
                 except asyncio.TimeoutError:
                     yield ": keep-alive heartbeat\n\n"
         finally:
