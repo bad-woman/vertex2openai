@@ -4,13 +4,18 @@
 需要拼出 `projects/{project}/locations/{location}/...` 的完整资源路径。
 多账号轮换时每个 Key 的项目都不一样，不能再共用 Cookie 通道那份全局 Project ID。
 
-探测方式：Identity Toolkit 的 `GET /v1/projects?key=API_KEY`。
-该接口用 API Key 本身鉴权，响应 JSON 里带 `projectId`（有的版本叫 `projectNumber`），
-无需任何额外权限，也不消耗模型配额，因此适合在启动时对每个 Key 各探一次。
+探测方式：用「调模型的正确 URL」，把模型名换成一个不存在的模型名发一次请求：
+  POST https://aiplatform.googleapis.com/v1/publishers/google/models/{fake}:generateContent?key={key}
+（这正是 Express 标准模式实际在用的全局端点格式。）
+模型不存在时 Google 返回 404，错误信息里会带上按该 Key 解析出的完整资源路径，
+形如 …projects/{project}/locations/…/publishers/google/models/{fake}… was not found，
+从中提取 project。请求在模型解析阶段即失败，不产生任何 token、不消耗配额；
+Key 本身非法时则返回 400/401/403，顺带校验 Key 有效性。
 探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。
 """
 
 import asyncio
+import re
 import time
 from typing import Optional, Tuple
 
@@ -19,7 +24,11 @@ import httpx
 import config as app_config
 from runtime_state import app_state
 
-IDENTITY_TOOLKIT_URL = "https://identitytoolkit.googleapis.com/v1/projects"
+# 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
+GENERATE_CONTENT_URL = (
+    "https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent"
+)
+PROBE_FAKE_MODEL = "vertex2openai-probe-nonexistent-model"
 PROBE_TIMEOUT_SECONDS = 15.0
 
 
@@ -41,32 +50,34 @@ def mask_key(key: str) -> str:
 
 
 async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
-    """探测单个 Key 所属的 GCP Project ID。返回 (project_id, 说明)。"""
+    """探测单个 Key 所属的 GCP Project ID。返回 (project_id, 说明)。
+
+    用不存在的模型名调一次 generateContent：Key 有效时上游返回 404，
+    错误信息里带 `projects/{project}/...` 路径，从中提取项目；
+    Key 无效时返回 400/401/403。全程不消耗配额。
+    """
     key = (key or "").strip()
     if not key:
         return None, "Key 为空。"
+    url = GENERATE_CONTENT_URL.format(model=PROBE_FAKE_MODEL)
+    body = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
     try:
         async with httpx.AsyncClient(**_client_args()) as client:
-            resp = await client.get(IDENTITY_TOOLKIT_URL, params={"key": key})
+            resp = await client.post(url, params={"key": key}, json=body)
     except Exception as e:
         return None, f"探测请求失败：{type(e).__name__} - {e}"
 
-    if resp.status_code != 200:
-        detail = resp.text[:200]
-        return None, f"探测接口返回 HTTP {resp.status_code}：{detail}"
-
-    try:
-        data = resp.json()
-    except Exception:
-        return None, "探测接口返回的不是 JSON。"
-
-    project_id = data.get("projectId") or data.get("project_id")
-    if not project_id:
-        number = data.get("projectNumber") or data.get("project_number")
-        if number:
-            return str(number), "仅返回项目编号（projectNumber），已按编号填入。"
-        return None, "探测响应里没有 projectId 字段。"
-    return str(project_id), "探测成功。"
+    text = resp.text or ""
+    if resp.status_code == 404:
+        m = re.search(r"projects/([^/\"'`\s]+)", text)
+        if m:
+            project = m.group(1)
+            tag = "（项目编号，可直接用于资源路径）" if project[:1].isdigit() else ""
+            return project, f"探测成功{tag}：从上游 404 错误信息中解析出项目。"
+        return None, f"上游返回 404，但错误信息里没有项目路径：{text[:200]}"
+    if resp.status_code in (400, 401, 403):
+        return None, f"Key 可能无效或无权访问（HTTP {resp.status_code}）：{text[:200]}"
+    return None, f"探测接口返回 HTTP {resp.status_code}：{text[:200]}"
 
 
 async def probe_and_store(key: str, *, force: bool = False) -> dict:
