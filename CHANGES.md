@@ -44,7 +44,7 @@
   `DetachedRequest` 解绑、容量淘汰、TTL 配置。
 - 与原包全量 md5 比对：修改 8 文件、新增 2 文件，无其他改动。
 
-## 修复补丁（2026-09-30，Railway 免费 VM 内 agent 修复、清宵补跑验证）
+## 修复补丁（2026-09-30，Railway 免费 VM 内 agent 修复、补跑验证）
 1. 并发去重竞态：`resumable.py` 新增 `ResumableStore.create_if_absent()`（持锁原子占位）；
    `routes/chat_api.py` 的 `_resumable_stream` / `_resumable_json` 改走原子占位，并发同体请求只打一次上游，
    上游失败/非流式响应时经 `_abort_placeholder` 撤占位（给跟读者补错误帧+终止帧）。
@@ -59,7 +59,7 @@
 2. 轮询坏游标误标记：`resumable_poll` 在 `from_` 越过末尾的坏游标下也会 `mark_delivered`，
    一次坏游标就挡住后续正常重放。改为仅当 `start <= buf.next_seq`（真正把本轮读到末尾）时才标记交付。
 
-## 签名轮换修复（2026-10-04，用户抓包、清宵换入）
+## 签名轮换修复（2026-10-04，用户抓包、换入）
 - Cookie 直连通道突发全线空回复：上游 `cloudconsole-pa` 返回 `QUERY_SIGNATURE_NOT_FOUND`
   （code 5 "Requested entity was not found"），系 Google 作废了硬编码在
   `app/cookie_auth.py` 的 `STREAM_GENERATE_QUERY_SIGNATURE`（README 已预警此内部接口无兼容性承诺）。
