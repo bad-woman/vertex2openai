@@ -159,6 +159,9 @@ DEFAULT_SETTINGS = {
     "resumable_enabled": True,            # 总开关；关掉则回到原有直通行为
     "resumable_ttl_seconds": 1800,        # 已完成的缓冲保留时长（秒），超时清掉
     "resumable_max_streams": 200,         # 缓冲总数上限，超限淘汰最旧的已完成缓冲
+    # 上面两个数量限制不足以保护图片/base64 或超长输出；以下是内存硬上限（MiB）。
+    "resumable_max_stream_mb": 16,        # 单次响应最多缓冲 16 MiB
+    "resumable_max_total_mb": 128,        # 全部响应缓冲合计最多 128 MiB
     # 按模型单独保存的参数覆盖：{ "模型ID": { 键: 值, ... } }
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},

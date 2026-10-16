@@ -4,6 +4,8 @@ from models import OpenAIRequest
 from auth import get_api_key
 
 import asyncio
+import hashlib
+import hmac
 import json
 
 # 引入运行状态管理器与多通道分发策略
@@ -25,6 +27,8 @@ from resumable import (
     sse_from_buffer,
     frame_with_id,
     DONE_FRAME,
+    ResumableCapacityError,
+    ResumeIdentityMismatch,
 )
 
 router = APIRouter()
@@ -51,11 +55,11 @@ def _request_fingerprint(request_obj: OpenAIRequest) -> str:
 
 
 def _resume_start_seq(fastapi_request: Request) -> int:
-    """续传起点：优先 Last-Event-ID 请求头，其次 ?resume_from= 查询参数，缺省 0。"""
+    """续传起点：Last-Event-ID 指的是“已收到的最后一帧”，故从下一帧续取。"""
     try:
         leid = (fastapi_request.headers.get("last-event-id") or "").strip()
         if leid:
-            return max(0, int(leid))
+            return max(0, int(leid) + 1)
     except (TypeError, ValueError):
         pass
     try:
@@ -65,6 +69,15 @@ def _resume_start_seq(fastapi_request: Request) -> int:
     except (TypeError, ValueError):
         pass
     return 0
+
+
+def _identity_hashes(api_key: str, request_obj: OpenAIRequest) -> tuple[str, str]:
+    """不保存明文 API Key/请求体，只保存用于核对续传 ID 归属的哈希。"""
+    fingerprint = _request_fingerprint(request_obj)
+    return (
+        hashlib.sha256((api_key or "").encode("utf-8")).hexdigest(),
+        hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
+    )
 
 
 def _resume_headers(stream_id: str, replay: bool = False) -> dict:
@@ -80,8 +93,8 @@ async def _abort_placeholder(buf, stream_id: str, message: str, code: int = 500)
     撤掉占位是为了不让一个「空壳」缓冲挡住后续重试（跟读者手里还拿着缓冲对象，读得完）。
     """
     err = {"error": {"message": message[:1024], "type": "upstream_error", "code": code}}
-    await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
-    await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
+    await resumable_store.append(buf, frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"), force=True)
+    await resumable_store.append(buf, frame_with_id(buf.next_seq, DONE_FRAME), force=True)
     await buf.finish("error", error=message)
     await resumable_store.drop(stream_id)
 
@@ -94,14 +107,24 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
     """
     stream_id, id_src = compute_stream_id(
         fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
-
-    buf, is_new = await resumable_store.create_if_absent(
-        stream_id, model=request_obj.model, kind="stream")
+    owner_hash, fingerprint_hash = _identity_hashes(api_key, request_obj)
+    try:
+        buf, is_new = await resumable_store.create_if_absent(
+            stream_id, model=request_obj.model, kind="stream",
+            owner_hash=owner_hash, fingerprint_hash=fingerprint_hash)
+    except ResumeIdentityMismatch as e:
+        return JSONResponse(status_code=409, content=create_openai_error_response(409, str(e), "resume_conflict"))
+    except ResumableCapacityError as e:
+        return JSONResponse(status_code=503, content=create_openai_error_response(503, str(e), "resumable_capacity"))
     if not is_new and (buf.kind != "stream" or buf.fully_delivered):
         # 已经完整交付过（或类型对不上）：这次算新一轮生成，撤掉旧缓冲重新占位。
         await resumable_store.drop(stream_id)
-        buf, is_new = await resumable_store.create_if_absent(
-            stream_id, model=request_obj.model, kind="stream")
+        try:
+            buf, is_new = await resumable_store.create_if_absent(
+                stream_id, model=request_obj.model, kind="stream",
+                owner_hash=owner_hash, fingerprint_hash=fingerprint_hash)
+        except ResumableCapacityError as e:
+            return JSONResponse(status_code=503, content=create_openai_error_response(503, str(e), "resumable_capacity"))
     if not is_new:
         # 命中在用的缓冲：重放已缓冲的部分并继续跟随上游直到本轮结束，不再请求上游。
         start = _resume_start_seq(fastapi_request)
@@ -153,14 +176,24 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
     """
     stream_id, id_src = compute_stream_id(
         fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
-
-    buf, is_new = await resumable_store.create_if_absent(
-        stream_id, model=request_obj.model, kind="json")
+    owner_hash, fingerprint_hash = _identity_hashes(api_key, request_obj)
+    try:
+        buf, is_new = await resumable_store.create_if_absent(
+            stream_id, model=request_obj.model, kind="json",
+            owner_hash=owner_hash, fingerprint_hash=fingerprint_hash)
+    except ResumeIdentityMismatch as e:
+        return JSONResponse(status_code=409, content=create_openai_error_response(409, str(e), "resume_conflict"))
+    except ResumableCapacityError as e:
+        return JSONResponse(status_code=503, content=create_openai_error_response(503, str(e), "resumable_capacity"))
     if not is_new and (buf.kind != "json" or buf.fully_delivered):
         # 已完整交付过（或类型对不上）：这次算新一轮生成，撤掉旧缓冲重新占位。
         await resumable_store.drop(stream_id)
-        buf, is_new = await resumable_store.create_if_absent(
-            stream_id, model=request_obj.model, kind="json")
+        try:
+            buf, is_new = await resumable_store.create_if_absent(
+                stream_id, model=request_obj.model, kind="json",
+                owner_hash=owner_hash, fingerprint_hash=fingerprint_hash)
+        except ResumableCapacityError as e:
+            return JSONResponse(status_code=503, content=create_openai_error_response(503, str(e), "resumable_capacity"))
     if not is_new:
         # 命中在用的缓冲：已出结果的直接重放；上游还在算的，等同一个后台泵的结果。
         print(f"↩️ [重放命中] {stream_id}（{id_src}）：直接返回已缓冲的完整回复，不再请求上游。")
@@ -264,6 +297,10 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
             status_code=404,
             content=create_openai_error_response(
                 404, f"未找到响应缓冲 {stream_id}（可能已过期被清理）。", "not_found"))
+    owner_hash, _ = _identity_hashes(api_key, OpenAIRequest(model="resume", messages=[]))
+    if not hmac.compare_digest(buf.owner_hash, owner_hash):
+        # 返回 404，避免把缓冲 ID 当作跨 Key 的探测接口。
+        return JSONResponse(status_code=404, content=create_openai_error_response(404, "未找到响应缓冲。", "not_found"))
     limit = max(1, min(limit, 500))
     if wait > 0 and not buf.done:
         await buf.wait_for(max(0, from_), min(wait, 25.0))

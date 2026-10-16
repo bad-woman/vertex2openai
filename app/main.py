@@ -629,10 +629,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
-            <div id="h_rsm" class="helpbox">反代收到 Google 的完整回复后先放进服务端缓冲区再吐给前端；前端断线可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传，也可轮询 <code>/v1/resumable/{id}</code> 拉分片。关掉则回到原有直通行为。</div>
+          <div id="h_rsm" class="helpbox">服务端把上游流写入短期缓冲；客户端必须保存 <code>X-Resume-Id</code> 或自行设置 <code>Idempotency-Key</code>，再在断线后用同一请求重试，或轮询 <code>/v1/resumable/{id}</code> 拉分片。普通 OpenAI 客户端不会自动续传。缓冲只存在当前进程，重启后失效。</div>
           </div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between"><span class="text-sm">单条续传缓冲上限 (MiB)</span><input id="resumable_max_stream_mb" type="number" step="1" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between"><span class="text-sm">续传缓冲总上限 (MiB)</span><input id="resumable_max_total_mb" type="number" step="1" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
@@ -874,7 +876,7 @@ async function loadParams(){
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
+    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams','resumable_max_stream_mb','resumable_max_total_mb'].forEach(k=>setV(k,s[k]));
     ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
     // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
@@ -1046,6 +1048,8 @@ async function saveSettings(){
     resumable_enabled:$('resumable_enabled').checked,
     resumable_ttl_seconds:numOr('resumable_ttl_seconds',1800),
     resumable_max_streams:numOr('resumable_max_streams',200),
+    resumable_max_stream_mb:numOr('resumable_max_stream_mb',16),
+    resumable_max_total_mb:numOr('resumable_max_total_mb',128),
   };
   // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
   // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
