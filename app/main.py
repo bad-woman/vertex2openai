@@ -193,6 +193,16 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>登录 · agentplatform2api</title>
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('ap_theme');
+    if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){
+      document.documentElement.classList.add('dark');
+    }
+  }catch(e){}
+})();
+</script>
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -200,7 +210,7 @@ body{
   background:radial-gradient(circle at 15% 20%, #f5eeff 0%, transparent 45%),
              radial-gradient(circle at 85% 80%, #e8fbf6 0%, transparent 45%),
              #fdfbf9;
-  font-family:'Inter',system-ui,sans-serif;color:#3d354b;
+  font-family:'Inter',system-ui,sans-serif;color:#3d354b;transition:background .25s,color .25s;
 }
 .card{
   background:rgba(255,255,255,.92);backdrop-filter:blur(10px);
@@ -211,8 +221,18 @@ body{
 .inp:focus{border-color:#8b7cf6;background:#fff;box-shadow:0 0 0 3px rgba(139,124,246,.16)}
 .btn{background:linear-gradient(135deg,#8b7cf6 0%,#f48fb1 100%);color:#fff;border-radius:12px;font-weight:600;padding:11px;width:100%;transition:.2s;box-shadow:0 4px 12px rgba(139,124,246,.28)}
 .btn:hover{opacity:.94;transform:translateY(-1px)}
+html.dark body{
+  background:radial-gradient(circle at 15% 20%, rgba(139,124,246,.12) 0%, transparent 45%),
+             radial-gradient(circle at 85% 80%, rgba(95,211,188,.08) 0%, transparent 45%),
+             #15131d;
+  color:#e6e1f2;
+}
+html.dark .card{background:rgba(30,27,41,.94);border-color:#2f2a40;box-shadow:0 12px 32px -10px rgba(0,0,0,.45)}
+html.dark .inp{background:#171421;border-color:#352f47;color:#e6e1f2}
+html.dark .inp:focus{background:#1c1828;border-color:#9d8df8;box-shadow:0 0 0 3px rgba(157,141,248,.2)}
 </style>
-</head><body class="min-h-screen flex items-center justify-center px-4">
+</head><body class="min-h-screen flex items-center justify-center px-4 relative">
+  <button onclick="toggleTheme()" id="theme-btn" class="absolute top-5 right-5 text-xs px-3 py-1.5 rounded-full border border-[#e6dff2] bg-white/80 cursor-pointer" style="color:inherit;background:transparent">🌙 夜间</button>
   <div class="w-full max-w-sm">
     <div class="flex items-center gap-3 mb-6 justify-center">
       <svg width="42" height="42" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="12" fill="url(#lg)"/>
@@ -231,12 +251,23 @@ body{
     </div>
   </div>
 <script>
+function syncThemeBtn(){
+  var isDark=document.documentElement.classList.contains('dark');
+  var b=document.getElementById('theme-btn');
+  if(b) b.textContent=isDark?'☀️ 日间':'🌙 夜间';
+}
+function toggleTheme(){
+  var isDark=document.documentElement.classList.toggle('dark');
+  try{localStorage.setItem('ap_theme',isDark?'dark':'light');}catch(e){}
+  syncThemeBtn();
+}
+syncThemeBtn();
 async function doLogin(e){
   e.preventDefault();
-  const pw=document.getElementById('pw').value;
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+  var pw=document.getElementById('pw').value;
+  var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
   if(r.ok){ location.href='/'; } else {
-    const d=await r.json().catch(()=>({}));
+    var d=await r.json().catch(function(){return {};});
     document.getElementById('err').textContent=d.error||'密码错误，请重试';
   }
   return false;
@@ -247,7 +278,7 @@ async function doLogin(e){
 
 
 # ==========================================
-# 控制台（马卡龙柔和配色，单文件，免构建）
+# 控制台（马卡龙日间 + 柔和护眼夜间双模式，内部零反引号）
 # ==========================================
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -255,6 +286,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>agentplatform2api · 控制台</title>
+<script>
+(function(){
+  try{
+    var t=localStorage.getItem('ap_theme');
+    if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){
+      document.documentElement.classList.add('dark');
+    }
+  }catch(e){}
+})();
+</script>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -265,6 +306,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --muted:#7d738e;
     --fg:#3b334a;
     --bg:#fdfbf9;
+    --card-bg:rgba(255,255,255,.94);
+    --inp-bg:#ffffff;
+    --inp-dis:#f7f5fa;
     --accent:#8b7cf6;
     --accent2:#f48fb1;
     --accent-hover:#7665e8;
@@ -276,6 +320,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --coral-text:#d64860;
     --sky:#74b9ff;
   }
+  html.dark {
+    --border:#2f2a40;
+    --muted:#9a90b0;
+    --fg:#e6e1f2;
+    --bg:#15131d;
+    --card-bg:rgba(30,27,41,.94);
+    --inp-bg:#171421;
+    --inp-dis:#211d2c;
+    --accent:#9d8df8;
+    --accent2:#f48fb1;
+    --accent-hover:#8b7cf6;
+    --mint:#5fd3bc;
+    --mint-text:#65dbc4;
+    --apricot:#f8c27a;
+    --apricot-text:#fad096;
+    --coral:#f68697;
+    --coral-text:#ff9bab;
+    --sky:#74b9ff;
+  }
   * { -webkit-font-smoothing:antialiased; }
   body {
     background:
@@ -285,17 +348,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       var(--bg);
     color:var(--fg);
     font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+    transition:background-color .25s ease, color .25s ease;
+  }
+  html.dark body {
+    background:
+      radial-gradient(circle at 8% 12%, rgba(139,124,246,.10) 0%, transparent 42%),
+      radial-gradient(circle at 92% 18%, rgba(95,211,188,.07) 0%, transparent 42%),
+      radial-gradient(circle at 50% 90%, rgba(244,143,177,.06) 0%, transparent 45%),
+      var(--bg);
   }
   .card {
-    background:rgba(255,255,255,.94);
+    background:var(--card-bg);
     border:1px solid var(--border);
     border-radius:16px;
     box-shadow:0 4px 18px -4px rgba(139,124,246,.07);
+    transition:background-color .25s ease, border-color .25s ease;
   }
+  html.dark .card { box-shadow:0 6px 22px -6px rgba(0,0,0,.45); }
   .stat-total { background:linear-gradient(145deg,#ffffff 0%,#f6f2ff 100%); border-color:#e6defa; }
   .stat-ok    { background:linear-gradient(145deg,#ffffff 0%,#eefcf8 100%); border-color:#d5f5ec; }
   .stat-retry { background:linear-gradient(145deg,#ffffff 0%,#fff9ef 100%); border-color:#fae7c8; }
   .stat-err   { background:linear-gradient(145deg,#ffffff 0%,#fff2f5 100%); border-color:#fbd5dc; }
+  html.dark .stat-total { background:linear-gradient(145deg,#1e1b29 0%,#251f3d 100%); border-color:#382e5c; }
+  html.dark .stat-ok    { background:linear-gradient(145deg,#1e1b29 0%,#182e2b 100%); border-color:#234740; }
+  html.dark .stat-retry { background:linear-gradient(145deg,#1e1b29 0%,#2f251a 100%); border-color:#4c3b24; }
+  html.dark .stat-err   { background:linear-gradient(145deg,#1e1b29 0%,#331d25 100%); border-color:#522b38; }
+
   .lbl { font-size:12px; color:var(--muted); font-weight:500; }
   .val { font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
   .btn {
@@ -310,12 +388,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-radius:10px; font-weight:500; transition:.15s;
   }
   .btn-soft:hover { background:#f0ebff; border-color:#d2c5f8; }
+  html.dark .btn-soft {
+    background:#252036; color:#b8abff; border-color:#3b3354;
+  }
+  html.dark .btn-soft:hover { background:#2e2842; border-color:#4e4370; }
+
   .inp {
-    border:1px solid var(--border); border-radius:10px; background:#fff;
+    border:1px solid var(--border); border-radius:10px; background:var(--inp-bg);
     font-size:14px; padding:8px 11px; width:100%; outline:none; transition:.15s; color:var(--fg);
   }
-  .inp:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(139,124,246,.14); }
-  .inp:disabled { background:#f7f5fa; color:#b0a8be; }
+  .inp:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(139,124,246,.16); }
+  .inp:disabled { background:var(--inp-dis); color:#888098; }
   .tab {
     padding:13px 6px; font-size:14px; font-weight:600; color:var(--muted);
     border-bottom:2.5px solid transparent; cursor:pointer; white-space:nowrap; transition:.15s;
@@ -325,19 +408,33 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .pill {
     display:inline-flex; align-items:center; gap:6px; font-size:12px;
     padding:3.5px 11px; border-radius:999px; border:1px solid var(--border);
-    background:#fff; color:#655b77;
+    background:var(--inp-bg); color:var(--muted); transition:.15s;
   }
   .pill-accent {
     border-color:#e2d9fc;
     background:linear-gradient(135deg,rgba(139,124,246,.12),rgba(244,143,177,.12));
     color:#6b5bd6; font-weight:600;
   }
+  html.dark .pill-accent {
+    border-color:#3d335c;
+    background:linear-gradient(135deg,rgba(139,124,246,.22),rgba(244,143,177,.16));
+    color:#c1b6ff;
+  }
   .pill-mint { border-color:#cdeee5; background:#eefcf8; color:var(--mint-text); font-weight:600; }
+  html.dark .pill-mint { border-color:#244a42; background:rgba(95,211,188,.14); color:#6de0c9; }
   .pill-apricot { border-color:#f9e2be; background:#fff8ee; color:var(--apricot-text); font-weight:600; }
+  html.dark .pill-apricot { border-color:#4d3b24; background:rgba(248,194,122,.14); color:#fad096; }
+
   .log { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
+  .log-item { cursor:pointer; transition:filter .12s ease; }
+  .log-item:hover { filter:brightness(0.96); }
+  html.dark .log-item:hover { filter:brightness(1.15); }
   ::-webkit-scrollbar{width:8px;height:8px}
   ::-webkit-scrollbar-thumb{background:#dfd8ec;border-radius:8px}
   ::-webkit-scrollbar-thumb:hover{background:#c9bfe0}
+  html.dark ::-webkit-scrollbar-thumb{background:#352f47}
+  html.dark ::-webkit-scrollbar-thumb:hover{background:#473f5e}
+
   .toast {
     position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
     background:linear-gradient(135deg,#4a3f63,#635380); color:#fff;
@@ -349,6 +446,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .switch { position:relative; width:40px; height:22px; display:inline-block; }
   .switch input{opacity:0;width:0;height:0}
   .slider{position:absolute;inset:0;background:#e6e0f0;border-radius:999px;transition:.2s;cursor:pointer}
+  html.dark .slider{background:#342e46}
   .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.15)}
   input:checked + .slider{background:linear-gradient(135deg,#8b7cf6,#5fd3bc)}
   input:checked + .slider:before{transform:translateX(18px)}
@@ -357,22 +455,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border:1px solid var(--border); border-radius:18px;
     box-shadow:0 6px 20px -6px rgba(139,124,246,.09);
   }
+  html.dark .hero {
+    background:linear-gradient(135deg,rgba(32,28,44,.96) 0%,rgba(37,31,54,.94) 55%,rgba(26,38,41,.94) 100%);
+    box-shadow:0 8px 24px -6px rgba(0,0,0,.45);
+  }
   .helpq {
     display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px;
     border-radius:50%; border:1px solid #d5cce6; color:#9286a8; font-size:10px; line-height:1;
     cursor:pointer; user-select:none; vertical-align:middle; margin-left:5px; transition:.15s;
     background:#faf8ff;
   }
+  html.dark .helpq { background:#252036; border-color:#3d3554; color:#a89ec2; }
   .helpq:hover { border-color:var(--accent); color:var(--accent); background:#f2edff; }
+  html.dark .helpq:hover { background:#2f2846; }
   .helpq.on { border-color:var(--accent); color:#fff; background:var(--accent); }
   .helpbox {
     display:none; margin-top:7px; padding:10px 12px; border-radius:10px; background:#faf8fd;
     border:1px solid #ece5f7; font-size:12px; line-height:1.75; color:#5e5470;
   }
+  html.dark .helpbox { background:#181523; border-color:#2f2942; color:#b5abc9; }
   .helpbox.show { display:block; }
   .helpbox, .helpbox code { overflow-wrap:anywhere; word-break:break-word; }
   .helpbox code { display:inline; white-space:normal; background:#ede6fa; color:#5a48b8; padding:1px 5px; border-radius:5px; font-size:11px; }
+  html.dark .helpbox code { background:#2b2442; color:#c4b8ff; }
   .helpbox b { color:var(--fg); }
+
+  html.dark .key-row { background:#181523 !important; border-color:#2f2942 !important; }
+  html.dark .opt-card:hover { background:#231e33 !important; }
+  html.dark .divider-line { border-color:#2b263b !important; }
+  html.dark #logwin { background:#121018 !important; }
+  html.dark .log-header { background:#191624 !important; border-color:#2f2a40 !important; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -394,15 +506,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <p class="text-xs text-[#7d738e] mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
       </div>
     </div>
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 flex-wrap">
       <span class="pill pill-accent" id="mode-pill">通道 —</span>
       <span class="pill pill-mint"><span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" style="background:#5fd3bc"></span><span class="relative inline-flex rounded-full h-2 w-2" style="background:#2eb89e"></span></span><span id="uptime">运行中</span></span>
-      <button onclick="logout()" class="pill hover:bg-[#f7f4fc]" style="cursor:pointer" title="退出登录">退出</button>
+      <button onclick="toggleTheme()" id="theme-btn" class="pill hover:opacity-85" style="cursor:pointer" title="切换日间马卡龙 / 夜间护眼模式">🌙 夜间护眼</button>
+      <button onclick="logout()" class="pill hover:opacity-85" style="cursor:pointer" title="退出登录">退出</button>
     </div>
   </header>
 
   <!-- Tabs -->
-  <nav class="flex gap-6 border-b border-[#ece5f5] mb-6 overflow-x-auto">
+  <nav class="flex gap-6 border-b border-[#ece5f5] divider-line mb-6 overflow-x-auto">
     <div class="tab active" data-tab="overview" onclick="switchTab('overview')">数据概览</div>
     <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
     <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
@@ -412,7 +525,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Overview -->
   <section id="view-overview">
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3.5 mb-4">
-      <div class="card stat-total p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1" style="color:#6b5bd6">0</div></div>
+      <div class="card stat-total p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1" style="color:var(--accent)">0</div></div>
       <div class="card stat-ok p-4"><div class="lbl">成功响应</div><div id="s-success" class="val text-2xl font-bold mt-1" style="color:var(--mint-text)">0</div></div>
       <div class="card stat-retry p-4"><div class="lbl">拥堵重试</div><div id="s-retries" class="val text-2xl font-bold mt-1" style="color:var(--apricot-text)">0</div></div>
       <div class="card stat-err p-4"><div class="lbl">错误 / 拦截</div><div id="s-error" class="val text-2xl font-bold mt-1" style="color:var(--coral-text)">0</div></div>
@@ -434,14 +547,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="lbl mb-4">Token 算力消耗 <span class="text-[#9a90ab]" style="text-transform:none;font-weight:400">· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
         <div class="space-y-4">
           <div>
-            <div class="flex justify-between text-sm mb-1.5"><span class="text-[#5e5470]">Prompt（输入）</span><span id="t-prompt" class="val font-semibold" style="color:#6b5bd6">0</span></div>
-            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden"><div id="bar-prompt" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#8b7cf6,#74b9ff)"></div></div>
+            <div class="flex justify-between text-sm mb-1.5"><span class="lbl" style="font-size:13px">Prompt（输入）</span><span id="t-prompt" class="val font-semibold" style="color:var(--accent)">0</span></div>
+            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden" style="background:rgba(139,124,246,.12)"><div id="bar-prompt" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#8b7cf6,#74b9ff)"></div></div>
           </div>
           <div>
-            <div class="flex justify-between text-sm mb-1.5"><span class="text-[#5e5470]">Completion（思考与输出）</span><span id="t-comp" class="val font-semibold" style="color:var(--mint-text)">0</span></div>
-            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden"><div id="bar-comp" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#5fd3bc,#f48fb1)"></div></div>
+            <div class="flex justify-between text-sm mb-1.5"><span class="lbl" style="font-size:13px">Completion（思考与输出）</span><span id="t-comp" class="val font-semibold" style="color:var(--mint-text)">0</span></div>
+            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden" style="background:rgba(139,124,246,.12)"><div id="bar-comp" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#5fd3bc,#f48fb1)"></div></div>
           </div>
-          <div class="pt-4 border-t border-[#f0eaf8] flex justify-between items-center"><span class="lbl">累计总消耗</span><span id="t-total" class="val text-xl font-bold" style="color:#5344a8">0</span></div>
+          <div class="pt-4 border-t border-[#f0eaf8] divider-line flex justify-between items-center"><span class="lbl">累计总消耗</span><span id="t-total" class="val text-xl font-bold" style="color:var(--accent)">0</span></div>
         </div>
       </div>
     </div>
@@ -452,11 +565,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card p-5 mb-4">
       <div class="lbl mb-3">上游调用通道</div>
       <div class="flex flex-col sm:flex-row gap-3">
-        <label class="flex-1 border border-[#e6dff2] rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-api">
+        <label class="flex-1 border border-[#e6dff2] divider-line opt-card rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-api">
           <input type="radio" name="mode" value="api_key" class="mt-1 accent-[#8b7cf6]" onchange="updateMode('api_key')">
           <div><div class="font-semibold text-sm">Express API Key（标准模式）</div><div class="text-xs text-[#7d738e] mt-0.5">使用官方 google-genai SDK + 多账号 Express Key 轮询调用</div></div>
         </label>
-        <label class="flex-1 border border-[#e6dff2] rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-web">
+        <label class="flex-1 border border-[#e6dff2] divider-line opt-card rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-web">
           <input type="radio" name="mode" value="web_proxy" class="mt-1 accent-[#8b7cf6]" onchange="updateMode('web_proxy')">
           <div><div class="font-semibold text-sm">Cookie 直连反代（Studio 模式）</div><div class="text-xs text-[#7d738e] mt-0.5">使用控制台 Cookie + SAPISIDHASH 直连 batchGraphql</div></div>
         </label>
@@ -534,7 +647,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <select id="thinking_g3_level" class="inp"><option value="">自动（按模型默认）</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
         </div>
         <p id="think-note" class="text-xs text-[#7d738e] mt-2"></p>
-        <div class="mt-3 pt-3 border-t border-[#f0eaf8]">
+        <div class="mt-3 pt-3 border-t border-[#f0eaf8] divider-line">
           <div class="lbl mb-1">原生思考控制（native_thinking_mode）</div>
           <select id="native_thinking_mode" class="inp">
             <option value="request">跟随请求（默认）</option>
@@ -557,7 +670,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <select id="image_aspect_ratio" class="inp"></select>
         </div>
         <p id="image-note" class="text-xs text-[#7d738e] mt-2"></p>
-        <div class="space-y-3 mt-3 pt-3 border-t border-[#f0eaf8]">
+        <div class="space-y-3 mt-3 pt-3 border-t border-[#f0eaf8] divider-line">
           <div class="text-xs text-[#9a90ab]">以下两项可针对生图模型单独开启保存</div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
@@ -578,7 +691,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div><div class="lbl mb-1.5">top_p</div><input id="default_top_p" type="number" step="0.05" class="inp" placeholder="—"></div>
           <div><div class="lbl mb-1.5">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
         </div>
-        <div class="flex items-center justify-between gap-3 mt-5 pt-4 border-t border-[#f0eaf8]">
+        <div class="flex items-center justify-between gap-3 mt-5 pt-4 border-t border-[#f0eaf8] divider-line">
           <span class="text-sm">采样参数处理<span class="helpq" onclick="hlp(this,'h_sp')">?</span></span>
           <select id="sampling_policy" class="inp" style="max-width:170px"><option value="auto">自动判定</option><option value="deprecated">强制剥离</option><option value="allowed">强制保留</option></select>
         </div>
@@ -610,7 +723,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="flex items-center justify-between"><span class="text-sm">思维链守卫（防跳过思考）<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
             <div id="h_cotg" class="helpbox">自动识别预填充中未闭合的思维链开标签（如 <code>&lt;thinking&gt;</code>、<code>&lt;cot&gt;</code>），前置注入格式硬性要求并在输出侧去重双开标签，防止模型跳过思考直接写正文。</div>
           </div>
-          <div class="pt-2 border-t border-[#f0eaf8]">
+          <div class="pt-2 border-t border-[#f0eaf8] divider-line">
             <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
             <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
             <div id="h_injs" class="helpbox">追加到客户端 system 之后。适合 RikkaHub 等轻量前端；酒馆用户已有预设，请留空。</div>
@@ -747,55 +860,77 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Logs -->
   <section id="view-logs" class="hidden">
     <div class="card overflow-hidden">
-      <div class="px-4 py-2.5 border-b border-[#ece5f5] flex items-center gap-2 bg-[#faf8ff]">
-        <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full" style="background:#f68697"></div><div class="w-3 h-3 rounded-full" style="background:#f8c27a"></div><div class="w-3 h-3 rounded-full" style="background:#5fd3bc"></div></div>
-        <span class="ml-2 text-xs text-[#8a7fa0] log">terminal · 实时监控</span>
+      <div class="px-4 py-2.5 border-b border-[#ece5f5] log-header flex items-center justify-between bg-[#faf8ff]">
+        <div class="flex items-center gap-2">
+          <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full" style="background:#f68697"></div><div class="w-3 h-3 rounded-full" style="background:#f8c27a"></div><div class="w-3 h-3 rounded-full" style="background:#5fd3bc"></div></div>
+          <span class="ml-2 text-xs text-[#8a7fa0] log">terminal · 实时监控（点击单条日志即可复制该条）</span>
+        </div>
+        <button class="btn-soft px-2.5 py-1 text-xs" onclick="clearLogs()">清空</button>
       </div>
-      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fdfcff]" style="height:60vh"></div>
+      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fdfcff]" style="height:64vh"></div>
     </div>
   </section>
 </div>
 <div id="toast" class="toast"></div>
 
 <script>
-const $ = id => document.getElementById(id);
-let CAPS = {}, chart = null, curAR = "";
-let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = [
+var $ = function(id){ return document.getElementById(id); };
+var CAPS = {}, chart = null, curAR = "", lastStats = {s:0, e:0, r:0};
+var GLOBAL_SETTINGS = {}, OVERRIDES = {};
+var PER_MODEL_KEYS = [
   'native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio',
   'default_temperature','default_top_p','default_max_tokens',
   'inject_system_instruction','inject_prefill','prefill_instruction',
   'image_system_instruction','inject_prefill_for_image','sampling_policy',
   'prefill_cot_guard','prefill_mode','prefill_suppress_thinking'
 ];
-const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
+var COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
-function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
+function toast(m){ var t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(function(){t.classList.remove('show');},2200); }
 function fmt(n){ return (n||0).toLocaleString('en-US'); }
 async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href='/'; }
 
+/* ---------- 夜间护眼模式切换 ---------- */
+function isDarkMode(){ return document.documentElement.classList.contains('dark'); }
+function syncThemeBtn(){
+  var b=$('theme-btn');
+  if(b) b.textContent = isDarkMode() ? '☀️ 日间马卡龙' : '🌙 夜间护眼';
+}
+function toggleTheme(){
+  var dark = document.documentElement.classList.toggle('dark');
+  try{ localStorage.setItem('ap_theme', dark ? 'dark' : 'light'); }catch(e){}
+  syncThemeBtn();
+  renderChart(lastStats.s, lastStats.e, lastStats.r);
+  rerenderAllLogs();
+}
+syncThemeBtn();
+
 function switchTab(t){
-  document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('active', e.dataset.tab===t));
-  ['overview','channel','params','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
+  document.querySelectorAll('.tab').forEach(function(e){ e.classList.toggle('active', e.dataset.tab===t); });
+  ['overview','channel','params','logs'].forEach(function(v){ $('view-'+v).classList.toggle('hidden', v!==t); });
 }
 
 /* ---------- Overview (Macaron Donut & Dynamic Token Bars) ---------- */
 function renderChart(s,e,r){
-  const ctx=$('donut').getContext('2d');
-  const isEmpty = (s===0 && e===0 && r===0);
-  const labels = isEmpty ? ['暂无请求'] : ['成功响应','拥堵重试','错误 / 拦截'];
-  const data   = isEmpty ? [1] : [s, r, e];
-  const colors = isEmpty ? ['#ede7f8'] : ['#5fd3bc', '#f8c27a', '#f68697'];
+  lastStats = {s:s, e:e, r:r};
+  var ctx=$('donut').getContext('2d');
+  var dark = isDarkMode();
+  var isEmpty = (s===0 && e===0 && r===0);
+  var labels = isEmpty ? ['暂无请求'] : ['成功响应','拥堵重试','错误 / 拦截'];
+  var data   = isEmpty ? [1] : [s, r, e];
+  var emptyColor = dark ? '#2b263b' : '#ede7f8';
+  var borderColor = dark ? '#1e1b29' : '#ffffff';
+  var colors = isEmpty ? [emptyColor] : ['#5fd3bc', '#f8c27a', '#f68697'];
 
-  const totalDone = s + e;
-  const rateEl = $('health-rate');
+  var totalDone = s + e;
+  var rateEl = $('health-rate');
   if(rateEl){
     if(totalDone === 0){
       rateEl.textContent = '待命';
       rateEl.className = 'pill pill-accent';
     } else {
-      const pct = ((s / totalDone) * 100).toFixed(1).replace(/\.0$/, '');
-      rateEl.textContent = `成功率 ${pct}%`;
+      var pct = ((s / totalDone) * 100).toFixed(1).replace(/\.0$/, '');
+      rateEl.textContent = '成功率 ' + pct + '%';
       rateEl.className = pct >= 90 ? 'pill pill-mint' : 'pill pill-apricot';
     }
   }
@@ -804,18 +939,19 @@ function renderChart(s,e,r){
     chart.data.labels = labels;
     chart.data.datasets[0].data = data;
     chart.data.datasets[0].backgroundColor = colors;
+    chart.data.datasets[0].borderColor = borderColor;
     chart.update();
     return;
   }
   chart = new Chart(ctx, {
     type: 'doughnut',
     data: {
-      labels,
+      labels: labels,
       datasets: [{
-        data,
+        data: data,
         backgroundColor: colors,
         borderWidth: 3,
-        borderColor: '#ffffff',
+        borderColor: borderColor,
         hoverOffset: 4
       }]
     },
@@ -835,14 +971,14 @@ function renderChart(s,e,r){
 
 async function fetchStats(){
   try{
-    const d=await (await fetch('/api/stats')).json();
+    var d=await (await fetch('/api/stats')).json();
     $('s-total').textContent=fmt(d.total);
     $('s-success').textContent=fmt(d.success);
     $('s-error').textContent=fmt(d.error);
     $('s-retries').textContent=fmt(d.retries);
-    const pTk = d.prompt_tokens || 0;
-    const cTk = d.completion_tokens || 0;
-    const totTk = pTk + cTk;
+    var pTk = d.prompt_tokens || 0;
+    var cTk = d.completion_tokens || 0;
+    var totTk = pTk + cTk;
     $('t-prompt').textContent=fmt(pTk);
     $('t-comp').textContent=fmt(cTk);
     $('t-total').textContent=fmt(totTk);
@@ -861,27 +997,33 @@ async function updateMode(m){
 }
 function parseCookies(str){
   str=(str||'').trim();
-  if(str.startsWith('[')&&str.endsWith(']')){ try{ const a=JSON.parse(str); if(Array.isArray(a)) return a.map(c=>{const n=c.name||c.key,v=c.value; return (n&&v)?`${n}=${v}`:'';}).filter(Boolean).join('; ');}catch(e){} }
+  if(str.startsWith('[')&&str.endsWith(']')){
+    try{
+      var a=JSON.parse(str);
+      if(Array.isArray(a)) return a.map(function(c){var n=c.name||c.key,v=c.value; return (n&&v)?(n+'='+v):'';}).filter(Boolean).join('; ');
+    }catch(e){}
+  }
   return str;
 }
 async function saveCookie(){
-  let ck=parseCookies($('cookie-input').value); let pid=$('project-input').value.trim();
-  const m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
+  var ck=parseCookies($('cookie-input').value); var pid=$('project-input').value.trim();
+  var m=pid.match(/[?&]project=([^&]+)/)||pid.match(/\/projects\/([^\/]+)/); if(m) pid=m[1];
   $('cookie-input').value=ck; $('project-input').value=pid;
   if(!pid){ toast('请填写 Project ID'); return; }
   try{
-    const r=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
-    const d=await r.json(); toast(r.ok?(d.message||'已保存并激活'):('❌ '+(d.error||'保存失败')));
+    var r=await fetch('/api/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie:ck,project_id:pid})});
+    var d=await r.json(); toast(r.ok?(d.message||'已保存并激活'):('❌ '+(d.error||'保存失败')));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function loadRuntime(){
   try{
-    const s=await (await fetch('/api/settings/runtime')).json();
-    const m=s.use_web_proxy?'web_proxy':'api_key';
-    document.querySelector(`input[name=mode][value=${m}]`).checked=true;
+    var s=await (await fetch('/api/settings/runtime')).json();
+    var m=s.use_web_proxy?'web_proxy':'api_key';
+    var radio=document.querySelector('input[name=mode][value=' + m + ']');
+    if(radio) radio.checked=true;
     $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
     $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-    const ci=$('cookie-input');
+    var ci=$('cookie-input');
     if(ci){
       ci.value='';
       ci.placeholder = s.google_cookie_configured
@@ -893,87 +1035,92 @@ async function loadRuntime(){
 }
 
 /* ---------- Express Key 列表（多账号，热编辑，即添即探） ---------- */
-let KEYS = [];
+var KEYS = [];
 function keySrcPill(rec){
   if(rec.project_source==='auto') return '<span class="pill pill-mint" style="text-transform:none">来源 auto</span>';
   if(rec.project_source==='manual') return '<span class="pill pill-accent" style="text-transform:none">来源 manual</span>';
   return '<span class="pill pill-apricot" style="text-transform:none">未探测</span>';
 }
 function renderKeys(){
-  const box=$('keys-list');
-  box.innerHTML = KEYS.map((rec,i)=>`
-    <div class="border border-[#ebe4f7] bg-[#fcfbff] rounded-xl p-3.5" data-i="${i}">
-      <div class="flex items-center gap-2 mb-2">
-        <span class="pill pill-accent" style="text-transform:none">#${i+1}</span>
-        <input class="inp log k-key" style="flex:1" placeholder="粘贴 Express API Key（明文显示）" value="${(rec.key||'').replace(/"/g,'&quot;')}">
-        <label class="flex items-center gap-1 text-xs text-[#6e6480] whitespace-nowrap"><input type="checkbox" class="k-enabled accent-[#8b7cf6]" ${rec.enabled===false?'':'checked'}>启用</label>
-        <button class="btn-soft px-2.5 py-1 text-xs" onclick="probeOneKey(${i})">探测</button>
-        <button class="px-2.5 py-1 text-xs rounded-lg border border-[#fbd2da] text-[#d64860] bg-[#fff5f7] hover:bg-[#ffecef]" onclick="removeKeyRow(${i})">删除</button>
-      </div>
-      <div class="flex items-center gap-2 flex-wrap">
-        <span class="lbl whitespace-nowrap">Project ID</span>
-        <input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 点击「探测」自动获取" value="${(rec.project_id||'').replace(/"/g,'&quot;')}">
-        ${keySrcPill(rec)}
-        <span class="text-xs text-[#9a90ab]">${rec.detected_at?('探测于 '+new Date(rec.detected_at*1000).toLocaleString()):''}</span>
-      </div>
-      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-[#d64860]':'text-[#239480]'}">${rec._msg||''}</div>
-    </div>`).join('');
-  $('keys-count').textContent = KEYS.filter(r=>r.key).length + ' 个';
+  var box=$('keys-list');
+  box.innerHTML = KEYS.map(function(rec,i){
+    var kVal = (rec.key||'').replace(/"/g,'&quot;');
+    var pVal = (rec.project_id||'').replace(/"/g,'&quot;');
+    var chk = (rec.enabled===false) ? '' : 'checked';
+    var detStr = rec.detected_at ? ('探测于 ' + new Date(rec.detected_at*1000).toLocaleString()) : '';
+    var msgCls = (rec._msg_ok===false) ? 'text-[#d64860]' : 'text-[#239480]';
+    return '<div class="key-row border border-[#ebe4f7] bg-[#fcfbff] rounded-xl p-3.5" data-i="' + i + '">'
+      + '<div class="flex items-center gap-2 mb-2">'
+      + '<span class="pill pill-accent" style="text-transform:none">#' + (i+1) + '</span>'
+      + '<input class="inp log k-key" style="flex:1" placeholder="粘贴 Express API Key（明文显示）" value="' + kVal + '">'
+      + '<label class="flex items-center gap-1 text-xs text-[#6e6480] whitespace-nowrap"><input type="checkbox" class="k-enabled accent-[#8b7cf6]" ' + chk + '>启用</label>'
+      + '<button class="btn-soft px-2.5 py-1 text-xs" onclick="probeOneKey(' + i + ')">探测</button>'
+      + '<button class="px-2.5 py-1 text-xs rounded-lg border border-[#fbd2da] text-[#d64860] hover:opacity-85" onclick="removeKeyRow(' + i + ')">删除</button>'
+      + '</div>'
+      + '<div class="flex items-center gap-2 flex-wrap">'
+      + '<span class="lbl whitespace-nowrap">Project ID</span>'
+      + '<input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 点击「探测」自动获取" value="' + pVal + '">'
+      + keySrcPill(rec)
+      + '<span class="text-xs text-[#9a90ab]">' + detStr + '</span>'
+      + '</div>'
+      + '<div class="text-xs mt-1 ' + msgCls + '">' + (rec._msg||'') + '</div>'
+      + '</div>';
+  }).join('');
+  $('keys-count').textContent = KEYS.filter(function(r){return r.key;}).length + ' 个';
   $('keys-empty').classList.toggle('hidden', KEYS.length>0);
 }
 function syncKeysFromDom(){
-  [...document.querySelectorAll('#keys-list [data-i]')].forEach(row=>{
-    const i=Number(row.dataset.i);
+  Array.prototype.slice.call(document.querySelectorAll('#keys-list [data-i]')).forEach(function(row){
+    var i=Number(row.dataset.i);
     if(!KEYS[i]) return;
     KEYS[i].key = row.querySelector('.k-key').value.trim();
-    const pid = row.querySelector('.k-project').value.trim();
+    var pid = row.querySelector('.k-project').value.trim();
     if(pid !== (KEYS[i].project_id||'')){ KEYS[i].project_id = pid; KEYS[i].project_source = pid?'manual':''; }
     KEYS[i].enabled = row.querySelector('.k-enabled').checked;
   });
 }
 function collectKeys(){
   syncKeysFromDom();
-  return KEYS.filter(r=>r.key);
+  return KEYS.filter(function(r){return r.key;});
 }
 function addKeyRow(){ syncKeysFromDom(); KEYS.push({key:'',project_id:'',project_source:'',enabled:true}); renderKeys(); }
 function removeKeyRow(i){ syncKeysFromDom(); KEYS.splice(i,1); renderKeys(); }
 async function loadExpressKeys(){
   try{
-    const d=await (await fetch('/api/express-keys')).json();
-    KEYS=(d.keys||[]).map(r=>Object.assign({},r));
+    var d=await (await fetch('/api/express-keys')).json();
+    KEYS=(d.keys||[]).map(function(r){return Object.assign({},r);});
     renderKeys();
   }catch(e){}
 }
 async function saveExpressKeys(){
-  const payload=collectKeys();
+  var payload=collectKeys();
   if(payload.length===0 && !confirm('将保存为“空 Key 列表”。\n保存后即使环境变量 VERTEX_EXPRESS_API_KEY 有值，重启也不会再导入。\n确定吗？')) { renderKeys(); return; }
   try{
-    const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
-    const d=await r.json();
-    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
+    var r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
+    var d=await r.json();
+    if(r.ok){ KEYS=(d.keys||[]).map(function(x){return Object.assign({},x);}); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
     else toast('❌ '+(d.error||'保存失败'));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function probeOneKey(i){
   syncKeysFromDom();
-  const rec=KEYS[i];
+  var rec=KEYS[i];
   if(!rec||!rec.key){ toast('请先在该行填入 Express API Key'); return; }
-  const targetKey = rec.key;
-  const emptyRows = KEYS.filter(r=>!r.key);
-  const payload = KEYS.filter(r=>r.key);
+  var targetKey = rec.key;
+  var emptyRows = KEYS.filter(function(r){return !r.key;});
+  var payload = KEYS.filter(function(r){return r.key;});
   toast('正在自动保存并探测归属项目…');
   try{
-    // 将当前界面上的全部非空 Key 一并传给后端先保存入库再探测，避免未保存的新 Key 被覆盖丢失
-    const r=await fetch('/api/express-keys/probe',{
+    var r=await fetch('/api/express-keys/probe',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:targetKey, force:true, keys:payload})
     });
-    const d=await r.json();
+    var d=await r.json();
     if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
-    const res=(d.results||[])[0]||{};
-    KEYS=(d.keys||[]).map(x=>Object.assign({},x)).concat(emptyRows);
-    const hit=KEYS.find(x=>x.key===targetKey);
+    var res=(d.results||[])[0]||{};
+    KEYS=(d.keys||[]).map(function(x){return Object.assign({},x);}).concat(emptyRows);
+    var hit=KEYS.find(function(x){return x.key===targetKey;});
     if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; }
     renderKeys();
     toast(res.ok?('✅ 已保存并探测成功：'+(res.project_id||'—')):('⚠️ Key 已保存，但探测未果：'+(res.message||'请手动填写项目')));
@@ -981,31 +1128,31 @@ async function probeOneKey(i){
 }
 async function probeAllKeys(){
   syncKeysFromDom();
-  const emptyRows = KEYS.filter(r=>!r.key);
-  const payload = KEYS.filter(r=>r.key);
+  var emptyRows = KEYS.filter(function(r){return !r.key;});
+  var payload = KEYS.filter(function(r){return r.key;});
   if(payload.length===0){ toast('请先至少添加一个 Express API Key'); return; }
   toast('正在自动保存并探测全部 Key…');
   try{
-    const r=await fetch('/api/express-keys/probe',{
+    var r=await fetch('/api/express-keys/probe',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({all:true, force:true, keys:payload})
     });
-    const d=await r.json();
+    var d=await r.json();
     if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
-    const results=d.results||[];
-    KEYS=(d.keys||[]).map(x=>Object.assign({},x)).concat(emptyRows);
-    results.forEach(res=>{ const hit=KEYS.find(x=>x.key===res.key); if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; } });
+    var results=d.results||[];
+    KEYS=(d.keys||[]).map(function(x){return Object.assign({},x);}).concat(emptyRows);
+    results.forEach(function(res){ var hit=KEYS.find(function(x){return x.key===res.key;}); if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; } });
     renderKeys();
-    toast('已保存并完成探测：成功 '+results.filter(x=>x.ok).length+' / '+results.length);
+    toast('已保存并完成探测：成功 '+results.filter(function(x){return x.ok;}).length+' / '+results.length);
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
 /* ---------- Params (① 按模型参数 vs ② 全局基础设施 严格分离) ---------- */
-function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
+function setV(id,v){ var el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
   try{
-    const s=await (await fetch('/api/settings')).json();
+    var s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
     [
@@ -1015,36 +1162,36 @@ async function loadParams(){
       'retry_max','retry_backoff_seconds','fake_streaming_interval',
       'prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill',
       'sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'
-    ].forEach(k=>setV(k,s[k]));
+    ].forEach(function(k){setV(k,s[k]);});
     [
       'img_compress_enabled','fake_streaming','roundrobin','safety_score',
       'cookie_debug','debug_outbound','prefill_suppress_thinking',
       'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'
-    ].forEach(k=>setV(k,s[k]));
+    ].forEach(function(k){setV(k,s[k]);});
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
       else if(s.thinking_force_console) setV('native_thinking_mode','console');
     }
   }catch(e){}
   try{
-    const c=await (await fetch('/api/capabilities')).json();
+    var c=await (await fetch('/api/capabilities')).json();
     CAPS=c.capabilities||{};
     OVERRIDES=c.overrides||{};
     $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
-      + (c.models||[]).map(m=>{const star=OVERRIDES[m]?' ★':''; return `<option value="${m}">${m}${star}</option>`;}).join('');
+      + (c.models||[]).map(function(m){var star=OVERRIDES[m]?' ★':''; return '<option value="' + m + '">' + m + star + '</option>';}).join('');
     renderCaps();
   }catch(e){}
 }
 
 function applyModelParamFields(model){
-  const isGlobal = (model==='__global__');
-  const ov = isGlobal ? {} : (OVERRIDES[model] || {});
-  PER_MODEL_KEYS.forEach(k=>{
-    const v = (k in ov) ? ov[k] : GLOBAL_SETTINGS[k];
+  var isGlobal = (model==='__global__');
+  var ov = isGlobal ? {} : (OVERRIDES[model] || {});
+  PER_MODEL_KEYS.forEach(function(k){
+    var v = (k in ov) ? ov[k] : GLOBAL_SETTINGS[k];
     if(k==='image_aspect_ratio'){ curAR = v || ""; }
     else setV(k, v);
   });
-  const has = !isGlobal && !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
+  var has = !isGlobal && !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
   $('ov-badge').classList.toggle('hidden', !has);
   $('btn-scope-save').textContent = isGlobal ? '💾 保存 ① 区为全局默认' : '💾 保存 ① 区为该模型专属';
   $('btn-scope-clear').classList.toggle('hidden', isGlobal);
@@ -1076,38 +1223,38 @@ function collectSectionOnePatch(){
 }
 
 async function saveModelOverride(){
-  const m=$('model-sel').value; if(!m) return;
-  const patch = collectSectionOnePatch();
+  var m=$('model-sel').value; if(!m) return;
+  var patch = collectSectionOnePatch();
   if(m==='__global__'){
     try{
-      const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+      var r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
       if(r.ok){ GLOBAL_SETTINGS=await r.json(); toast('✅ 已将 ① 区参数保存为全局默认'); }
       else toast('❌ 保存失败');
     }catch(e){ toast('❌ 保存失败'); }
     return;
   }
   try{
-    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
-    const d=await r.json();
+    var r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    var d=await r.json();
     if(r.ok){ OVERRIDES[m]=d.override||patch; toast('✅ 已保存 '+m+' 的专属参数'); refreshModelSelStars(); applyModelParamFields(m); }
     else toast('❌ 保存失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
 async function clearModelOverride(){
-  const m=$('model-sel').value; if(!m || m==='__global__') return;
+  var m=$('model-sel').value; if(!m || m==='__global__') return;
   if(!OVERRIDES[m]){ toast('该模型当前没有专属参数'); return; }
   try{
-    const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'DELETE'});
+    var r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'DELETE'});
     if(r.ok){ delete OVERRIDES[m]; toast('已清除 '+m+' 专属参数，回退全局默认'); refreshModelSelStars(); applyModelParamFields(m); }
     else toast('❌ 清除失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
 function refreshModelSelStars(){
-  const sel=$('model-sel'); const cur=sel.value;
-  [...sel.options].forEach(o=>{
-    const base=o.value;
+  var sel=$('model-sel'); var cur=sel.value;
+  Array.prototype.slice.call(sel.options).forEach(function(o){
+    var base=o.value;
     if(base==='__global__'){
       o.textContent = '＊ 全局默认（对所有模型）';
     } else {
@@ -1117,30 +1264,30 @@ function refreshModelSelStars(){
   sel.value=cur;
 }
 
-function chip(t, accent){ return `<span class="pill${accent?' pill-accent':''}">${t}</span>`; }
+function chip(t, accent){ return '<span class="pill' + (accent?' pill-accent':'') + '">' + t + '</span>'; }
 function fillARFor(cap){
-  const sel=$('image_aspect_ratio');
-  const list = (cap && cap.is_image && cap.image_aspect_ratios.length) ? cap.image_aspect_ratios : COMMON_ARS;
-  sel.innerHTML='<option value="">自动</option>' + list.map(a=>`<option value="${a}">${a}</option>`).join('');
+  var sel=$('image_aspect_ratio');
+  var list = (cap && cap.is_image && cap.image_aspect_ratios.length) ? cap.image_aspect_ratios : COMMON_ARS;
+  sel.innerHTML='<option value="">自动</option>' + list.map(function(a){return '<option value="' + a + '">' + a + '</option>';}).join('');
   sel.value = (curAR && list.includes(curAR)) ? curAR : "";
 }
 function renderCaps(){
-  const m=$('model-sel').value;
+  var m=$('model-sel').value;
   if(m==='__global__'){
     applyModelParamFields(m);
     fillARFor(null);
     $('caps-summary').innerHTML='<span class="text-xs text-[#7d738e]">全局默认作用域：下方 ① 区的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力白名单与专属值。</span>';
-    ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(id=>{const el=$(id); if(el) el.disabled=false;});
+    ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
     $('think-note').textContent='全局默认：具体下发时仍按各模型能力自动裁剪（例如 Pro 上 minimal 会就近取 low）。';
     $('image-note').textContent='全局默认：仅生图模型会用到分辨率与宽高比。';
     $('sampling-note').textContent='全局默认：已废弃采样参数的模型会自动剥离。';
     return;
   }
-  const cap=CAPS[m]; if(!cap) return;
+  var cap=CAPS[m]; if(!cap) return;
   applyModelParamFields(m);
-  const th=cap.thinking||{};
-  let sum=[chip('家族 '+cap.family, true)];
+  var th=cap.thinking||{};
+  var sum=[chip('家族 '+cap.family, true)];
   if(th.kind==='level') sum.push(chip('思考档位 '+(th.levels||[]).join(' / ')));
   else sum.push(chip('无思考调节'));
   if(cap.is_image){
@@ -1154,16 +1301,16 @@ function renderCaps(){
   if(cap.supports_search) sum.push(chip('支持搜索'));
   $('caps-summary').innerHTML=sum.join('');
 
-  const isLevel=th.kind==='level';
+  var isLevel=th.kind==='level';
   $('thinking_g3_level').disabled=!isLevel;
   $('wrap-g3level').style.opacity=isLevel?'1':'.4';
-  let tn='';
+  var tn='';
   if(cap.is_image) tn='生图模型思考档位（默认 high，可在上方调整）。';
   else if(isLevel) tn='该模型用思考档位' + ((th.levels && !th.levels.includes('minimal')) ? '（此模型最低 low，无 minimal，且无法关闭）' : '（无法完全关闭，最省为 minimal）') + '。';
   else tn='该模型不支持思考调节。';
   $('think-note').textContent=tn;
 
-  const imgOn=cap.is_image;
+  var imgOn=cap.is_image;
   $('image_size').disabled=!imgOn; $('image_aspect_ratio').disabled=!imgOn;
   fillARFor(cap);
   $('image-note').textContent = imgOn
@@ -1178,13 +1325,12 @@ function renderCaps(){
           ? '官方建议保持采样默认值；留空即用模型默认。'
           : '该模型支持采样参数；留空即用模型默认。');
 }
-function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
-function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
-function hlp(el,id){const b=document.getElementById(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);}
+function numOrNull(id){ var v=$(id).value.trim(); return v===''?null:Number(v); }
+function numOr(id,d){ var v=$(id).value.trim(); return v===''?d:Number(v); }
+function hlp(el,id){var b=document.getElementById(id);var on=b.classList.toggle('show');el.classList.toggle('on',on);}
 
 async function saveSettings(){
-  // 严格只保存「② 全局基础设施设置」，绝不触碰「① 按模型参数」
-  const patch={
+  var patch={
     express_location:$('express_location').value,
     img_compress_enabled:$('img_compress_enabled').checked,
     img_compress_max_dim:numOr('img_compress_max_dim',1536),
@@ -1203,7 +1349,7 @@ async function saveSettings(){
     cookie_debug:$('cookie_debug').checked,
   };
   try{
-    const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+    var r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
     if(r.ok){
       GLOBAL_SETTINGS=await r.json();
       toast('✅ 全局基础设施设置已保存');
@@ -1211,26 +1357,76 @@ async function saveSettings(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
-/* ---------- Logs (Macaron Soft Log Highlighting) ---------- */
-const logwin=$('logwin'); let autoscroll=true;
-logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; });
-function logLine(t){
-  let c='#4d4460',bg='transparent',bl='3px solid transparent';
-  if(t.includes('✅')||t.includes('🎉')){c='#1f8270';bg='#f1fcf9';bl='3px solid #5fd3bc';}
-  else if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')||t.includes('🛑')){c='#b56c14';bg='#fffaf2';bl='3px solid #f8c27a';}
-  else if(t.includes('❌')||t.includes('ERROR')||t.includes('🔴')){c='#c43c54';bg='#fff4f6';bl='3px solid #f68697';}
-  else if(t.includes('💰')){c='#5e4bc4';bg='#f7f4ff';bl='3px solid #8b7cf6';}
-  let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#239480;font-weight:600">$1</span>');
-  return `<div style="color:${c};background:${bg};border-left:${bl};padding:6px 10px;border-radius:6px;white-space:pre-wrap;word-break:break-word">${s}</div>`;
+/* ---------- Logs (日间/夜间自适应 + 点击单条复制) ---------- */
+var logwin=$('logwin'); var autoscroll=true;
+var LOG_RAW_LINES = [];
+logwin.addEventListener('scroll',function(){ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; });
+function logLine(t, idx){
+  var dark = isDarkMode();
+  var c = dark ? '#ccc4de' : '#4d4460', bg = 'transparent', bl = '3px solid transparent';
+  if(t.includes('✅')||t.includes('🎉')){
+    c = dark ? '#6de0c9' : '#1f8270';
+    bg = dark ? 'rgba(95,211,188,.10)' : '#f1fcf9';
+    bl = '3px solid #5fd3bc';
+  }
+  else if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')||t.includes('🛑')){
+    c = dark ? '#fad096' : '#b56c14';
+    bg = dark ? 'rgba(248,194,122,.11)' : '#fffaf2';
+    bl = '3px solid #f8c27a';
+  }
+  else if(t.includes('❌')||t.includes('ERROR')||t.includes('🔴')){
+    c = dark ? '#ff9bab' : '#c43c54';
+    bg = dark ? 'rgba(246,134,151,.14)' : '#fff4f6';
+    bl = '3px solid #f68697';
+  }
+  else if(t.includes('💰')){
+    c = dark ? '#c2b6ff' : '#5e4bc4';
+    bg = dark ? 'rgba(139,124,246,.13)' : '#f7f4ff';
+    bl = '3px solid #8b7cf6';
+  }
+  var hlColor = dark ? '#65dbc4' : '#239480';
+  var s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:' + hlColor + ';font-weight:600">$1</span>');
+  return '<div class="log-item" data-idx="' + idx + '" onclick="copySingleLog(this)" title="点击复制本条日志" style="color:' + c + ';background:' + bg + ';border-left:' + bl + ';padding:6px 10px;border-radius:6px;white-space:pre-wrap;word-break:break-word">' + s + '</div>';
+}
+async function copySingleLog(el){
+  var sel = window.getSelection ? window.getSelection().toString() : '';
+  if(sel && sel.length > 0) return;
+  var idx = Number(el.getAttribute('data-idx'));
+  var raw = LOG_RAW_LINES[idx] || el.innerText || '';
+  try{
+    await navigator.clipboard.writeText(raw);
+    toast('📋 已复制该条日志');
+  }catch(e){ toast('复制失败，请手动选中复制'); }
+}
+function rerenderAllLogs(){
+  logwin.innerHTML = LOG_RAW_LINES.map(function(line, i){ return logLine(line, i); }).join('');
+  if(autoscroll) logwin.scrollTop = logwin.scrollHeight;
+}
+function clearLogs(){
+  LOG_RAW_LINES = [];
+  logwin.innerHTML = '';
+  toast('已清空当前面板日志');
 }
 try{
-  const es=new EventSource('/stream-logs');
-  es.onmessage=e=>{ if(e.data.includes('keep-alive')) return; logwin.insertAdjacentHTML('beforeend',logLine(e.data)); if(autoscroll) logwin.scrollTop=logwin.scrollHeight; };
+  var es=new EventSource('/stream-logs');
+  es.onmessage=function(e){
+    if(e.data.includes('keep-alive')) return;
+    if(LOG_RAW_LINES.length >= 100){
+      LOG_RAW_LINES.shift();
+      LOG_RAW_LINES.push(e.data);
+      rerenderAllLogs();
+      return;
+    }
+    var idx = LOG_RAW_LINES.length;
+    LOG_RAW_LINES.push(e.data);
+    logwin.insertAdjacentHTML('beforeend', logLine(e.data, idx));
+    if(autoscroll) logwin.scrollTop=logwin.scrollHeight;
+  };
 }catch(e){}
 
 /* ---------- Project ID auto-extract ---------- */
-$('project-input').addEventListener('input',e=>{ const v=e.target.value.trim(); const m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
-$('image_aspect_ratio').addEventListener('change', e=>{ curAR=e.target.value; });
+$('project-input').addEventListener('input',function(e){ var v=e.target.value.trim(); var m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
+$('image_aspect_ratio').addEventListener('change', function(e){ curAR=e.target.value; });
 
 /* init */
 fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
@@ -1378,7 +1574,7 @@ class ProbeBody(BaseModel):
     key: str = ""
     all: bool = False
     force: bool = False
-    keys: Optional[list] = None  # 若前端传入当前编辑中的 keys 列表，探测前先自动保存入库
+    keys: Optional[list] = None
 
 
 class KeyProjectBody(BaseModel):
@@ -1418,7 +1614,6 @@ async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require
 
 @app.post("/api/express-keys/probe")
 async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth)):
-    """手动触发探测：若请求附带前端当前 keys 列表，先同步保存再探测，彻底避免新加 Key 消失。"""
     if isinstance(body.keys, list) and len(body.keys) > 0:
         app_state.set_express_keys(body.keys)
         express_key_manager.refresh_keys()
