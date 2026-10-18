@@ -90,6 +90,27 @@ def is_error_frame(text: str) -> bool:
     return False
 
 
+def is_real_output_frame(text: str) -> bool:
+    """判断 SSE 帧是否包含真正的模型产出（非空 content / reasoning_content / tool_calls，且非报错帧）。"""
+    s = (text or "").strip()
+    if not s.startswith("data:") or is_error_frame(text):
+        return False
+    payload_str = s[len("data:"):].strip()
+    if not payload_str or payload_str == "[DONE]":
+        return False
+    try:
+        obj = json.loads(payload_str)
+    except Exception:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    for ch in (obj.get("choices") or []):
+        delta = (ch or {}).get("delta") or {}
+        if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+            return True
+    return False
+
+
 def make_keepalive_sse(model: str) -> str:
     """生成不带序号的假流式保活帧（直接发给在线客户端，不写入 ResumableBuffer）。"""
     keep_alive_data = {
@@ -386,11 +407,10 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
             text = _as_text(chunk)
             if not text or is_keepalive_frame(text):
                 continue
-            is_done = text.strip().endswith("[DONE]")
             err_frame = is_error_frame(text)
             if err_frame:
                 saw_error = True
-            is_real_output = (not is_done) and (not err_frame)
+            is_real_output = is_real_output_frame(text)
             await buf.append(frame_with_id(buf.next_seq, text), is_model_output=is_real_output)
 
         if not buf.events or not buf.events[-1].strip().endswith("[DONE]"):

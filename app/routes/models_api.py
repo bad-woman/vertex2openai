@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Set
 from auth import get_api_key
 from model_loader import get_express_models, refresh_models_config_cache
 from runtime_state import app_state
+import model_capabilities as mc
 
 router = APIRouter()
 _last_model_fetch_time = 0
@@ -19,11 +20,10 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
         _last_model_fetch_time = current_time
 
     express_key_manager_instance = fastapi_request.app.state.express_key_manager
-    
-    # 动态放行：开启网页反代或者配置有 Express API Key 均可安全获取模型列表
+
     has_web_proxy = app_state.is_web_proxy_enabled()
     has_express_key = express_key_manager_instance.get_total_keys() > 0
-    
+
     raw_models = await get_express_models() if (has_express_key or has_web_proxy) else []
 
     final_model_list: List[Dict[str, Any]] = []
@@ -31,7 +31,7 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
 
     def add_model(base_id: str):
         suffixes = [""]
-        if "gemini" in base_id.lower() and "image" not in base_id.lower():
+        if "gemini" in base_id.lower() and mc.get_profile(base_id).get("supports_search", True):
             suffixes.append("-search")
 
         for suffix in suffixes:
