@@ -160,15 +160,25 @@ def _get_auth_or_project_hint(error_msg: str, http_status: int = 200) -> str:
 
 
 def _extract_clean_error_message(raw: Any) -> str:
-    """从 batchGraphql 嵌套 JSON 或原始响应文本中提取干净、完整的错误原因。"""
+    """从 batchGraphql 嵌套 JSON 或原始响应文本中提取干净、完整的错误原因（含 details / extensions）。"""
     if isinstance(raw, dict):
-        msg = raw.get("message") or (raw.get("error", {}).get("message") if isinstance(raw.get("error"), dict) else None)
-        code = raw.get("code") or (raw.get("extensions") or {}).get("code")
-        status = raw.get("status") or (raw.get("extensions") or {}).get("status")
+        err_dict = raw.get("error") if isinstance(raw.get("error"), dict) else raw
+        msg = err_dict.get("message") or raw.get("message")
+        code = err_dict.get("code") or (raw.get("extensions") or {}).get("code")
+        status = err_dict.get("status") or (raw.get("extensions") or {}).get("status")
+        details = err_dict.get("details") or (raw.get("extensions") or {}).get("details") or raw.get("extensions")
         if msg:
             prefix = " / ".join(str(x) for x in (code, status) if x)
-            return f"[{prefix}] {msg}" if prefix else str(msg)
-        return json.dumps(raw, ensure_ascii=False)[:600]
+            base = f"[{prefix}] {msg}" if prefix else str(msg)
+            if details:
+                try:
+                    det_s = json.dumps(details, ensure_ascii=False)
+                except Exception:
+                    det_s = str(details)
+                if det_s and det_s not in base and det_s != "{}":
+                    base += f" | 详情: {det_s[:1200]}"
+            return base
+        return json.dumps(raw, ensure_ascii=False)[:2000]
 
     text = str(raw or "").strip()
     if not text:
@@ -183,39 +193,38 @@ def _extract_clean_error_message(raw: Any) -> str:
                 if not isinstance(item, dict):
                     continue
                 if isinstance(item.get("error"), dict):
-                    err = item["error"]
-                    c = err.get("code", "")
-                    s = err.get("status", "")
-                    m = err.get("message", "")
-                    head = " ".join(str(x) for x in (c, s) if x)
-                    extracted.append(f"[{head}] {m}" if head else m)
+                    extracted.append(_extract_clean_error_message(item["error"]))
                 for res in (item.get("results") or []):
                     for err in (res.get("errors") or []):
-                        if isinstance(err, dict) and err.get("message"):
-                            extracted.append(str(err["message"]))
+                        if isinstance(err, dict):
+                            extracted.append(_extract_clean_error_message(err))
             if extracted:
-                return "；".join(extracted)
+                return "；".join(extracted)[:2000]
         except Exception:
             pass
 
-    m = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-    if m:
-        try:
-            clean_m = json.loads(f'"{m.group(1)}"')
-        except Exception:
-            clean_m = m.group(1)
-        return clean_m
+    msgs = re.findall(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    if msgs:
+        cleaned = []
+        for raw_m in msgs:
+            try:
+                cm = json.loads(f'"{raw_m}"')
+            except Exception:
+                cm = raw_m
+            if cm and cm not in cleaned:
+                cleaned.append(cm)
+        if cleaned:
+            return "；".join(cleaned)[:2000]
 
     if "<html" in text.lower() or "<!doctype" in text.lower():
         title_m = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
         body_clean = re.sub(r"<[^>]+>", " ", text)
         body_clean = re.sub(r"\s+", " ", body_clean).strip()
         if title_m:
-            return f"HTML 错误页 ({title_m.group(1).strip()}): {body_clean[:300]}"
-        return f"HTML 错误页: {body_clean[:300]}"
+            return f"HTML 错误页 ({title_m.group(1).strip()}): {body_clean[:800]}"
+        return f"HTML 错误页: {body_clean[:800]}"
 
-    return text[:600]
-
+    return text[:2000]
 
 def _diagnose_studio_error(err_msg: str, http_status: int = 200) -> str:
     """为 Studio (Cookie) 通道常见错误生成一目了然的中文原因摘要。"""
@@ -1240,7 +1249,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                 stats.add_retry()
                 clean_http_err = _extract_clean_error_message(response.text)
                 print(f"⚠️ [Studio 假流式重试] 模型={base_model_name} | HTTP {response.status_code} | "
-                      f"第 {attempt+1}/{retry_max} 次重试，等待 {backoff_sec}s | 原因: {clean_http_err[:200]}")
+                      f"第 {attempt+1}/{retry_max} 次重试，等待 {backoff_sec}s | 原因: {clean_http_err[:2000]}")
                 waited = 0.0
                 while waited < backoff_sec:
                     step = min(0.5, backoff_sec - waited)
@@ -1309,7 +1318,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                     return {"kind": "cancelled", "message": "客户端已断开连接。"}
                 stats.add_retry()
                 print(f"⚠️ [Studio 假流式限流重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                      f"等待 {backoff_sec}s | 详情: {retry_error[:240]}")
+                      f"等待 {backoff_sec}s | 详情: {retry_error[:2000]}")
                 waited = 0.0
                 while waited < backoff_sec:
                     step = min(0.5, backoff_sec - waited)
@@ -1348,7 +1357,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                     return {"kind": "cancelled", "message": "客户端已断开连接。"}
                 stats.add_retry()
                 print(f"⚠️ [Studio 假流式异常重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                      f"等待 {backoff_sec}s | 异常: {em[:200]}")
+                      f"等待 {backoff_sec}s | 异常: {em[:2000]}")
                 waited = 0.0
                 while waited < backoff_sec:
                     step = min(0.5, backoff_sec - waited)
@@ -1561,7 +1570,7 @@ class CookieProxyUpstream(BaseUpstream):
                 if res.get("kind") != "ok":
                     stats.add_error()
                     err_detail = res.get("message", "生成失败")
-                    print(f"❌ [Studio 假流式报错] 模型={base_model_name} (项目={project_id}) | 详情: {err_detail[:450]}")
+                    print(f"❌ [Studio 假流式报错] 模型={base_model_name} (项目={project_id}) | 详情: {err_detail[:2000]}")
                     yield _make_openai_chunk(response_id, model_display, content=f"[Studio 错误] {err_detail}")
                     yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
                     yield "data: [DONE]\n\n"
@@ -1701,7 +1710,7 @@ class CookieProxyUpstream(BaseUpstream):
                                     stream_ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
                                     yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
                                 elif status == "api_error_text":
-                                    print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:400]}")
+                                    print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:2000]}")
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
                                 elif status == "image":
                                     if prefill_text and not prefill_emitted:
@@ -1737,7 +1746,7 @@ class CookieProxyUpstream(BaseUpstream):
                                 if not has_yielded_to_client:
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
                                 stats.add_error()
-                                print(f"❌ [Studio 鉴权/项目错误] 模型={base_model_name} (项目={project_id}) | {data[:500]}")
+                                print(f"❌ [Studio 鉴权/项目错误] 模型={base_model_name} (项目={project_id}) | {data[:2000]}")
                                 yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
                                 yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
                                 yield "data: [DONE]\n\n"
@@ -1754,7 +1763,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                                     err_prefix = "不可重试错误" if status == "fatal_error" else f"重试 {retry_max} 次后仍失败"
                                     stats.add_error()
-                                    print(f"❌ [Studio {err_prefix}] 模型={base_model_name} (项目={project_id}) | {data[:450]}")
+                                    print(f"❌ [Studio {err_prefix}] 模型={base_model_name} (项目={project_id}) | {data[:2000]}")
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
                                     yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
                                     yield "data: [DONE]\n\n"
@@ -1767,7 +1776,7 @@ class CookieProxyUpstream(BaseUpstream):
                             wait_sec = backoff_sec
                             stats.add_retry()
                             print(f"⚠️ [Studio 限流退避] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                                  f"等待 {wait_sec}s | 原因: {error_to_raise[:200]}")
+                                  f"等待 {wait_sec}s | 原因: {error_to_raise[:2000]}")
                             async for _hb in _sleep_with_heartbeat(wait_sec):
                                 if await fastapi_request.is_disconnected():
                                     print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
@@ -1914,7 +1923,7 @@ class CookieProxyUpstream(BaseUpstream):
                             stats.add_retry()
                             clean_http_err = _extract_clean_error_message(response.text)
                             print(f"⚠️ [Studio 非流式重试] 模型={base_model_name} | HTTP {response.status_code} | "
-                                  f"第 {attempt+1}/{retry_max} 次重试，等待 {wait_sec}s | 原因: {clean_http_err[:200]}")
+                                  f"第 {attempt+1}/{retry_max} 次重试，等待 {wait_sec}s | 原因: {clean_http_err[:2000]}")
                             waited = 0.0
                             while waited < wait_sec:
                                 step = min(0.5, wait_sec - waited)
@@ -1939,7 +1948,7 @@ class CookieProxyUpstream(BaseUpstream):
                         ):
                             hint = _get_auth_or_project_hint(clean_msg, response.status_code)
                         full_err_msg = f"HTTP {response.status_code}（{diag}）：{clean_msg}{hint}"
-                        print(f"❌ [Studio 非流式报错] 模型={base_model_name} (项目={project_id}) | 耗时 {elapsed:.1f}s | {full_err_msg[:450]}")
+                        print(f"❌ [Studio 非流式报错] 模型={base_model_name} (项目={project_id}) | 耗时 {elapsed:.1f}s | {full_err_msg[:2000]}")
                         return JSONResponse(status_code=response.status_code, content={
                             "error": {"message": full_err_msg, "type": "upstream_error", "code": response.status_code}
                         })
@@ -2028,7 +2037,7 @@ class CookieProxyUpstream(BaseUpstream):
                         wait_sec = backoff_sec
                         stats.add_retry()
                         print(f"⚠️ [Studio 非流式限流重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                              f"等待 {wait_sec}s | 详情: {retry_error[:240]}")
+                              f"等待 {wait_sec}s | 详情: {retry_error[:2000]}")
                         waited = 0.0
                         while waited < wait_sec:
                             step = min(0.5, wait_sec - waited)
@@ -2050,7 +2059,7 @@ class CookieProxyUpstream(BaseUpstream):
                             429 if _is_retryable_error(fatal_error) else 400
                         )
                         print(f"❌ [Studio 非流式报错] 模型={base_model_name} (项目={project_id}) | HTTP {err_status} | "
-                              f"耗时 {elapsed:.1f}s | {fatal_error[:450]}")
+                              f"耗时 {elapsed:.1f}s | {fatal_error[:2000]}")
                         return JSONResponse(status_code=err_status, content={
                             "error": {"message": fatal_error, "type": "upstream_error", "code": err_status}
                         })
@@ -2121,7 +2130,7 @@ class CookieProxyUpstream(BaseUpstream):
                         wait_sec = backoff_sec
                         stats.add_retry()
                         print(f"⚠️ [Studio 非流式异常重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                              f"等待 {wait_sec}s | 异常: {err_msg[:200]}")
+                              f"等待 {wait_sec}s | 异常: {err_msg[:2000]}")
                         waited = 0.0
                         while waited < wait_sec:
                             step = min(0.5, wait_sec - waited)
@@ -2135,8 +2144,8 @@ class CookieProxyUpstream(BaseUpstream):
                         continue
 
                     elapsed = time.time() - start_time
-                    print(f"❌ [Studio 非流式异常] 模型={base_model_name} (项目={project_id}) | 耗时 {elapsed:.1f}s | {err_msg[:350]}")
-                    traceback.print_exc()
+                    print(f"❌ [Studio 非流式异常] 模型={base_model_name} (项目={project_id}) | 耗时 {elapsed:.1f}s | {err_msg[:2000]}")
+                    print(traceback.format_exc())
                     return JSONResponse(status_code=500, content={
                         "error": {"message": f"Studio 代理异常: {err_msg}", "type": "proxy_error"}
                     })
