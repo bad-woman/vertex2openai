@@ -3,7 +3,7 @@ import re
 import json
 import time
 import uuid
-import random 
+import random
 import httpx
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
@@ -25,6 +25,7 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
+
 
 def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: int = None) -> Tuple[bytes, str]:
     """输入图片压缩引擎：可在控制台配置开关/边长/质量/体积阈值。
@@ -50,13 +51,11 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
     except (TypeError, ValueError):
         quality = 85
 
-    # 在安全体积内的图片，原样发送，不损耗画质
     if len(image_data) <= max_size_bytes:
         return image_data, original_mime
 
     try:
         with Image.open(io.BytesIO(image_data)) as img:
-            # 抹平透明通道以防转成 JPEG 时报错
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 if img.mode == 'RGBA' or img.mode == 'LA':
@@ -74,7 +73,6 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
             img.save(output, format='JPEG', quality=quality, optimize=True)
             opt_data = output.getvalue()
 
-            # 二次压缩兜底（锁死在阈值以下）
             if len(opt_data) > max_size_bytes:
                 output = io.BytesIO()
                 img.save(output, format='JPEG', quality=max(40, quality - 15), optimize=True)
@@ -85,20 +83,8 @@ def optimize_image_bytes(image_data: bytes, original_mime: str, max_size_bytes: 
         print(f"⚠️ [图片处理] 输入图片压缩失败，已回退为原图传输：{e}")
         return image_data, original_mime
 
-SUPPORTED_ROLES = ["user", "model", "function"] 
 
-# ============================================================
-# 思考签名（thought signature）的出入站处理（P0-4）
-#
-# 官方约束（核对于 2026-07-26）：
-#   - 函数调用强校验，Gemini 3 缺签名直接 400；纯文本不强校验但会掉质量。
-#   - Gemini 3 的签名总在**第一个** function call part 上，必须原样回传。
-#   - 并行调用必须按 FC1,FC2,FR1,FR2 顺序回传，交错会 400。
-#   - 拿不到签名时可用 skip_thought_signature_validator 哨兵跳过校验（最后手段）。
-#
-# 这里的两个函数是出/入站的唯一入口。此前 api_helpers 与本文件各有一份复制粘贴的
-# 实现，且已经出现细微不一致（一个用 response_id、一个用 base_id 拼 fallback id）。
-# ============================================================
+SUPPORTED_ROLES = ["user", "model", "function"]
 
 LEGACY_THOUGHT_SEP = "__thought__"
 
@@ -130,9 +116,6 @@ def thought_signature_extra(signature: Optional[bytes], part_kind: Optional[str]
     if not encoded:
         return None
     google = {"thought_signature": encoded}
-    # Google only standardizes thought_signature. This optional hint lets this
-    # bridge put a message-level signature back on a thought/text/signature-only
-    # Part instead of moving it during OpenAI flattening.
     if part_kind:
         google["thought_signature_part"] = part_kind
     return {"google": google}
@@ -153,7 +136,6 @@ def signature_from_extra(value: Any) -> Tuple[Optional[bytes], Optional[str]]:
     try:
         return base64.b64decode(str(encoded), validate=True), google.get("thought_signature_part")
     except Exception:
-        # Preserve non-base64 callers rather than silently discarding their explicit carrier.
         return str(encoded).encode("utf-8"), google.get("thought_signature_part")
 
 
@@ -178,9 +160,6 @@ def ordinary_parts_from_extra(value: Any) -> Optional[List[types.Part]]:
         text = item.get("text")
         if kind not in {"text", "thought", "signature_only"} or not isinstance(text, str):
             return None
-        # Generated images are flattened to markdown in OpenAI content. Let the
-        # normal content path parse them back into inline_data rather than
-        # replaying the data URL as ordinary text.
         if kind == "text" and "data:image/" in text:
             return None
         encoded = item.get("thought_signature")
@@ -221,12 +200,7 @@ def resolve_tool_call_signature(tool_call_id: str,
                                 require_signature: bool = False,
                                 explicit_signature: Optional[bytes] = None,
                                 explicit_unsigned: bool = False) -> Tuple[str, Optional[bytes]]:
-    """Restore ``(real id, signature)`` with explicit OpenAI metadata first.
-
-    The skip sentinel is used only for the first call in a required Gemini 3
-    step when neither explicit metadata, the legacy id, nor the fallback store
-    can recover a signature. Explicitly unsigned parallel followers stay bare.
-    """
+    """Restore (real id, signature) with explicit OpenAI metadata first."""
     real_id = tool_call_id or ""
     sig: Optional[bytes] = explicit_signature
 
@@ -253,7 +227,7 @@ def resolve_tool_call_signature(tool_call_id: str,
 
 
 def _requires_signature(model_name: str) -> bool:
-    """该模型是否强校验思考签名（仅 Gemini 3.x 家族）。"""
+    """该模型是否强校验思考签名（仅 Gemini 3.x / 4.x 家族）。"""
     if not model_name:
         return False
     try:
@@ -273,12 +247,13 @@ def extract_reasoning_by_tags(full_text: str, tag_name: str) -> Tuple[str, str]:
     reasoning_content = "".join(reasoning_parts)
     return reasoning_content.strip(), normal_text.strip()
 
+
 def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]:
     parts = []
     remaining_text = text
     pattern = r"!\[[^\]]*\]\(data:(image/[a-zA-Z0-9+.-]+);base64,([a-zA-Z0-9+/=]+)\)"
     matches = list(re.finditer(pattern, text))
-    
+
     if matches:
         for match in reversed(matches):
             mime_type = match.group(1)
@@ -294,23 +269,16 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
             except Exception as e:
                 print(f"⚠️ [图片处理] 提取 Markdown 图片失败，已跳过该图片：{e}")
         parts.reverse()
-        # 仅在**确实抽走了图片**时才压平空白：抠掉 data URL 会留下成片空格。
-        # 旧实现无条件执行，导致所有纯文本消息的缩进/多空格（代码块、ASCII 图、
-        # 酒馆预设的排版）都被悄悄改写。文本保真优先。
         remaining_text = re.sub(r"[ \t]+", " ", remaining_text).strip()
 
     return parts, remaining_text
 
-def _coerce_tool_response(content: Any) -> Dict[str, Any]:
-    """把 OpenAI 工具结果安全地转成 function_response 需要的对象。
 
-    修复：旧实现用 `isinstance(str) and (...) or (...)` 的错误优先级，
-    当 content 为 list 时会对其调用 .strip() 抛 AttributeError。
-    """
+def _coerce_tool_response(content: Any) -> Dict[str, Any]:
+    """把 OpenAI 工具结果安全地转成 function_response 需要的对象。"""
     if content is None:
         return {"result": ""}
     if not isinstance(content, str):
-        # content 可能是 OpenAI 的分段 list / dict
         try:
             return {"result": json.dumps(content, ensure_ascii=False)}
         except Exception:
@@ -319,7 +287,6 @@ def _coerce_tool_response(content: Any) -> Dict[str, Any]:
     if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
         try:
             parsed = json.loads(s)
-            # function_response 的 response 需要是对象；数组则包一层
             return parsed if isinstance(parsed, dict) else {"result": parsed}
         except json.JSONDecodeError:
             return {"result": content}
@@ -350,20 +317,16 @@ def _is_empty_message(msg: OpenAIMessage) -> bool:
 
 
 DEFAULT_PREFILL_INSTRUCTION = (
-    "[继续输出] 下面是你这条回复已经写好的开头，请从断点处无缝继续，"
-    "不要重复开头内容，也不要添加任何前言、解释或标注："
+    "[继续输出] 下面是你这条回复已经写好的开头，请紧接在最后一个字符之后无缝往下续写，"
+    "严禁重复已经写出的开头内容或标签，也不要添加任何前言、解释或标注："
 )
 
 
-# keep_turn 模式用的收尾指令。预填充留在 model 轮次里，这里只需要一句极短的推动，
-# 越短越不干扰预设本身。
 DEFAULT_KEEP_TURN_NUDGE = (
-    "[继续] 从你上一条的断点处无缝往下写，不要重复已写内容，不要任何前言或解释。"
+    "[继续] 请紧接在你上一条回复的断点处无缝往下写，严禁重复已写出的内容或开标签，不要任何前言或解释。"
 )
 
 
-# 生图模型专用的续写指令。通用那句是"从断点处无缝往下写"，模型会照办——
-# 继续写**文本**，于是吐出一段字符画而不是图片（实测）。生图必须明确要图。
 DEFAULT_IMAGE_PREFILL_NUDGE = (
     "[继续] 按上面说的风格与要求，直接输出图片本身，不要输出任何文字描述或字符画。"
 )
@@ -377,26 +340,7 @@ def apply_console_injection(
     is_image_model: bool = False,
     allow_image_prefill: bool = False,
 ) -> Tuple[List[OpenAIMessage], List[str]]:
-    """把控制台配置的 system 指令 / 预填充注入到消息里。
-
-    面向 RikkaHub 这类轻量前端：它们没有酒馆的预设系统，尤其**从不发送
-    assistant 预填充**，因此在这些前端下预填充这个杠杆完全用不上，
-    "预填充时压制原生思考"也永远不会触发。
-
-    注入发生在 `apply_prefill_compat` **之前**，注入完的消息与"前端自己发了
-    预填充"完全同形，下游四种兼容模式原样复用，不引入新分支。
-
-    四条护栏（缺一个就会和现有功能打架）：
-      1. 客户端已经发了预填充 → 不注入，否则两段预填充叠一起（酒馆场景）；
-      2. 请求带 tools → 不注入，凭空多一个 model 轮次会打乱函数调用往返；
-      3. 生图模型 → 默认不注入预填充，除非 allow_image_prefill=True。
-         预填充对生图确有很强的引导力（实测：同一句"画一只猫"，预填充承诺
-         "纯黑白钢笔线稿"就真的输出线稿，不加则是彩色写实照片），但角色扮演
-         用的预填充落到生图请求上会让模型改吐文本，所以做成开关而非默认放行；
-      4. 两个字段都留空 → 整个函数是空操作。
-
-    返回 (新消息列表, 说明做了什么的日志行列表)。
-    """
+    """把控制台配置的 system 指令 / 预填充注入到消息里。"""
     notes: List[str] = []
     system_text = (system_text or "").strip()
     prefill_text = (prefill_text or "").strip()
@@ -406,8 +350,6 @@ def apply_console_injection(
     new_msgs = list(messages or [])
 
     if system_text:
-        # 追加在客户端 system 之后：越靠后越不容易被前面的内容淹没，
-        # 也保证前端自己的系统提示仍然在场。
         insert_at = 0
         for i, m in enumerate(new_msgs):
             if m.role == "system":
@@ -438,41 +380,29 @@ def apply_console_injection(
     return new_msgs, notes
 
 
-# 预设思维链标签的宽松匹配：各人预设用的标签名完全不同，代理**不预设任何具体名字**，
-# 只按"开了但没闭合"这一形状识别；字符集放宽到字母数字与 _ - ~ . : 组合，
-# 以兼容 <thinking>、<CoT>、<plan_1>、<analysis~> 这类各式各样的自定义标签。
 _TAG_OPEN_RE = re.compile(r"<([A-Za-z][A-Za-z0-9_\-~.:]*)\s*>")
 
 
 def detect_unclosed_tag(text: str) -> Optional[str]:
-    """找出文本里"开了但没闭合"的最后一个标签名，没有则返回 None。
-
-    预填充卡思维链的典型形态就是停在一个**未闭合的开标签**上（标签名随预设而定）：
-    模型接着写的内容理应落在标签内部（即思维链），写完再闭合、然后写正文。
-    """
+    """找出文本里"开了但没闭合"的最后一个标签名，没有则返回 None。"""
     if not text:
         return None
     last: Optional[str] = None
     for m in _TAG_OPEN_RE.finditer(text):
         name = m.group(1)
         if re.search(rf"</\s*{re.escape(name)}\s*>", text[m.end():]):
-            continue          # 这个标签在后面闭合了，不算
+            continue
         last = name
     return last
 
 
 def build_cot_guard(tag: str) -> str:
-    """生成"必须先写完思维链再写正文"的强化要求（思维链守卫）。
-
-    为什么需要它：预填充只是把话头停在开标签上，**没有任何一句话告诉模型
-    "接下来必须先完成思维链"**。实测里模型经常直接跨过思考写正文，
-    结果输出里只有一个孤零零的开标签、没有思考内容也没有闭合标签，
-    前端按正则去抓思维链就抓不到（用户报告：多数情况没有思维链）。
-    这段守卫把隐含约定写成显式指令，并点名那个具体标签。
-    """
-    return (f"\n\n（格式硬性要求）你的这条回复当前停在 <{tag}> 内部：请**先**在 <{tag}> 里"
-            f"逐条写完该标签要求的全部思考内容，写完后用 </{tag}> 闭合，"
-            f"**然后才**开始写正文。不允许跳过思考直接写正文，也不允许只写一个空标签。")
+    """生成"必须先写完思维链再写正文"的强化要求（思维链守卫）。"""
+    return (
+        f"（格式硬性要求：下方已写好的开头正停在未闭合的 <{tag}> 标签内部；"
+        f"请直接从断点处继续写出 <{tag}> 内的全部思考内容，写完后用 </{tag}> 闭合，然后才开始写正文；"
+        f"严禁再次重复输出 <{tag}> 开标签，严禁跳过思考直接写正文，也不允许只写一个空标签。）"
+    )
 
 
 def apply_prefill_compat(
@@ -483,34 +413,12 @@ def apply_prefill_compat(
     cot_guard: bool = False,
 ) -> Tuple[List[OpenAIMessage], str, bool]:
     """
-    预填充(prefill)兼容：Gemini 3.x 拒绝以 assistant/model 结尾的请求（400）。
-
-    - mode="off"：不处理（可能 400）。
-    - mode="minimal"：末尾非 user 时追加一个占位 user，仅保证不报错（不还原预填充）。
-    - mode="smart"：
-      * allow_model_last=True（模型允许以 model 轮次结尾，如 2.5 及更早）→ **原生透传**：
-        消息保持原样发给上游，模型直接续写末尾轮次，最忠实；
-      * 否则（3.x 等）→ 把末尾 assistant 预填充取出，转成末尾 user 的“续写指令”
-        （模板可用 instruction_template 自定义，留空用内置默认）。
-    - mode="keep_turn"（3.x 上比 smart 更贴合原意）：
-      **保留** assistant 预填充作为 model 轮次，只在其后补一句极短的 user 推动语。
-      3.x 拒绝的是“以 model 轮次**结尾**”，并不禁止 model 轮次出现在中间。
-      smart 把预填充塞进 user 消息，模型于是把自己写的话当成“用户给的参考文本”，
-      倾向另起一句；keep_turn 让预填充留在模型自己的声音里，续写是逐字接续的。
-      预填充的主要用途是用预设自带的思维链顶掉原生思维链，此时预填充往往是
-      `<thinking>` 这类**未闭合的开头**——它必须处在 model 轮次里，模型才会
-      当作“自己已经写了一半”继续填充，而不是当成用户贴来的样例。
-      2.5 系仍走原生透传，不受影响。
-      以上模式都返回 prefill 文本，由上游把它拼回输出开头（配合去重）。
-
+    预填充(prefill)兼容：Gemini 3.x / 4.x 拒绝以 assistant/model 结尾的请求（400）。
     返回 (处理后的消息列表, 需拼回输出开头的预填充文本, 是否检测到预填充)。
-    第三项供“预填充时压制原生思考”等联动逻辑使用。
-    与模型名无关：按请求形状 + 能力档案触发；新加模型 ID 自动生效。
     """
     if not messages or mode == "off":
         return messages, "", False
 
-    # 找到最后一条“非空”消息
     idx = len(messages) - 1
     while idx >= 0 and _is_empty_message(messages[idx]):
         idx -= 1
@@ -519,109 +427,170 @@ def apply_prefill_compat(
 
     last = messages[idx]
     if last.role != "assistant" or getattr(last, "tool_calls", None):
-        return messages, "", False  # 已是 user 结尾 / 末尾是工具调用 → 无需处理
-
-    prefill = _message_text(last.content).strip()
-    if not prefill:
         return messages, "", False
 
+    raw_prefill = _message_text(last.content)
+    if not raw_prefill or not raw_prefill.strip():
+        return messages, "", False
+
+    prefill = raw_prefill.lstrip("\r\n").rstrip(" \t\r")
+    if prefill.endswith("\n\n"):
+        prefill = prefill.rstrip("\n") + "\n"
+
     if mode == "minimal":
-        new_msgs = list(messages)
+        new_msgs = list(messages[:idx + 1])
         new_msgs.append(OpenAIMessage(role="user", content="(请继续)"))
         return new_msgs, "", True
 
-    # 模型支持 model 结尾 → 原生预填充透传（不改消息，模型直接续写）
     if allow_model_last:
         return messages, prefill, True
 
+    unclosed_tag = detect_unclosed_tag(prefill) if cot_guard else None
+
     if mode == "keep_turn":
-        # 保留预填充所在的 assistant 轮次，只补一句极短 user 推动语。
-        # 必须截到 idx+1：预填充后面可能还跟着空消息，带上它们会再次以非 user 结尾。
         new_msgs = list(messages[:idx + 1])
         nudge = (instruction_template or "").strip() or DEFAULT_KEEP_TURN_NUDGE
-        if cot_guard:
-            tag = detect_unclosed_tag(prefill)
-            if tag:
-                nudge += build_cot_guard(tag)
+        if unclosed_tag:
+            nudge = nudge + "\n\n" + build_cot_guard(unclosed_tag)
         new_msgs.append(OpenAIMessage(role="user", content=nudge))
         return new_msgs, prefill, True
 
-    # smart：丢弃末尾预填充 assistant（及其后的空消息），转成续写指令
+    # smart 模式：将 cot_guard 放在 intro 与 prefill 之间，确保整条消息严格以 prefill 原文断点收尾
     new_msgs = list(messages[:idx])
     intro = (instruction_template or "").strip() or DEFAULT_PREFILL_INSTRUCTION
+    if unclosed_tag:
+        intro = intro + "\n" + build_cot_guard(unclosed_tag)
     instruction = intro + "\n\n" + prefill
-    if cot_guard:
-        tag = detect_unclosed_tag(prefill)
-        if tag:
-            # 守卫放在预填充之后 = 模型最后读到的就是这条硬性要求
-            instruction += build_cot_guard(tag)
-    if new_msgs and new_msgs[-1].role == "user" and isinstance(new_msgs[-1].content, str):
-        merged = new_msgs[-1].content + "\n\n" + instruction
-        new_msgs[-1] = OpenAIMessage(role="user", content=merged)
+
+    if new_msgs and new_msgs[-1].role == "user":
+        prev_user = new_msgs[-1]
+        if isinstance(prev_user.content, str):
+            merged = prev_user.content + "\n\n" + instruction
+            new_msgs[-1] = prev_user.model_copy(update={"content": merged})
+        elif isinstance(prev_user.content, list):
+            merged_list = list(prev_user.content) + [{"type": "text", "text": "\n\n" + instruction}]
+            new_msgs[-1] = prev_user.model_copy(update={"content": merged_list})
+        else:
+            new_msgs.append(OpenAIMessage(role="user", content=instruction))
     else:
         new_msgs.append(OpenAIMessage(role="user", content=instruction))
     return new_msgs, prefill, True
 
 
-def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 8) -> str:
-    """预填充去重：若模型无视指令、把预填充的结尾复述在输出开头，裁掉重叠部分。
-
-    - 输出以整段预填充开头（完整复述）→ 裁掉整段；
-    - 否则找 预填充结尾 与 输出开头 的最长重叠（≥ min_overlap 字符，避免误伤）。
-    """
+def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 4) -> str:
+    """预填充智能去重：裁掉模型在输出开头复述的预填充文本或重复开启的未闭合标签。"""
     if not prefill or not output:
         return output
+
+    pre_clean = prefill.rstrip(" \t\r\n")
+    if not pre_clean:
+        return output
+
+    out_lstripped = output.lstrip(" \t\r\n")
+    leading_ws_len = len(output) - len(out_lstripped)
+
     if output.startswith(prefill):
         return output[len(prefill):]
-    kmax = min(len(prefill), len(output))
-    for k in range(kmax, min_overlap - 1, -1):
-        if prefill[-k:] == output[:k]:
-            return output[k:]
+    if out_lstripped.startswith(pre_clean):
+        rest = out_lstripped[len(pre_clean):]
+        if prefill.endswith("\n") and rest.startswith("\n"):
+            rest = rest[1:]
+        return rest
+
+    kmax = min(len(pre_clean), len(out_lstripped))
+    effective_min = 2 if (pre_clean.endswith(">") or out_lstripped.startswith("<")) else min(min_overlap, len(pre_clean))
+    for k in range(kmax, max(1, effective_min) - 1, -1):
+        if pre_clean[-k:] == out_lstripped[:k]:
+            rest = out_lstripped[k:]
+            if prefill.endswith("\n") and rest.startswith("\n"):
+                rest = rest[1:]
+            return rest
+
+    unclosed_tag = detect_unclosed_tag(prefill)
+    if unclosed_tag:
+        tag_pattern = re.compile(rf"<\s*{re.escape(unclosed_tag)}\s*>", re.IGNORECASE)
+        last_tag_match = None
+        for m in tag_pattern.finditer(pre_clean):
+            last_tag_match = m
+        if last_tag_match is not None:
+            tail_from_tag = pre_clean[last_tag_match.start():]
+            if out_lstripped.startswith(tail_from_tag):
+                rest = out_lstripped[len(tail_from_tag):]
+                if prefill.endswith("\n") and rest.startswith("\n"):
+                    rest = rest[1:]
+                return rest
+            out_tag_match = tag_pattern.match(out_lstripped)
+            if out_tag_match:
+                after_out_tag = out_lstripped[out_tag_match.end():]
+                after_pre_tag = pre_clean[last_tag_match.end():].lstrip(" \t\r\n")
+                after_out_lstripped = after_out_tag.lstrip(" \t\r\n")
+                if after_pre_tag and after_out_lstripped.startswith(after_pre_tag):
+                    rest = after_out_lstripped[len(after_pre_tag):]
+                else:
+                    rest = after_out_tag
+                    if (prefill.endswith("\n") or pre_clean.endswith(">")) and rest.startswith("\n"):
+                        rest = rest[1:]
+                return rest
+
+    if leading_ws_len > 0 and prefill.endswith("\n") and output.startswith("\n"):
+        return output[1:]
+
     return output
 
 
 class PrefillDeduper:
-    """流式版预填充去重器。
-
-    预填充文本由代理先行发给客户端；若模型复述了预填充开头，需要在
-    流式输出的起始处裁掉重叠。做法：先攒下输出开头的一小段（窗口 =
-    min(len(prefill)+32, 600) 字符），做一次去重判定后放行，之后的
-    文本原样透传（不再增加任何延迟）。
-
-    用法：out = deduper.feed(chunk_text)（可能返回空串表示还在攒）；
-    流结束时调用 deduper.flush() 取回剩余文本。
-    """
+    """流式版预填充去重器。"""
 
     def __init__(self, prefill: str, window_cap: int = 600):
         self.prefill = prefill or ""
-        self.window = min(len(self.prefill) + 32, window_cap) if self.prefill else 0
+        self.window = min(len(self.prefill) + 48, window_cap) if self.prefill else 0
         self.buffer = ""
         self.done = self.window == 0
+        self._unclosed_tag = detect_unclosed_tag(self.prefill) if self.prefill else None
 
     def feed(self, text: str) -> str:
         if self.done:
             return text
+        if not text:
+            return ""
         self.buffer += text
-        # P2-4：只要已经能判定「不可能是预填充的重复」，立刻放行，不必攒满窗口。
-        # 旧实现固定攒到 min(len(prefill)+32, 600) 字符才放行，首 token 延迟明显，
-        # 与注释里的“零额外延迟”不符。
         if len(self.buffer) >= self.window or not self._still_ambiguous():
             return self._resolve()
         return ""
 
     def _still_ambiguous(self) -> bool:
-        """当前缓冲是否还不足以判定去重量。
-
-        strip_prefill_overlap 只看输出的前 len(prefill) 个字符，因此：
-          - 缓冲长度已达 len(prefill) → 信息完备，重叠量已确定，立即放行；
-          - 否则只有当缓冲仍是预填充的某个子串时，才可能延展成更长的重叠，需要继续等。
-        """
-        buf, pre = self.buffer, self.prefill
+        """判断当前已攒下的前缀是否仍可能与 prefill 构成更长的重叠。"""
+        buf = self.buffer
+        pre = self.prefill.rstrip(" \t\r\n")
         if not buf or not pre:
             return False
-        if len(buf) >= len(pre):
+
+        s = buf.lstrip(" \t\r\n")
+        if not s:
+            return len(buf) < 32
+
+        if len(s) >= len(pre) + 16:
             return False
-        return buf in pre
+
+        if s.startswith("<") and ">" not in s and len(s) < 48:
+            return True
+
+        if self._unclosed_tag:
+            open_tok = f"<{self._unclosed_tag}>"
+            if open_tok.lower().startswith(s.lower()) or s.lower().startswith(open_tok.lower()):
+                if len(s) < len(pre) + len(open_tok):
+                    return True
+
+        if s in pre or pre.startswith(s):
+            return True
+
+        max_k = min(len(pre), len(s))
+        for k in range(max_k, 0, -1):
+            if pre.endswith(s[:k]):
+                if k == len(s):
+                    return True
+                break
+        return False
 
     def flush(self) -> str:
         if self.done:
@@ -633,12 +602,220 @@ class PrefillDeduper:
         return strip_prefill_overlap(self.prefill, out)
 
 
-def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
-    """OpenAI 消息 → Gemini contents。
+# ============================================================
+# 流式工具调用参数分片聚合器（支持 streamFunctionCallArguments / partialArgs / willContinue）
+# ============================================================
 
-    model_name 用于判断是否需要对缺失的思考签名启用官方哨兵（仅 Gemini 3.x 强校验）。
-    留空表示“未知模型”，此时不注入哨兵——调用方（express_sdk）总会传真实模型名。
-    """
+_JSON_PATH_TOKEN_RE = re.compile(r"\.([A-Za-z0-9_$-]+)|\[(\d+)\]|\[['\"]([^'\"]+)['\"]\]")
+
+
+def _parse_json_path_tokens(json_path: str) -> List[Any]:
+    """将 RFC 9535 JSONPath（如 $.tables[0].name 或 $['a.b'][1]）解析为路径键列表。"""
+    s = (json_path or "").strip()
+    if s.startswith("$"):
+        s = s[1:]
+    if not s:
+        return []
+    tokens: List[Any] = []
+    for m in _JSON_PATH_TOKEN_RE.finditer(s):
+        if m.group(1) is not None:
+            tokens.append(m.group(1))
+        elif m.group(2) is not None:
+            tokens.append(int(m.group(2)))
+        elif m.group(3) is not None:
+            tokens.append(m.group(3))
+    if not tokens and s.startswith("."):
+        tokens = [seg for seg in s.split(".") if seg]
+    return tokens
+
+
+def _extract_partial_arg_value(parg: Any) -> Tuple[bool, Any, bool]:
+    """从单个 PartialArg（SDK 对象或字典）提取 (是否有值, 值, will_continue)。"""
+    def _get(k_snake: str, k_camel: str):
+        if isinstance(parg, dict):
+            return parg.get(k_camel, parg.get(k_snake))
+        return getattr(parg, k_snake, getattr(parg, k_camel, None))
+
+    wc = bool(_get("will_continue", "willContinue"))
+
+    sv = _get("string_value", "stringValue")
+    if sv is not None:
+        return True, str(sv), wc
+
+    nv = _get("number_value", "numberValue")
+    if nv is not None:
+        if isinstance(nv, float) and nv.is_integer():
+            return True, int(nv), wc
+        return True, nv, wc
+
+    bv = _get("bool_value", "boolValue")
+    if bv is not None:
+        return True, bool(bv), wc
+
+    if isinstance(parg, dict) and ("nullValue" in parg or "null_value" in parg):
+        return True, None, wc
+    if not isinstance(parg, dict) and getattr(parg, "null_value", None) is not None:
+        return True, None, wc
+
+    return False, None, wc
+
+
+def _set_json_path_value(root: Dict[str, Any], tokens: List[Any], value: Any, append_string: bool = False) -> None:
+    """在嵌套字典/列表中按路径写入或追加（用于流式字符串分片）值。"""
+    if not tokens:
+        return
+    curr: Any = root
+    for idx in range(len(tokens) - 1):
+        key = tokens[idx]
+        next_key = tokens[idx + 1]
+        want_list = isinstance(next_key, int)
+        if isinstance(key, int):
+            if not isinstance(curr, list):
+                return
+            while len(curr) <= key:
+                curr.append([] if want_list else {})
+            if curr[key] is None or not isinstance(curr[key], (list if want_list else dict)):
+                curr[key] = [] if want_list else {}
+            curr = curr[key]
+        else:
+            if not isinstance(curr, dict):
+                return
+            if key not in curr or not isinstance(curr[key], (list if want_list else dict)):
+                curr[key] = [] if want_list else {}
+            curr = curr[key]
+
+    last_key = tokens[-1]
+    if isinstance(last_key, int):
+        if not isinstance(curr, list):
+            return
+        while len(curr) <= last_key:
+            curr.append(None)
+        if append_string and isinstance(curr[last_key], str) and isinstance(value, str):
+            curr[last_key] = curr[last_key] + value
+        else:
+            curr[last_key] = value
+    else:
+        if not isinstance(curr, dict):
+            return
+        if append_string and isinstance(curr.get(last_key), str) and isinstance(value, str):
+            curr[last_key] = curr[last_key] + value
+        else:
+            curr[last_key] = value
+
+
+class FunctionCallStreamAssembler:
+    """将 Gemini streamFunctionCallArguments 的分片 FunctionCall (partialArgs / willContinue)
+    安全聚合成完整的函数调用事件，同时 100% 兼容普通单块 FunctionCall。"""
+
+    def __init__(self):
+        self._pending: Optional[Dict[str, Any]] = None
+
+    def has_pending(self) -> bool:
+        return self._pending is not None
+
+    def feed(self, fc: Any, thought_signature: Optional[bytes] = None) -> List[Dict[str, Any]]:
+        """喂入一个 function_call 对象或字典，返回目前已聚合完成的调用列表。"""
+        if fc is None:
+            return []
+
+        if isinstance(fc, dict):
+            fc_id = str(fc.get("id") or "").strip() or None
+            fc_name = str(fc.get("name") or "").strip()
+            fc_args = fc.get("args")
+            fc_partial = fc.get("partialArgs") if "partialArgs" in fc else fc.get("partial_args")
+            fc_will_continue = bool(fc.get("willContinue") if "willContinue" in fc else fc.get("will_continue"))
+        else:
+            fc_id = str(getattr(fc, "id", "") or "").strip() or None
+            fc_name = str(getattr(fc, "name", "") or "").strip()
+            fc_args = getattr(fc, "args", None)
+            fc_partial = getattr(fc, "partial_args", None)
+            fc_will_continue = bool(getattr(fc, "will_continue", False))
+
+        has_args = isinstance(fc_args, dict) and len(fc_args) > 0
+        has_partial = isinstance(fc_partial, list) and len(fc_partial) > 0
+
+        if not fc_name and not has_args and not has_partial and not fc_will_continue and self._pending is None:
+            return []
+
+        ready: List[Dict[str, Any]] = []
+
+        if self._pending is not None and fc_name and self._pending["name"] and fc_name != self._pending["name"]:
+            ready.append(self._finalize_pending())
+
+        if self._pending is None and fc_name and not has_partial and not fc_will_continue:
+            ready.append({
+                "id": fc_id,
+                "name": fc_name,
+                "args": dict(fc_args) if isinstance(fc_args, dict) else {},
+                "thought_signature": thought_signature,
+            })
+            return ready
+
+        if self._pending is None:
+            self._pending = {
+                "id": fc_id,
+                "name": fc_name or "unknown",
+                "args": dict(fc_args) if isinstance(fc_args, dict) else {},
+                "thought_signature": thought_signature,
+                "last_path": "",
+                "string_continuing": False,
+            }
+        else:
+            if fc_id and not self._pending.get("id"):
+                self._pending["id"] = fc_id
+            if fc_name and (not self._pending.get("name") or self._pending["name"] == "unknown"):
+                self._pending["name"] = fc_name
+            if thought_signature and not self._pending.get("thought_signature"):
+                self._pending["thought_signature"] = thought_signature
+            if has_args and not has_partial:
+                self._pending["args"].update(fc_args)
+
+        if has_partial:
+            for parg in fc_partial:
+                raw_path = (
+                    parg.get("jsonPath", parg.get("json_path"))
+                    if isinstance(parg, dict)
+                    else getattr(parg, "json_path", getattr(parg, "jsonPath", None))
+                )
+                path_str = str(raw_path or "").strip() or self._pending["last_path"]
+                has_val, val, arg_wc = _extract_partial_arg_value(parg)
+                if has_val and path_str:
+                    tokens = _parse_json_path_tokens(path_str)
+                    append_str = bool(
+                        isinstance(val, str)
+                        and self._pending["string_continuing"]
+                        and path_str == self._pending["last_path"]
+                    )
+                    _set_json_path_value(self._pending["args"], tokens, val, append_string=append_str)
+                    self._pending["last_path"] = path_str
+                    self._pending["string_continuing"] = bool(arg_wc and isinstance(val, str))
+                elif not arg_wc:
+                    self._pending["string_continuing"] = False
+
+        if not fc_will_continue:
+            ready.append(self._finalize_pending())
+
+        return ready
+
+    def flush(self) -> List[Dict[str, Any]]:
+        """流结束时冲刷尚未收到 willContinue=False 尾块的残留函数调用。"""
+        if self._pending is None:
+            return []
+        return [self._finalize_pending()]
+
+    def _finalize_pending(self) -> Dict[str, Any]:
+        item = self._pending
+        self._pending = None
+        return {
+            "id": item.get("id"),
+            "name": item.get("name") or "unknown",
+            "args": item.get("args") or {},
+            "thought_signature": item.get("thought_signature"),
+        }
+
+
+def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
+    """OpenAI 消息 → Gemini contents。"""
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     require_sig = _requires_signature(model_name)
     raw_gemini_messages = []
@@ -657,7 +834,7 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
             continue
 
         parts = []
-        current_gemini_role = "" 
+        current_gemini_role = ""
 
         if role == "tool":
             tool_call_id_str = message.tool_call_id or ""
@@ -665,13 +842,10 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
             function_name = message.name or tool_name_by_id.get(tool_call_id_str) or tool_name_by_id.get(real_tool_id)
 
             if not function_name:
-                # 既没有显式 name，也无法从前面的 assistant.tool_calls 关联时才降级。
                 mock_text = f"[System Observation - Tool Result]:\n{message.content}"
                 parts.append(types.Part.from_text(text=mock_text))
                 current_gemini_role = "user"
             else:
-                # FunctionResponse is always a Gemini ``user`` Content and never
-                # carries a thought signature. Signatures belong on model Parts.
                 tool_output_data = _coerce_tool_response(message.content)
 
                 func_resp_kwargs = {"name": function_name, "response": tool_output_data}
@@ -703,9 +877,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                     parsed_arguments = {}
 
                 explicit_sig, _ = signature_from_extra(tool_call)
-                # One assistant message is one function-calling step: only its
-                # first call requires a signature. Later calls are explicitly
-                # unsigned parallel followers and must not receive sentinels.
                 real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
                     tool_call_id_str,
                     require_signature=require_sig and tool_index == 0,
@@ -763,17 +934,17 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                     if isinstance(item, dict) and item.get("type") == "tool_call":
                         i = item.get("index")
                         if isinstance(i, int) and 0 <= i < len(tool_parts):
-                            ordered.append(tool_parts[i]); used_tools.add(i)
+                            ordered.append(tool_parts[i])
+                            used_tools.add(i)
                     elif isinstance(item, dict) and item.get("type") == "ordinary":
                         i = item.get("index")
                         if isinstance(i, int) and 0 <= i < len(ordinary_parts):
-                            ordered.append(ordinary_parts[i]); used_ordinary.add(i)
+                            ordered.append(ordinary_parts[i])
+                            used_ordinary.add(i)
                 ordered.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
                 ordered.extend(p for i, p in enumerate(tool_parts) if i not in used_tools)
                 parts.extend(ordered)
             else:
-                # Historical behavior emitted calls first. Preserve it unless a
-                # response from this bridge supplies exact part_order metadata.
                 parts.extend(tool_parts)
                 parts.extend(ordinary_parts)
         else:
@@ -797,14 +968,12 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
             if exact_ordinary_parts is None and isinstance(message.content, str):
                 image_parts, clean_text = _extract_markdown_images_to_parts(message.content)
-                if clean_text: parts.append(types.Part.from_text(text=clean_text))
+                if clean_text:
+                    parts.append(types.Part.from_text(text=clean_text))
                 parts.extend(image_parts)
 
             elif exact_ordinary_parts is None and isinstance(message.content, list):
                 for part_item in message.content:
-                    # F-1：pydantic 会把标准 part 解析成 ContentPartText / ContentPartImage 实例，
-                    # 归一成 dict 后只保留一条处理路径（原先 dict 与实例两套分支已出现行为分歧：
-                    # 实例分支直接 from_text，跳过了 markdown 内联图片抽取）。
                     part_item = normalize_content_part(part_item)
                     if not isinstance(part_item, dict):
                         text_attr = getattr(part_item, "text", None)
@@ -815,7 +984,8 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                     if part_item.get("type") == "text":
                         text_content = part_item.get("text", "\n")
                         image_parts, clean_text = _extract_markdown_images_to_parts(text_content)
-                        if clean_text: parts.append(types.Part.from_text(text=clean_text))
+                        if clean_text:
+                            parts.append(types.Part.from_text(text=clean_text))
                         parts.extend(image_parts)
 
                     elif part_item.get("type") == "image_url":
@@ -833,7 +1003,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
                                 parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
                         elif image_url.startswith(("http://", "https://")):
-                            # 统一走加固后的 fetch_remote_image（SSRF 与体积防护都在那里，见 F-3）。
                             fetched = fetch_remote_image(image_url)
                             if fetched:
                                 img_bytes, mime_type = fetched
@@ -854,11 +1023,11 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                 else:
                     parts[parts.index(target)] = target.model_copy(update={"thought_signature": message_sig})
 
-        if not parts: continue
+        if not parts:
+            continue
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
 
     def _is_text_only(content: types.Content) -> bool:
-        """该 Content 是否只含文本 part（没有 function_call / function_response / inline_data）。"""
         for p in content.parts or []:
             if getattr(p, "function_call", None) is not None:
                 return False
@@ -880,9 +1049,6 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
             previous = merged_messages[-1]
             previous_is_results = _is_function_response_only(previous)
             current_is_results = _is_function_response_only(msg)
-            # Parallel tool results are contiguous user Parts. A later fresh
-            # user turn must remain a new Content because it starts a new turn
-            # for Gemini's signature validator.
             if previous_is_results != current_is_results:
                 merged_messages.append(msg)
                 continue
@@ -897,19 +1063,12 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
     return merged_messages
 
-# F-3：远程图片抓取的防护参数。
-# 本服务常部署在能访问内网/云元数据服务的环境里，而图片 URL 完全由请求方控制，
-# 不加限制等于把代理变成一个任意内网 GET 的跳板（SSRF）。
-MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024   # 单张图上限，防止超大响应打爆内存
+
+MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REMOTE_IMAGE_REDIRECTS = 3
 
 
 def _is_blocked_host(host: str) -> bool:
-    """目标是否指向内网/环回/链路本地等不该被代理访问的地址。
-
-    云元数据服务（169.254.169.254）属于链路本地段，已被 is_link_local 覆盖。
-    主机名先解析再判断，避免用 DNS 指向内网的域名绕过。
-    """
     import ipaddress
     import socket
 
@@ -923,7 +1082,7 @@ def _is_blocked_host(host: str) -> bool:
         try:
             infos = socket.getaddrinfo(host, None)
         except Exception:
-            return True   # 解析不了就不放行
+            return True
         for info in infos:
             try:
                 candidates.append(ipaddress.ip_address(info[4][0]))
@@ -939,15 +1098,6 @@ def _is_blocked_host(host: str) -> bool:
 
 
 def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes, str]]:
-    """同步抓取远程图片，返回 (bytes, mime)。失败返回 None。
-
-    调用方须保证不在事件循环线程里直接调用（Express/Cookie 两条通道都用
-    asyncio.to_thread 包住整个消息转换）。
-
-    F-3 防护：只允许 http/https、拒绝内网与链路本地地址（重定向后逐跳复查）、
-    限制响应体积、校验 content-type。配置了 PROXY_URL 时出站本就经代理，
-    到不了内网，此时跳过地址检查。
-    """
     from urllib.parse import urlparse
 
     check_host = not app_config.PROXY_URL
@@ -969,7 +1119,6 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
             for _ in range(MAX_REMOTE_IMAGE_REDIRECTS + 1):
                 resp = client.get(current)
                 if resp.is_redirect:
-                    # 逐跳复查：只校验首个 URL 的话，一个 302 就能把请求带进内网。
                     current = str(resp.next_request.url) if resp.next_request else ""
                     nxt = urlparse(current)
                     if nxt.scheme not in ("http", "https"):
@@ -994,20 +1143,12 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
 
 
 def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
-    """压缩后转成 batchGraphql 的 inlineData part（camelCase）。"""
     opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
     return {"inlineData": {"mimeType": opt_mime,
                            "data": base64.b64encode(opt_bytes).decode("utf-8")}}
 
 
 def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
-    """OpenAI 的 message.content → batchGraphql 的 parts 列表（P1-2）。
-
-    与 Express 通道行为对齐：
-      - 解析正文里的 markdown data-URL 图片（多轮修图时上一张图不会再被当成巨大文本发出）
-      - data: 与 http(s): 两种 image_url 都支持
-      - 统一走 optimize_image_bytes 做输入图压缩（控制台开关对两条通道都生效）
-    """
     parts: List[Dict[str, Any]] = []
     if content is None:
         return parts
@@ -1069,11 +1210,6 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
 
 
 def _rating_fields(r: Any) -> Tuple[str, str, Optional[float], Optional[float]]:
-    """把一条安全评分归一成 (分类, 概率档, 概率分, 严重度分)。
-
-    Express 通道给的是 SDK 对象（属性 + 枚举），Cookie 通道给的是 batchGraphql
-    的 camelCase 字典，两边共用同一个渲染器。
-    """
     def _enum_name(v):
         return getattr(v, "name", None) or (str(v) if v is not None else "")
 
@@ -1092,17 +1228,18 @@ def _rating_fields(r: Any) -> Tuple[str, str, Optional[float], Optional[float]]:
 def _create_safety_ratings_html(safety_ratings: list) -> str:
     if not safety_ratings:
         return ""
-    # 上游对部分分类只给 probability 不给 probability_score（实测 JAILBREAK 常为 None），
-    # 直接 max(key=probability_score) 会拿 None 和 float 比较 → TypeError，
-    # 整个请求变成 500。缺分数的按 -1 排，永远不会被选成“最高分”。
     normalized = [_rating_fields(r) for r in safety_ratings]
     highest = max(normalized, key=lambda t: t[2] if t[2] is not None else -1.0)
     highest_score = highest[2] if highest[2] is not None else -1.0
 
-    if highest_score < 0: color = "#888"          # 一条分数都没有
-    elif highest_score <= 0.33: color = "#0f8"
-    elif highest_score <= 0.66: color = "yellow"
-    else: color = "#bf555d"
+    if highest_score < 0:
+        color = "#888"
+    elif highest_score <= 0.33:
+        color = "#0f8"
+    elif highest_score <= 0.66:
+        color = "yellow"
+    else:
+        color = "#bf555d"
 
     def _fmt(cat, prob, ps, ss):
         ps_s = f"{ps:.7f}" if ps is not None else "None"
@@ -1122,6 +1259,7 @@ def _create_safety_ratings_html(safety_ratings: list) -> str:
     )
     return html_output
 
+
 def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
     try:
         b64_data = base64.b64encode(image_data).decode("utf-8")
@@ -1130,6 +1268,7 @@ def _convert_image_to_markdown(image_data: bytes, mime_type: str) -> str:
     except Exception as e:
         print(f"⚠️ [图片处理] 将 Gemini 图片转换为 Markdown 失败：{e}")
         return "[Image could not be displayed]"
+
 
 def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: Any) -> Tuple[str, str]:
     reasoning_text_parts = []
@@ -1144,9 +1283,9 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
 
     if gemini_candidate_content and hasattr(gemini_candidate_content, "parts") and gemini_candidate_content.parts:
         for part_item in gemini_candidate_content.parts:
-            if hasattr(part_item, "function_call") and part_item.function_call is not None: 
+            if hasattr(part_item, "function_call") and part_item.function_call is not None:
                 continue
-            
+
             part_text = ""
             if hasattr(part_item, "text") and part_item.text is not None:
                 part_text = str(part_item.text)
@@ -1161,19 +1300,23 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
                 if hasattr(file_data, "file_uri"):
                     file_uri = file_data.file_uri
                     part_text = f"![Image]({file_uri})"
-            
+
             part_is_thought = hasattr(part_item, "thought") and part_item.thought is True
 
-            if part_is_thought: reasoning_text_parts.append(part_text)
-            elif part_text: normal_text_parts.append(part_text)
-            
-    elif candidate_part_text: normal_text_parts.append(candidate_part_text)
+            if part_is_thought:
+                reasoning_text_parts.append(part_text)
+            elif part_text:
+                normal_text_parts.append(part_text)
+
+    elif candidate_part_text:
+        normal_text_parts.append(candidate_part_text)
     elif gemini_candidate_content and hasattr(gemini_candidate_content, "text") and gemini_candidate_content.text is not None:
         normal_text_parts.append(str(gemini_candidate_content.text))
-    elif hasattr(gemini_response_candidate, "text") and gemini_response_candidate.text is not None and not gemini_candidate_content: 
+    elif hasattr(gemini_response_candidate, "text") and gemini_response_candidate.text is not None and not gemini_candidate_content:
         normal_text_parts.append(str(gemini_response_candidate.text))
 
     return "".join(reasoning_text_parts), "".join(normal_text_parts)
+
 
 def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_model_str: str) -> Dict[str, Any]:
     choices = []
@@ -1183,18 +1326,24 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
     if hasattr(gemini_response_obj, "candidates") and gemini_response_obj.candidates:
         for i, candidate in enumerate(gemini_response_obj.candidates):
             message_payload = {"role": "assistant"}
-            
-            raw_finish_reason = getattr(candidate, "finish_reason", None)
-            openai_finish_reason = "stop" 
-            if raw_finish_reason:
-                if hasattr(raw_finish_reason, "name"): raw_gemini_finish_reason_str = raw_finish_reason.name.upper()
-                else: raw_gemini_finish_reason_str = str(raw_finish_reason).upper()
 
-                if raw_gemini_finish_reason_str == "STOP": openai_finish_reason = "stop"
-                elif raw_gemini_finish_reason_str == "MAX_TOKENS": openai_finish_reason = "length"
-                elif raw_gemini_finish_reason_str == "SAFETY": openai_finish_reason = "content_filter"
-                elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]: openai_finish_reason = "tool_calls"
-            
+            raw_finish_reason = getattr(candidate, "finish_reason", None)
+            openai_finish_reason = "stop"
+            if raw_finish_reason:
+                if hasattr(raw_finish_reason, "name"):
+                    raw_gemini_finish_reason_str = raw_finish_reason.name.upper()
+                else:
+                    raw_gemini_finish_reason_str = str(raw_finish_reason).upper()
+
+                if raw_gemini_finish_reason_str == "STOP":
+                    openai_finish_reason = "stop"
+                elif raw_gemini_finish_reason_str == "MAX_TOKENS":
+                    openai_finish_reason = "length"
+                elif raw_gemini_finish_reason_str == "SAFETY":
+                    openai_finish_reason = "content_filter"
+                elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]:
+                    openai_finish_reason = "tool_calls"
+
             parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
             reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
             if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
@@ -1217,7 +1366,7 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                         "type": "function",
                         "function": {
                             "name": fc.name,
-                            "arguments": json.dumps(fc.args or {})
+                            "arguments": json.dumps(fc.args or {}, ensure_ascii=False)
                         }
                     }
                     extra = thought_signature_extra(sig)
@@ -1266,36 +1415,42 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             if message_payload.get("tool_calls") and order_descriptors:
                 google = message_payload.setdefault("extra_content", {}).setdefault("google", {})
                 google["part_order"] = order_descriptors
-            
+
             choice_item = {"index": i, "message": message_payload, "finish_reason": openai_finish_reason}
-            if hasattr(candidate, "logprobs") and candidate.logprobs is not None: choice_item["logprobs"] = candidate.logprobs
+            if hasattr(candidate, "logprobs") and candidate.logprobs is not None:
+                choice_item["logprobs"] = candidate.logprobs
             choices.append(choice_item)
-            
+
     elif hasattr(gemini_response_obj, "text") and gemini_response_obj.text is not None:
-         content_str = gemini_response_obj.text or ""
-         choices.append({"index": 0, "message": {"role": "assistant", "content": content_str}, "finish_reason": "stop"})
-    else: 
-         choices.append({"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": "stop"})
+        content_str = gemini_response_obj.text or ""
+        choices.append({"index": 0, "message": {"role": "assistant", "content": content_str}, "finish_reason": "stop"})
+    else:
+        choices.append({"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": "stop"})
 
     usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     if hasattr(gemini_response_obj, "usage_metadata"):
         um = gemini_response_obj.usage_metadata
-        if hasattr(um, "prompt_token_count"): usage_data["prompt_tokens"] = um.prompt_token_count
+        if hasattr(um, "prompt_token_count"):
+            usage_data["prompt_tokens"] = um.prompt_token_count
         if hasattr(um, "candidates_token_count"):
             usage_data["completion_tokens"] = um.candidates_token_count
-            if hasattr(um, "total_token_count"): usage_data["total_tokens"] = um.total_token_count
-            else: usage_data["total_tokens"] = usage_data["prompt_tokens"] + usage_data["completion_tokens"]
-        elif hasattr(um, "total_token_count"): 
-             usage_data["total_tokens"] = um.total_token_count
-             if usage_data["prompt_tokens"] > 0 and usage_data["total_tokens"] > usage_data["prompt_tokens"]:
-                 usage_data["completion_tokens"] = usage_data["total_tokens"] - usage_data["prompt_tokens"]
-        else: usage_data["total_tokens"] = usage_data["prompt_tokens"] 
+            if hasattr(um, "total_token_count"):
+                usage_data["total_tokens"] = um.total_token_count
+            else:
+                usage_data["total_tokens"] = usage_data["prompt_tokens"] + usage_data["completion_tokens"]
+        elif hasattr(um, "total_token_count"):
+            usage_data["total_tokens"] = um.total_token_count
+            if usage_data["prompt_tokens"] > 0 and usage_data["total_tokens"] > usage_data["prompt_tokens"]:
+                usage_data["completion_tokens"] = usage_data["total_tokens"] - usage_data["prompt_tokens"]
+        else:
+            usage_data["total_tokens"] = usage_data["prompt_tokens"]
 
     return {
         "id": base_id, "object": "chat.completion", "created": response_timestamp,
         "model": request_model_str, "choices": choices,
         "usage": usage_data
     }
+
 
 def convert_to_openai_format(gemini_response: Any, model: str) -> Dict[str, Any]:
     return process_gemini_response_to_openai_dict(gemini_response, model)
