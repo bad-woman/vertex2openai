@@ -185,7 +185,7 @@ def _diagnose_express_error(code: int, msg: str, status_str: str = "") -> str:
 
 
 def extract_upstream_error(e: Exception) -> tuple[int, str]:
-    """从上游异常里精准提取 (HTTP 状态码, 含中文诊断的清晰错误说明)。"""
+    """从上游异常里精准提取 (HTTP 状态码, 含中文诊断与完整 details 的清晰错误说明)。"""
     code = getattr(e, "code", None) or getattr(e, "status_code", None)
     status_str = str(getattr(e, "status", "") or "").strip()
 
@@ -199,7 +199,29 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
         )
         clean_msg = m.group(1) if m else raw
 
-    clean_msg = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", str(clean_msg).strip())
+    details_obj = getattr(e, "details", None)
+    extra_detail_str = ""
+    if details_obj:
+        try:
+            if isinstance(details_obj, dict):
+                err_inner = details_obj.get("error") if isinstance(details_obj.get("error"), dict) else details_obj
+                det_list = err_inner.get("details")
+                if det_list:
+                    extra_detail_str = f" | details={json.dumps(det_list, ensure_ascii=False)[:1200]}"
+                else:
+                    d_str = json.dumps(details_obj, ensure_ascii=False)
+                    if d_str and str(clean_msg) not in d_str:
+                        extra_detail_str = f" | 详情: {d_str[:1200]}"
+            elif isinstance(details_obj, list):
+                extra_detail_str = f" | details={json.dumps(details_obj, ensure_ascii=False)[:1200]}"
+            else:
+                d_str = str(details_obj).strip()
+                if d_str and str(clean_msg) not in d_str:
+                    extra_detail_str = f" | 详情: {d_str[:1200]}"
+        except Exception:
+            pass
+
+    clean_msg = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", str(clean_msg).strip() + extra_detail_str)
 
     if not isinstance(code, int) or not (400 <= code <= 599):
         low = f"{status_str} {clean_msg}".lower()
@@ -970,7 +992,7 @@ async def gemini_fake_stream_generator(
                     stats.add_retry()
                     err_code, err_summary = extract_upstream_error(e_call)
                     print(f"⚠️ [自动重试] 假流式模型={request_obj.model} | HTTP {err_code} | "
-                          f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {backoff_sec}s | {err_summary[:240]}")
+                          f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {backoff_sec}s | {err_summary[:2000]}")
                     waited = 0.0
                     elapsed_hb = 0.0
                     while waited < backoff_sec:
@@ -1023,8 +1045,8 @@ async def gemini_fake_stream_generator(
         stats.add_error()
         err_code, err_formatted = extract_upstream_error(e_outer_gemini)
         print(f"❌ [Express 假流式报错] 模型={request_obj.model} (上游路径={model_for_api_call}) | "
-              f"HTTP {err_code} | {err_formatted[:500]}")
-        err_resp_sse = create_openai_error_response(err_code, err_formatted[:800], "upstream_error")
+              f"HTTP {err_code} | {err_formatted[:2000]}")
+        err_resp_sse = create_openai_error_response(err_code, err_formatted[:2000], "upstream_error")
         json_payload_error = json.dumps(err_resp_sse, ensure_ascii=False)
         if not is_auto_attempt:
             yield f"data: {json_payload_error}\n\n"
@@ -1194,7 +1216,7 @@ async def execute_gemini_call(
                         if (fallback_model and model_to_call != fallback_model
                                 and not has_yielded and is_location_pin_failure(e_stream_call)):
                             _, pin_err_msg = extract_upstream_error(e_stream_call)
-                            print(f"↩️ [上游端点回退] 钉定路径 {model_to_call} 调用失败（{pin_err_msg[:180]}），"
+                            print(f"↩️ [上游端点回退] 钉定路径 {model_to_call} 调用失败（{pin_err_msg[:2000]}），"
                                   f"已自动退回默认路由 {fallback_model} 重试一次。")
                             model_to_call = fallback_model
                             current_client = _get_fallback_client()
@@ -1208,7 +1230,7 @@ async def execute_gemini_call(
                             stats.add_retry()
                             err_code, err_summary = extract_upstream_error(e_stream_call)
                             print(f"⚠️ [自动重试] Express 流式模型={request_obj.model} | HTTP {err_code} | "
-                                  f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_time}s | {err_summary[:240]}")
+                                  f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_time}s | {err_summary[:2000]}")
                             _waited = 0.0
                             _hb_acc = 0.0
                             while _waited < wait_time:
@@ -1227,13 +1249,13 @@ async def execute_gemini_call(
                         stats.add_error()
                         err_code, err_formatted = extract_upstream_error(e_stream_call)
                         print(f"❌ [Express 流式报错] 模型={request_obj.model} (上游路径={model_to_call}) | "
-                              f"HTTP {err_code} | {err_formatted[:500]}")
+                              f"HTTP {err_code} | {err_formatted[:2000]}")
                         if is_auto_attempt:
                             raise e_stream_call
                         if has_yielded:
                             yield "data: [DONE]\n\n"
                         else:
-                            err_resp = create_openai_error_response(err_code, err_formatted[:800], "upstream_error")
+                            err_resp = create_openai_error_response(err_code, err_formatted[:2000], "upstream_error")
                             yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
                             yield "data: [DONE]\n\n"
                         return
@@ -1280,7 +1302,7 @@ async def execute_gemini_call(
                 if (fallback_model and model_to_call != fallback_model
                         and is_location_pin_failure(e_call)):
                     _, pin_err_msg = extract_upstream_error(e_call)
-                    print(f"↩️ [上游端点回退] 钉定路径 {model_to_call} 调用失败（{pin_err_msg[:180]}），"
+                    print(f"↩️ [上游端点回退] 钉定路径 {model_to_call} 调用失败（{pin_err_msg[:2000]}），"
                           f"已自动退回默认路由 {fallback_model} 重试一次。")
                     model_to_call = fallback_model
                     current_client = _get_fallback_client()
@@ -1296,7 +1318,7 @@ async def execute_gemini_call(
                     wait_time = backoff_sec
                     err_code, err_summary = extract_upstream_error(e_call)
                     print(f"⚠️ [自动重试] Express 非流式模型={request_obj.model} | HTTP {err_code} | "
-                          f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_time}s | {err_summary[:240]}")
+                          f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_time}s | {err_summary[:2000]}")
                     waited = 0.0
                     while waited < wait_time:
                         step = min(0.5, wait_time - waited)
