@@ -3,6 +3,7 @@ import os
 import secrets
 import threading
 import time
+from typing import Optional
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,7 +46,6 @@ async def lifespan(app: FastAPI):
     from model_loader import refresh_models_config_cache
     print("🚀 [服务启动] agentplatform2api 适配器已启动（Express API Key / Cookie 直连 双通道）。")
 
-    # S-1：默认口令 + 公开托管 + 明文 Cookie 是很危险的组合，必须让人看见。
     if config.API_KEY == DEFAULT_API_KEY:
         public_host = any(os.environ.get(k) for k in ("SPACE_ID", "SPACE_HOST", "HF_SPACE_ID"))
         if public_host and os.environ.get("ALLOW_DEFAULT_KEY", "").lower() not in ("1", "true", "yes"):
@@ -56,8 +56,7 @@ async def lifespan(app: FastAPI):
             )
         print("🔴 [安全警告] API_KEY 仍是默认值 123456！它既是本代理的 Key，也是控制台登录口令，"
               "请立刻改成强口令。")
-    # 多账号 Express Key：环境变量只做**一次性**初始导入，之后以控制台保存的列表为准。
-    # （用户在控制台把列表清空并保存后，这里不会再把环境变量里的 Key 复种回来。）
+
     app_state.import_env_express_keys_once(config.VERTEX_EXPRESS_API_KEY_VAL)
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
@@ -66,10 +65,7 @@ async def lifespan(app: FastAPI):
               "若不启用 Cookie 直连模式，聊天请求将会报错。")
     await refresh_models_config_cache()
 
-    # 启动时自动探测各 Key 归属的 GCP Project ID（location 钉定要用）。
-    # 放后台任务里跑：探测走外网，绝不能阻塞服务启动。
     _probe_task = asyncio.create_task(_probe_express_projects_on_startup())
-    # 过期缓冲清理器（弱网续传用，见 resumable.py）
     _sweeper_task = asyncio.create_task(resumable_store.sweeper_loop())
     try:
         yield
@@ -79,13 +75,12 @@ async def lifespan(app: FastAPI):
                 _t.cancel()
         resumable_store.cancel_all_pumps()
 
+
 app = FastAPI(title="agentplatform2api", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    # 本服务使用 Bearer / Basic 鉴权，不依赖浏览器 Cookie；
-    # 关闭 allow_credentials 以符合 CORS 规范（通配符 + 凭证不合法）。
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -100,7 +95,7 @@ async def stats_tracker_middleware(request: Request, call_next):
         stats.increment_total()
         try:
             response = await call_next(request)
-            if response.status_code >= 400:
+            if response.status_code >= 400 and response.status_code != 499:
                 stats.add_error()
             return response
         except Exception as e:
@@ -114,12 +109,9 @@ AUTH_COOKIE = "ap_session"
 DEFAULT_API_KEY = "123456"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
 
-# P2-2：会话 token 改为随机值存内存，不再用 sha256(常量 + API_KEY) 这种确定值。
-# 确定值意味着同一个 API_KEY 永远对应同一个 cookie，无法单独失效某个会话。
-_sessions: dict = {}          # token -> 过期时间戳
+_sessions: dict = {}
 _sessions_lock = threading.Lock()
 
-# 登录失败计数：{ip: [失败次数, 最近失败时间]}，指数退避
 _login_failures: dict = {}
 _login_lock = threading.Lock()
 LOGIN_LOCK_BASE_SECONDS = 2
@@ -130,7 +122,7 @@ def _issue_session() -> str:
     token = secrets.token_urlsafe(32)
     now = time.time()
     with _sessions_lock:
-        for t, exp in list(_sessions.items()):     # 顺手清理过期会话
+        for t, exp in list(_sessions.items()):
             if exp < now:
                 _sessions.pop(t, None)
         _sessions[token] = now + SESSION_TTL_SECONDS
@@ -157,7 +149,6 @@ def _is_authed(request: Request) -> bool:
 
 
 def _login_retry_after(ip: str) -> int:
-    """该 IP 还需等待多少秒才能再次尝试登录（0 = 可以尝试）。"""
     with _login_lock:
         rec = _login_failures.get(ip)
         if not rec:
@@ -182,7 +173,6 @@ def _clear_login_failure(ip: str) -> None:
 
 
 def mask_cookie(cookie_str: str) -> str:
-    """S-1：控制台只回显掩码，不再把完整 Google 会话 Cookie 明文吐回前端。"""
     if not cookie_str:
         return ""
     names = []
@@ -205,27 +195,39 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <title>登录 · agentplatform2api</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>body{background:#fbfbfd;font-family:'Inter',system-ui,sans-serif;color:#18181b}
-.inp{border:1px solid #e8e8ec;border-radius:10px;padding:11px 13px;width:100%;outline:none;font-size:15px}
-.inp:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,.12)}
-.btn{background:#4f46e5;color:#fff;border-radius:10px;font-weight:600;padding:11px;width:100%;transition:.15s}
-.btn:hover{background:#4338ca}</style>
+<style>
+body{
+  background:radial-gradient(circle at 15% 20%, #f5eeff 0%, transparent 45%),
+             radial-gradient(circle at 85% 80%, #e8fbf6 0%, transparent 45%),
+             #fdfbf9;
+  font-family:'Inter',system-ui,sans-serif;color:#3d354b;
+}
+.card{
+  background:rgba(255,255,255,.92);backdrop-filter:blur(10px);
+  border:1px solid #ede7f6;border-radius:20px;
+  box-shadow:0 10px 30px -10px rgba(139,124,246,.14);
+}
+.inp{border:1px solid #e6dff2;border-radius:12px;padding:11px 14px;width:100%;outline:none;font-size:15px;background:#fcfaff;color:#3d354b;transition:.2s}
+.inp:focus{border-color:#8b7cf6;background:#fff;box-shadow:0 0 0 3px rgba(139,124,246,.16)}
+.btn{background:linear-gradient(135deg,#8b7cf6 0%,#f48fb1 100%);color:#fff;border-radius:12px;font-weight:600;padding:11px;width:100%;transition:.2s;box-shadow:0 4px 12px rgba(139,124,246,.28)}
+.btn:hover{opacity:.94;transform:translateY(-1px)}
+</style>
 </head><body class="min-h-screen flex items-center justify-center px-4">
   <div class="w-full max-w-sm">
     <div class="flex items-center gap-3 mb-6 justify-center">
-      <svg width="40" height="40" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="11" fill="url(#lg)"/>
+      <svg width="42" height="42" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="12" fill="url(#lg)"/>
       <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
       <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/><path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
-      <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs></svg>
-      <span class="text-lg font-bold tracking-tight">agentplatform2api</span>
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#8b7cf6"/><stop offset=".55" stop-color="#f48fb1"/><stop offset="1" stop-color="#5fd3bc"/></linearGradient></defs></svg>
+      <span class="text-xl font-bold tracking-tight">agentplatform<span style="color:#8b7cf6">2api</span></span>
     </div>
-    <div class="bg-white border border-neutral-200 rounded-2xl p-6 shadow-sm">
-      <p class="text-sm text-neutral-500 mb-4">请输入访问密码（即 API_KEY）</p>
+    <div class="card p-6">
+      <p class="text-sm text-[#7c728d] mb-4">请输入访问密码（即 API_KEY）</p>
       <form id="f" onsubmit="return doLogin(event)">
-        <input id="pw" type="password" class="inp mb-3" placeholder="密码" autofocus autocomplete="current-password">
+        <input id="pw" type="password" class="inp mb-3.5" placeholder="密码" autofocus autocomplete="current-password">
         <button class="btn" type="submit">进入控制台</button>
       </form>
-      <p id="err" class="text-xs text-rose-600 mt-3 h-4"></p>
+      <p id="err" class="text-xs text-[#e05670] mt-3 h-4"></p>
     </div>
   </div>
 <script>
@@ -233,7 +235,10 @@ async function doLogin(e){
   e.preventDefault();
   const pw=document.getElementById('pw').value;
   const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
-  if(r.ok){ location.href='/'; } else { document.getElementById('err').textContent='密码错误，请重试'; }
+  if(r.ok){ location.href='/'; } else {
+    const d=await r.json().catch(()=>({}));
+    document.getElementById('err').textContent=d.error||'密码错误，请重试';
+  }
   return false;
 }
 </script>
@@ -242,7 +247,7 @@ async function doLogin(e){
 
 
 # ==========================================
-# 控制台（浅色 Vercel 风格，单文件，免构建）
+# 控制台（马卡龙柔和配色，单文件，免构建）
 # ==========================================
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -255,53 +260,119 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root { --border:#e8e8ec; --muted:#6b7280; --fg:#18181b; --bg:#fbfbfd; --accent:#4f46e5; --accent2:#7c3aed; --accent-hover:#4338ca; }
+  :root {
+    --border:#ece5f5;
+    --muted:#7d738e;
+    --fg:#3b334a;
+    --bg:#fdfbf9;
+    --accent:#8b7cf6;
+    --accent2:#f48fb1;
+    --accent-hover:#7665e8;
+    --mint:#5fd3bc;
+    --mint-text:#239480;
+    --apricot:#f8c27a;
+    --apricot-text:#c97b1e;
+    --coral:#f68697;
+    --coral-text:#d64860;
+    --sky:#74b9ff;
+  }
   * { -webkit-font-smoothing:antialiased; }
-  body { background:var(--bg); color:var(--fg); font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif; }
-  .card { background:#fff; border:1px solid var(--border); border-radius:14px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
+  body {
+    background:
+      radial-gradient(circle at 8% 12%, rgba(243,232,255,.65) 0%, transparent 40%),
+      radial-gradient(circle at 92% 18%, rgba(230,252,245,.65) 0%, transparent 40%),
+      radial-gradient(circle at 50% 90%, rgba(255,238,244,.55) 0%, transparent 45%),
+      var(--bg);
+    color:var(--fg);
+    font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+  }
+  .card {
+    background:rgba(255,255,255,.94);
+    border:1px solid var(--border);
+    border-radius:16px;
+    box-shadow:0 4px 18px -4px rgba(139,124,246,.07);
+  }
+  .stat-total { background:linear-gradient(145deg,#ffffff 0%,#f6f2ff 100%); border-color:#e6defa; }
+  .stat-ok    { background:linear-gradient(145deg,#ffffff 0%,#eefcf8 100%); border-color:#d5f5ec; }
+  .stat-retry { background:linear-gradient(145deg,#ffffff 0%,#fff9ef 100%); border-color:#fae7c8; }
+  .stat-err   { background:linear-gradient(145deg,#ffffff 0%,#fff2f5 100%); border-color:#fbd5dc; }
   .lbl { font-size:12px; color:var(--muted); font-weight:500; }
   .val { font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
-  .btn { background:var(--accent); color:#fff; border-radius:9px; font-weight:600; transition:.15s; box-shadow:0 1px 2px rgba(79,70,229,.25); }
-  .btn:hover { background:var(--accent-hover); }
-  .btn:disabled { opacity:.5; cursor:not-allowed; }
-  .btn-ghost { background:#fff; color:var(--fg); border:1px solid var(--border); border-radius:9px; font-weight:500; }
-  .btn-ghost:hover { background:#f7f7f9; }
-  .inp { border:1px solid var(--border); border-radius:9px; background:#fff; font-size:14px; padding:8px 10px; width:100%; outline:none; transition:.15s; color:var(--fg); }
-  .inp:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,70,229,.12); }
-  .inp:disabled { background:#f4f4f6; color:#a1a1aa; }
-  .tab { padding:14px 4px; font-size:14px; font-weight:500; color:var(--muted); border-bottom:2px solid transparent; cursor:pointer; white-space:nowrap; }
+  .btn {
+    background:linear-gradient(135deg, #8b7cf6 0%, #a288f8 100%);
+    color:#fff; border-radius:10px; font-weight:600; transition:.18s;
+    box-shadow:0 3px 10px rgba(139,124,246,.24);
+  }
+  .btn:hover { background:linear-gradient(135deg, #7a6ae8 0%, #9175f0 100%); transform:translateY(-1px); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+  .btn-soft {
+    background:#f8f5ff; color:#6b5bd6; border:1px solid #e4dcfa;
+    border-radius:10px; font-weight:500; transition:.15s;
+  }
+  .btn-soft:hover { background:#f0ebff; border-color:#d2c5f8; }
+  .inp {
+    border:1px solid var(--border); border-radius:10px; background:#fff;
+    font-size:14px; padding:8px 11px; width:100%; outline:none; transition:.15s; color:var(--fg);
+  }
+  .inp:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(139,124,246,.14); }
+  .inp:disabled { background:#f7f5fa; color:#b0a8be; }
+  .tab {
+    padding:13px 6px; font-size:14px; font-weight:600; color:var(--muted);
+    border-bottom:2.5px solid transparent; cursor:pointer; white-space:nowrap; transition:.15s;
+  }
   .tab.active { color:var(--accent); border-bottom-color:var(--accent); }
   .tab:hover:not(.active){ color:var(--fg); }
-  .pill { display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--border); background:#fff; color:#52525b; }
-  .pill-accent { border-color:transparent; background:rgba(79,70,229,.08); color:var(--accent); font-weight:600; }
+  .pill {
+    display:inline-flex; align-items:center; gap:6px; font-size:12px;
+    padding:3.5px 11px; border-radius:999px; border:1px solid var(--border);
+    background:#fff; color:#655b77;
+  }
+  .pill-accent {
+    border-color:#e2d9fc;
+    background:linear-gradient(135deg,rgba(139,124,246,.12),rgba(244,143,177,.12));
+    color:#6b5bd6; font-weight:600;
+  }
+  .pill-mint { border-color:#cdeee5; background:#eefcf8; color:var(--mint-text); font-weight:600; }
+  .pill-apricot { border-color:#f9e2be; background:#fff8ee; color:var(--apricot-text); font-weight:600; }
   .log { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
   ::-webkit-scrollbar{width:8px;height:8px}
-  ::-webkit-scrollbar-thumb{background:#dcdce3;border-radius:8px}
-  ::-webkit-scrollbar-thumb:hover{background:#c0c0ca}
-  .toast { position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--fg); color:#fff; padding:10px 18px; border-radius:10px; font-size:14px; opacity:0; transition:.25s; pointer-events:none; z-index:50; }
+  ::-webkit-scrollbar-thumb{background:#dfd8ec;border-radius:8px}
+  ::-webkit-scrollbar-thumb:hover{background:#c9bfe0}
+  .toast {
+    position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
+    background:linear-gradient(135deg,#4a3f63,#635380); color:#fff;
+    padding:10px 20px; border-radius:12px; font-size:14px; opacity:0;
+    transition:.25s; pointer-events:none; z-index:50;
+    box-shadow:0 8px 24px rgba(74,63,99,.22);
+  }
   .toast.show { opacity:1; }
-  .switch { position:relative; width:40px; height:22px; }
+  .switch { position:relative; width:40px; height:22px; display:inline-block; }
   .switch input{opacity:0;width:0;height:0}
-  .slider{position:absolute;inset:0;background:#e4e4e7;border-radius:999px;transition:.2s;cursor:pointer}
-  .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.2)}
-  input:checked + .slider{background:var(--accent)}
+  .slider{position:absolute;inset:0;background:#e6e0f0;border-radius:999px;transition:.2s;cursor:pointer}
+  .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+  input:checked + .slider{background:linear-gradient(135deg,#8b7cf6,#5fd3bc)}
   input:checked + .slider:before{transform:translateX(18px)}
-  .hero { background:linear-gradient(180deg,#fff, #fbfbfd); border:1px solid var(--border); border-radius:16px; }
-  /* 说明收纳：面板功能很多，长说明平铺会挤爆版面，但说明本身不能省。
-     统一收进 ⓘ 折叠块——默认只占一个图标，点开才展开详细文字。 */
-  .helpq { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px;
-           border-radius:50%; border:1px solid #d4d4d8; color:#a1a1aa; font-size:10px; line-height:1;
-           cursor:pointer; user-select:none; vertical-align:middle; margin-left:5px; transition:.15s; }
-  .helpq:hover { border-color:var(--accent); color:var(--accent); background:rgba(79,70,229,.06); }
+  .hero {
+    background:linear-gradient(135deg,rgba(255,255,255,.96) 0%,rgba(249,245,255,.94) 55%,rgba(239,252,248,.94) 100%);
+    border:1px solid var(--border); border-radius:18px;
+    box-shadow:0 6px 20px -6px rgba(139,124,246,.09);
+  }
+  .helpq {
+    display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px;
+    border-radius:50%; border:1px solid #d5cce6; color:#9286a8; font-size:10px; line-height:1;
+    cursor:pointer; user-select:none; vertical-align:middle; margin-left:5px; transition:.15s;
+    background:#faf8ff;
+  }
+  .helpq:hover { border-color:var(--accent); color:var(--accent); background:#f2edff; }
   .helpq.on { border-color:var(--accent); color:#fff; background:var(--accent); }
-  .helpbox { display:none; margin-top:7px; padding:9px 11px; border-radius:9px; background:#f7f7fa;
-             border:1px solid #ececf1; font-size:12px; line-height:1.75; color:#52525b; }
+  .helpbox {
+    display:none; margin-top:7px; padding:10px 12px; border-radius:10px; background:#faf8fd;
+    border:1px solid #ece5f7; font-size:12px; line-height:1.75; color:#5e5470;
+  }
   .helpbox.show { display:block; }
-  /* 手机端：帮助文字里的长标识符（模型资源路径、URL）必须能断行，否则会把整张卡片撑破 */
   .helpbox, .helpbox code { overflow-wrap:anywhere; word-break:break-word; }
-  .helpbox code { display:inline; white-space:normal; }
+  .helpbox code { display:inline; white-space:normal; background:#ede6fa; color:#5a48b8; padding:1px 5px; border-radius:5px; font-size:11px; }
   .helpbox b { color:var(--fg); }
-  .helpbox code { background:#e9e9ef; padding:1px 4px; border-radius:4px; font-size:11px; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -310,28 +381,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Header -->
   <header class="hero px-5 py-4 mb-6 flex items-center justify-between flex-wrap gap-3">
     <div class="flex items-center gap-3.5">
-      <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true">
-        <rect width="40" height="40" rx="11" fill="url(#lg)"/>
+      <svg width="42" height="42" viewBox="0 0 40 40" fill="none" aria-hidden="true">
+        <rect width="40" height="40" rx="12" fill="url(#lg)"/>
         <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
         <path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
         <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/>
         <path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
-        <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs>
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#8b7cf6"/><stop offset=".55" stop-color="#f48fb1"/><stop offset="1" stop-color="#5fd3bc"/></linearGradient></defs>
       </svg>
       <div>
         <h1 class="text-xl font-bold tracking-tight leading-none">agentplatform<span style="color:var(--accent)">2api</span></h1>
-        <p class="text-xs text-neutral-500 mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
+        <p class="text-xs text-[#7d738e] mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
       </div>
     </div>
     <div class="flex items-center gap-2">
       <span class="pill pill-accent" id="mode-pill">通道 —</span>
-      <span class="pill"><span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span><span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span></span><span id="uptime">运行中</span></span>
-      <button onclick="logout()" class="pill" style="cursor:pointer" title="退出登录">退出</button>
+      <span class="pill pill-mint"><span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" style="background:#5fd3bc"></span><span class="relative inline-flex rounded-full h-2 w-2" style="background:#2eb89e"></span></span><span id="uptime">运行中</span></span>
+      <button onclick="logout()" class="pill hover:bg-[#f7f4fc]" style="cursor:pointer" title="退出登录">退出</button>
     </div>
   </header>
 
   <!-- Tabs -->
-  <nav class="flex gap-6 border-b border-neutral-200 mb-6 overflow-x-auto">
+  <nav class="flex gap-6 border-b border-[#ece5f5] mb-6 overflow-x-auto">
     <div class="tab active" data-tab="overview" onclick="switchTab('overview')">数据概览</div>
     <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
     <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
@@ -340,23 +411,37 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <!-- Overview -->
   <section id="view-overview">
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-      <div class="card p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1">0</div></div>
-      <div class="card p-4"><div class="lbl">成功响应</div><div id="s-success" class="val text-2xl font-bold mt-1 text-emerald-600">0</div></div>
-      <div class="card p-4"><div class="lbl">拥堵重试</div><div id="s-retries" class="val text-2xl font-bold mt-1 text-amber-500">0</div></div>
-      <div class="card p-4"><div class="lbl">错误 / 拦截</div><div id="s-error" class="val text-2xl font-bold mt-1 text-rose-600">0</div></div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3.5 mb-4">
+      <div class="card stat-total p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1" style="color:#6b5bd6">0</div></div>
+      <div class="card stat-ok p-4"><div class="lbl">成功响应</div><div id="s-success" class="val text-2xl font-bold mt-1" style="color:var(--mint-text)">0</div></div>
+      <div class="card stat-retry p-4"><div class="lbl">拥堵重试</div><div id="s-retries" class="val text-2xl font-bold mt-1" style="color:var(--apricot-text)">0</div></div>
+      <div class="card stat-err p-4"><div class="lbl">错误 / 拦截</div><div id="s-error" class="val text-2xl font-bold mt-1" style="color:var(--coral-text)">0</div></div>
     </div>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-      <div class="card p-5 flex flex-col items-center justify-center">
-        <div class="lbl w-full mb-3">服务健康度</div>
-        <div class="w-36 h-36"><canvas id="donut"></canvas></div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+      <div class="card p-5 flex flex-col items-center justify-between">
+        <div class="flex items-center justify-between w-full mb-2">
+          <span class="lbl">服务健康度</span>
+          <span id="health-rate" class="pill pill-mint" style="font-size:11px;padding:2px 8px">100% 正常</span>
+        </div>
+        <div class="w-36 h-36 my-1"><canvas id="donut"></canvas></div>
+        <div class="flex items-center justify-center gap-4 text-xs text-[#6e6480] mt-2 w-full">
+          <span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-full" style="background:#5fd3bc"></span>成功</span>
+          <span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-full" style="background:#f8c27a"></span>重试</span>
+          <span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-full" style="background:#f68697"></span>错误</span>
+        </div>
       </div>
-      <div class="card p-5 md:col-span-2">
-        <div class="lbl mb-4">Token 算力消耗 <span class="text-neutral-400" style="text-transform:none;font-weight:400">· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
+      <div class="card p-5 md:col-span-2 flex flex-col justify-between">
+        <div class="lbl mb-4">Token 算力消耗 <span class="text-[#9a90ab]" style="text-transform:none;font-weight:400">· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
         <div class="space-y-4">
-          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Prompt（输入）</span><span id="t-prompt" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-black h-1.5 rounded-full" style="width:70%"></div></div></div>
-          <div><div class="flex justify-between text-sm mb-1"><span class="text-neutral-600">Completion（输出）</span><span id="t-comp" class="val font-semibold">0</span></div><div class="w-full bg-neutral-100 rounded-full h-1.5"><div class="bg-neutral-400 h-1.5 rounded-full" style="width:45%"></div></div></div>
-          <div class="pt-4 border-t border-neutral-100 flex justify-between items-center"><span class="lbl">总计</span><span id="t-total" class="val text-xl font-bold">0</span></div>
+          <div>
+            <div class="flex justify-between text-sm mb-1.5"><span class="text-[#5e5470]">Prompt（输入）</span><span id="t-prompt" class="val font-semibold" style="color:#6b5bd6">0</span></div>
+            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden"><div id="bar-prompt" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#8b7cf6,#74b9ff)"></div></div>
+          </div>
+          <div>
+            <div class="flex justify-between text-sm mb-1.5"><span class="text-[#5e5470]">Completion（思考与输出）</span><span id="t-comp" class="val font-semibold" style="color:var(--mint-text)">0</span></div>
+            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden"><div id="bar-comp" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#5fd3bc,#f48fb1)"></div></div>
+          </div>
+          <div class="pt-4 border-t border-[#f0eaf8] flex justify-between items-center"><span class="lbl">累计总消耗</span><span id="t-total" class="val text-xl font-bold" style="color:#5344a8">0</span></div>
         </div>
       </div>
     </div>
@@ -367,40 +452,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card p-5 mb-4">
       <div class="lbl mb-3">上游调用通道</div>
       <div class="flex flex-col sm:flex-row gap-3">
-        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-api">
-          <input type="radio" name="mode" value="api_key" class="mt-1" onchange="updateMode('api_key')">
-          <div><div class="font-medium text-sm">Express API Key（标准）</div><div class="text-xs text-neutral-500 mt-0.5">用 VERTEX_EXPRESS_API_KEY 调官方 SDK</div></div>
+        <label class="flex-1 border border-[#e6dff2] rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-api">
+          <input type="radio" name="mode" value="api_key" class="mt-1 accent-[#8b7cf6]" onchange="updateMode('api_key')">
+          <div><div class="font-semibold text-sm">Express API Key（标准模式）</div><div class="text-xs text-[#7d738e] mt-0.5">使用官方 google-genai SDK + 多账号 Express Key 轮询调用</div></div>
         </label>
-        <label class="flex-1 border border-neutral-200 rounded-lg p-3 cursor-pointer flex items-start gap-3 hover:bg-neutral-50" id="opt-web">
-          <input type="radio" name="mode" value="web_proxy" class="mt-1" onchange="updateMode('web_proxy')">
-          <div><div class="font-medium text-sm">Cookie 直连反代</div><div class="text-xs text-neutral-500 mt-0.5">用控制台 Cookie 调 batchGraphql</div></div>
+        <label class="flex-1 border border-[#e6dff2] rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-web">
+          <input type="radio" name="mode" value="web_proxy" class="mt-1 accent-[#8b7cf6]" onchange="updateMode('web_proxy')">
+          <div><div class="font-semibold text-sm">Cookie 直连反代（Studio 模式）</div><div class="text-xs text-[#7d738e] mt-0.5">使用控制台 Cookie + SAPISIDHASH 直连 batchGraphql</div></div>
         </label>
       </div>
     </div>
-    <!-- Express API Key 列表（多账号，热编辑） -->
+
+    <!-- Express API Key 列表（多账号，热编辑，即添即探） -->
     <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
         <div>
           <div class="text-sm font-semibold">Express API Key 列表<span class="helpq" onclick="hlp(this,'h_keys')">?</span></div>
-          <div class="text-xs text-neutral-500 mt-0.5">多个谷歌账号的 Key 可一起放这里，按「多 Key 轮询」开关随机或轮询使用</div>
+          <div class="text-xs text-[#7d738e] mt-0.5">支持添加多个谷歌账号的 Key；添加后直接点「探测」会自动保存并探测归属项目</div>
         </div>
-        <div class="flex items-center gap-2">
-          <span id="keys-count" class="pill" style="text-transform:none">0 个</span>
-          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="probeAllKeys()">🔎 探测全部项目</button>
-          <button class="px-3 py-1.5 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="addKeyRow()">＋ 添加 Key</button>
+        <div class="flex items-center gap-2 flex-wrap">
+          <span id="keys-count" class="pill pill-accent" style="text-transform:none">0 个</span>
+          <button class="btn-soft px-3 py-1.5 text-sm" onclick="probeAllKeys()">🔎 探测全部项目</button>
+          <button class="btn-soft px-3 py-1.5 text-sm" onclick="addKeyRow()">＋ 添加 Key</button>
           <button class="btn px-4 py-1.5 text-sm" onclick="saveExpressKeys()">保存 Key 列表</button>
         </div>
       </div>
       <div id="h_keys" class="helpbox">
-        <b>热编辑</b>：增删改后点「保存 Key 列表」立即生效，<b>不需要重启服务</b>。列表存在 <code>web_state.json</code>（文件权限 0600）。<br>
-        <b>Project ID</b>：每个 Key 属于不同的谷歌账号/项目，标准模式的 location 钉定会用<b>这个 Key 自己的项目</b>拼资源路径 <code>projects/{project}/locations/{location}/...</code>，不再共用 Cookie 通道那份全局 Project ID。<br>
-        启动时自动探测填入（用不存在的模型名调一次 generateContent，从上游 404 错误信息里解析项目，不消耗配额；来源显示 <code>auto</code>）；也可点每行的「探测」单独重探，或直接手填（来源变 <code>manual</code>，探测不会覆盖手填值）。<br>
-        探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。<br>
-        <b>环境变量</b> <code>VERTEX_EXPRESS_API_KEY</code> 只在<b>首次启动</b>时一次性导入这里；此后以本列表为准——<b>把列表清空并保存后，重启也不会被环境变量复种</b>。<br>
-        <b>明文显示</b>：本列表按需要明文展示 Key（控制台本身有密码保护）；运行日志里只打掩码。
+        <b>即添即探 &amp; 热生效</b>：点击「＋ 添加 Key」填入新 Key 后，无论直接点单行的「探测」、「🔎 探测全部项目」还是「保存 Key 列表」，都会<b>自动将新 Key 保存并立即热生效</b>，不会丢失已填内容，也无需重启服务。<br>
+        <b>Project ID 绑定</b>：每个 Key 对应各自谷歌账号的 GCP 项目，标准模式钉定 location 时优先使用该 Key 自己的 Project ID。<br>
+        <b>环境变量</b>：<code>VERTEX_EXPRESS_API_KEY</code> 仅在首次启动时做一次性导入；清空列表并保存后，重启不会复种。
       </div>
-      <div id="keys-list" class="space-y-2"></div>
-      <p id="keys-empty" class="text-xs text-neutral-500 mt-2 hidden">当前没有任何 Express Key。点「＋ 添加 Key」粘贴一个，再点「保存 Key 列表」。</p>
+      <div id="keys-list" class="space-y-2.5"></div>
+      <p id="keys-empty" class="text-xs text-[#7d738e] mt-2 hidden">当前没有任何 Express Key。点「＋ 添加 Key」粘贴一个，直接点「探测」或「保存 Key 列表」即可。</p>
     </div>
 
     <div id="cookie-box" class="card p-5 hidden">
@@ -409,10 +492,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="lbl mb-2">Google Cloud Project ID</div>
       <input id="project-input" class="inp mb-3" placeholder="可直接粘贴含 ?project=xxx 的整条 URL，自动提取">
       <div class="flex items-center justify-between">
-        <span class="text-xs text-neutral-500">保存后自动校验是否包含 SAPISID</span>
+        <span class="text-xs text-[#7d738e]">保存后自动校验是否包含 SAPISID</span>
         <button class="btn px-4 py-2 text-sm" onclick="saveCookie()">保存并激活</button>
       </div>
-      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久，取决于账号会话是否有效）；仅当出现 Permission Denied 等权限错误时再重新获取粘贴即可，并非只有 1–2 小时。</p>
+      <p class="text-xs text-[#7d738e] mt-3 leading-relaxed">💡 Cookie 通常较为持久（可维持数周甚至更久）；当出现 <code>aiplatform.endpoints.predict denied</code> 权限错误时，90% 以上是因为 Cookie 会话已过期，重新从浏览器复制粘贴保存即可。</p>
     </div>
   </section>
 
@@ -421,50 +504,50 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <div class="lbl mb-1">选择模型 <span id="ov-badge" class="pill pill-accent hidden" style="text-transform:none">已有专属参数</span></div>
-          <select id="model-sel" class="inp" style="min-width:240px" onchange="renderCaps()"></select>
+          <div class="lbl mb-1">选择编辑作用域（全局默认 / 指定模型专属） <span id="ov-badge" class="pill pill-accent hidden" style="text-transform:none">★ 已有专属参数</span></div>
+          <select id="model-sel" class="inp" style="min-width:260px" onchange="renderCaps()"></select>
         </div>
-        <div id="caps-summary" class="text-xs text-neutral-600 flex flex-wrap gap-2 max-w-xl"></div>
+        <div id="caps-summary" class="text-xs flex flex-wrap gap-2 max-w-xl"></div>
       </div>
-      <p class="text-xs text-neutral-500 mt-3 leading-relaxed">上面的下拉框选择<b>编辑对象</b>：选「＊ 全局默认」就是在改所有模型的默认值；选某个具体模型，就是在改<b>那个模型</b>的专属值（保存后模型名后出现 ★）。切换下拉框时，下面 ① 区的字段会跟着换成对应对象的值。<br>
-      <b>① 按模型参数</b>（思考 / 生图 / 采样 / 注入与续写）跟随上面的下拉框，用本卡片的按钮保存。<br>
-      <b>② 全局设置</b>（图压缩 / 重试 / 假流式 / 调试开关）只有全局一份，用页面底部的「保存全局设置」保存，<b>不会</b>动到 ① 区的任何内容。<br>
-      优先级：<b>单次请求 &gt; 模型专属 &gt; 全局默认 &gt; 内置</b>，最后仍按模型能力自动裁剪。</p>
-      <div class="flex items-center gap-2 mt-3 flex-wrap">
+      <p class="text-xs text-[#7d738e] mt-3 leading-relaxed">
+        • <b>① 按模型参数</b>（思考 / 生图 / 采样 / 预填充与注入）完全跟随上方下拉框：选「＊ 全局默认」时修改的是所有模型的默认值；选具体模型时修改的是该模型的专属值（带 ★），通过本卡片的按钮保存。<br>
+        • <b>② 全局设置</b>（location 区域 / 图片压缩 / 重试退避 / 假流式与弱网续传 / 调试开关）全局唯一，通过页面底部的「保存全局设置」按钮保存，<b>两个分区完全独立、互不覆盖</b>。
+      </p>
+      <div class="flex items-center gap-2.5 mt-3.5 flex-wrap">
         <button id="btn-scope-save" class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
-        <button id="btn-scope-clear" class="px-4 py-2 text-sm rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="clearModelOverride()">清除该模型专属</button>
-        <span id="ov-hint" class="text-xs text-neutral-500"></span>
+        <button id="btn-scope-clear" class="btn-soft px-4 py-2 text-sm" onclick="clearModelOverride()">清除该模型专属</button>
+        <span id="ov-hint" class="text-xs text-[#7d738e]"></span>
       </div>
     </div>
 
-    <div class="flex items-center gap-2 mb-2 mt-5">
-      <span class="pill pill-accent" style="text-transform:none">① 按模型参数</span>
-      <span class="text-xs text-neutral-500">下面这些卡片的内容，属于上方下拉框选中的那个对象（全局默认 / 某个模型），用上方的保存按钮写入。</span>
+    <div class="flex items-center gap-2 mb-2.5 mt-5">
+      <span class="pill pill-accent" style="text-transform:none">① 按模型参数（跟随上方下拉框）</span>
+      <span class="text-xs text-[#7d738e]">本区所有设置均支持按模型单独保存，使用上方按钮写入。</span>
     </div>
 
     <div class="grid md:grid-cols-2 gap-4">
       <!-- 思考 -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">思考强度</div>
+        <div class="text-sm font-semibold mb-3">思考强度与控制</div>
         <div class="mb-3" id="wrap-g3level">
-          <div class="lbl mb-1">Gemini 3.x 思考档位（thinking_level）</div>
+          <div class="lbl mb-1">思考档位（thinking_level）</div>
           <select id="thinking_g3_level" class="inp"><option value="">自动（按模型默认）</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
         </div>
-        <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
-        <div class="mt-3 pt-3 border-t border-neutral-100">
+        <p id="think-note" class="text-xs text-[#7d738e] mt-2"></p>
+        <div class="mt-3 pt-3 border-t border-[#f0eaf8]">
           <div class="lbl mb-1">原生思考控制（native_thinking_mode）</div>
           <select id="native_thinking_mode" class="inp">
             <option value="request">跟随请求（默认）</option>
             <option value="off">关闭原生思考（角色扮演推荐）</option>
             <option value="console">强制用上方档位（忽略前端）</option>
           </select>
-          <p class="text-xs text-neutral-500 mt-2 leading-relaxed">🎭 <b>跑角色扮演预设、想让预设自带的思维链接管时，选“关闭原生思考”。</b>只想对某个模型这么设，就用上方的“保存为该模型专属”。<br>• <b>跟随请求</b>：用前端发来的 <code>reasoning_effort</code>；SillyTavern 等常发 <code>xhigh</code> → 高强度原生思考。<br>• <b>关闭原生思考</b>：忽略前端参数，把档位压到<span id="ntm-floor">该模型最低档</span>，并<b>不返回思考</b>。⚠️ 实测 Studio(batchGraphql) 会忽略 includeThoughts，故本项在压档位的同时于响应侧<b>剥离思考块</b>——重预设下这是避免“只有思考、没有正文”的关键。<br>• <b>强制用上方档位</b>：忽略前端，用你在上面选的档位（返回思考）。<br>（预填充预设另见“开关 &amp; 预填充”卡片的压制开关。）</p>
+          <p class="text-xs text-[#7d738e] mt-2 leading-relaxed">🎭 跑酒馆角色扮演预设时推荐选<b>「关闭原生思考」</b>：自动忽略前端传来的 <code>reasoning_effort=xhigh</code>，将档位压到该模型最低合法档并剥离原生思考块，让预设自带的思维链接管。</p>
         </div>
       </div>
 
       <!-- 生图 -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">生图</div>
+        <div class="text-sm font-semibold mb-3">生图参数</div>
         <div class="mb-3">
           <div class="lbl mb-1">默认分辨率（image_size）</div>
           <select id="image_size" class="inp"><option value="512">512</option><option value="1K">1K</option><option value="2K">2K</option><option value="4K">4K</option></select>
@@ -473,80 +556,90 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="lbl mb-1">默认宽高比（aspect_ratio）</div>
           <select id="image_aspect_ratio" class="inp"></select>
         </div>
-        <p id="image-note" class="text-xs text-neutral-500 mt-2"></p>
-        <div class="space-y-3 mt-3 pt-3 border-t border-neutral-100">
-          <div class="text-xs text-neutral-400">以下两项仅对生图模型有意义，可按模型专属保存</div>
+        <p id="image-note" class="text-xs text-[#7d738e] mt-2"></p>
+        <div class="space-y-3 mt-3 pt-3 border-t border-[#f0eaf8]">
+          <div class="text-xs text-[#9a90ab]">以下两项可针对生图模型单独开启保存</div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
-            <div id="h_isi" class="helpbox">关闭时（默认）生图模型会<b>丢弃 system 提示词</b>——你写的画风、构图要求全部不生效。开启后 system 会随生图请求一起下发。<br>实测对照（system=“纯黑白线稿，只有线条”，user=“画一只猫”）：<b>关 → 彩色写实照片；开 → 黑白线稿</b>。默认关只是为了不改变旧行为，<b>用生图建议打开</b>。</div>
+            <div id="h_isi" class="helpbox">开启后，system 提示词中的画风、构图要求会随生图请求一并下发给生图模型。</div>
           </div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
-            <div id="h_ipf" class="helpbox">默认关：下面“注入预填充”的内容<b>不会</b>发给生图模型。<br>预填充对生图其实有<b>很强的引导力</b>——实测同一句“画一只猫”，预填充承诺“纯黑白钢笔线稿”就真的输出线稿，不加则是彩色写实照片。想用它引导画风或做破限，就打开。<br><b>注意</b>：角色扮演用的预填充（例如思考块开标签）落到生图请求上，可能让模型改吐一段文字而不出图。建议配合“保存为该模型专属”，给生图模型单独配一段合适的预填充。<br>生图模型会自动改用一句<b>要图片</b>的续写指令（否则模型会把“继续往下写”理解成继续写文字，实测会吐字符画）；若你在下面自定义了“续写指令模板”，则以你的为准——生图用时记得写明“直接输出图片”。</div>
+            <div id="h_ipf" class="helpbox">默认关，避免角色扮演的思考标签误注入给生图模型。若想用预填充强力引导画风，可对生图模型单独打开并配专属预填充。</div>
           </div>
         </div>
       </div>
 
       <!-- 采样默认 -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">采样默认值 <span class="text-xs font-normal text-neutral-400">（留空=不注入，交给模型默认）</span></div>
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div class="text-sm font-semibold mb-3">采样默认值 <span class="text-xs font-normal text-[#9a90ab]">（留空=不注入，交给模型默认）</span></div>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
           <div><div class="lbl mb-1.5">temperature</div><input id="default_temperature" type="number" step="0.1" class="inp" placeholder="—"></div>
           <div><div class="lbl mb-1.5">top_p</div><input id="default_top_p" type="number" step="0.05" class="inp" placeholder="—"></div>
           <div><div class="lbl mb-1.5">max_tokens</div><input id="default_max_tokens" type="number" class="inp" placeholder="—"></div>
         </div>
-        <div class="flex items-center justify-between gap-3 mt-5 pt-4 border-t border-neutral-100">
+        <div class="flex items-center justify-between gap-3 mt-5 pt-4 border-t border-[#f0eaf8]">
           <span class="text-sm">采样参数处理<span class="helpq" onclick="hlp(this,'h_sp')">?</span></span>
           <select id="sampling_policy" class="inp" style="max-width:170px"><option value="auto">自动判定</option><option value="deprecated">强制剥离</option><option value="allowed">强制保留</option></select>
         </div>
-        <div id="h_sp" class="helpbox">决定是否把 <code>temperature / top_p / top_k</code> 发给模型。<br>
-          <b>自动判定</b>（默认）：按版本号推断——3.6 起、3.5 Flash-Lite、以及 4.x 及以后一律剥离。<br>
-          <b>什么时候需要手动改</b>：版本号表达不了“号更小但发布更晚”。比如日后出一个 <code>gemini-3.5-pro</code>，官方按“更新模型”废弃了采样，自动判定却会因为 3.5 &lt; 3.6 而放行——此时给它选<b>强制剥离</b>即可，不必改代码。反过来官方澄清某模型仍可调，就选<b>强制保留</b>。<br>
-          可按模型专属保存。生图模型不受此开关影响（本来就剥离全部采样）；<code>candidate_count</code> 是 3.x 的硬限制，也不归它管。</div>
-        <p id="sampling-note" class="text-xs text-neutral-500 mt-2"></p>
+        <div id="h_sp" class="helpbox">决定是否把 <code>temperature / top_p / top_k</code> 发给模型。自 Gemini 3.6 / 3.5-flash-lite / 4.x 起官方已废弃采样参数，自动判定会自动剥离以避免 400 报错。</div>
+        <p id="sampling-note" class="text-xs text-[#7d738e] mt-2"></p>
       </div>
 
-      <!-- 控制台注入（可按模型覆盖） -->
+      <!-- 预填充与注入（全部归入 ① 按模型参数区） -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">注入与续写 <span class="text-xs font-normal text-neutral-400">（留空＝不启用 / 用内置默认；均支持按模型专属）</span></div>
+        <div class="text-sm font-semibold mb-3">预填充兼容与注入 <span class="text-xs font-normal text-[#9a90ab]">（支持按模型单独配置）</span></div>
         <div class="space-y-3">
-
           <div>
+            <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
+              <select id="prefill_mode" class="inp" style="width:155px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+            </div>
+            <div id="h_pfm" class="helpbox">
+              Gemini 3.x / 4.x 拒绝以 assistant 轮次结尾的请求。<br>
+              • <b>智能（默认）</b>：将末尾预填充并入最后一条 user 末尾（严格以预填充原文收尾），并在输出侧自动拼回与智能去重，最稳健。<br>
+              • <b>保留模型轮次</b>：保留 assistant 预填充轮次，在其后补一句简短 user 推动语，输出侧自动剥离重复开标签。<br>
+              • <b>最小</b>：仅补占位 user 保证不报错，不拼回预填充。<br>
+              • <b>关闭</b>：原样下发。
+            </div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
+            <div id="h_pst" class="helpbox">检测到请求末尾带预填充时，自动将模型的原生思考压到最低并不回传，让预设自带的思维链接管。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between"><span class="text-sm">思维链守卫（防跳过思考）<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
+            <div id="h_cotg" class="helpbox">自动识别预填充中未闭合的思维链开标签（如 <code>&lt;thinking&gt;</code>、<code>&lt;cot&gt;</code>），前置注入格式硬性要求并在输出侧去重双开标签，防止模型跳过思考直接写正文。</div>
+          </div>
+          <div class="pt-2 border-t border-[#f0eaf8]">
             <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
             <textarea id="inject_system_instruction" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injs" class="helpbox">追加到客户端 system 之<b>后</b>，两条通道都生效。<br>给 <b>RikkaHub 这类轻量前端</b>用：它们没有酒馆的预设系统，每开一个新对话都要重设系统提示。填在这里就是<b>所有前端、所有对话通用</b>。<br><b>酒馆用户请留空</b>——预设已经管了 system，这里再加会和预设打架，而且 <code>{{getvar::xx}}</code> 这类宏在代理侧<b>不会被解析</b>。</div>
+            <div id="h_injs" class="helpbox">追加到客户端 system 之后。适合 RikkaHub 等轻量前端；酒馆用户已有预设，请留空。</div>
           </div>
           <div>
             <div class="lbl mb-1">注入预填充<span class="helpq" onclick="hlp(this,'h_injp')">?</span></div>
             <textarea id="inject_prefill" rows="2" class="inp log" placeholder="留空 = 不注入"></textarea>
-            <div id="h_injp" class="helpbox">
-              客户端<b>没有发送</b>预填充时，代理自动补一条 assistant 消息，然后按上面的“预填充兼容模式”处理。<br>
-              轻量前端<b>从不发送预填充</b>，等于完全用不上破限最强的那个杠杆，连“预填充时压制原生思考”也永远不会触发（3.6-flash 上更容易出现“只有思考没正文”）。填在这里就能补上。<br>
-              内容通常很短：一句开场白 + 思考块的开标签即可，别塞大段规则（规则请放上面的 system 框）。<br>
-              <b>四条护栏，避免和现有功能冲突</b>：① 客户端已自带预填充（酒馆）→ 跳过，不覆盖；② 请求带函数调用 → 跳过；③ 生图模型 → 默认跳过（可用上面的“生图也注入预填充”放行）；④ 留空 → 完全不启用。<br>
-              <b>只填内容还不够</b>：填完必须点保存——点“保存全局设置”＝对所有模型生效；点上方“保存为该模型专属”＝只对当前所选模型生效。（生图模型还需额外打开上面的“生图也注入预填充”开关，那个开关只是放行，内容仍取自这里。）<br>强烈建议按模型分开配：生图要的是画风描述，角色扮演要的是思考块开标签，两者内容完全不同；问答用的模型则应留空（否则每条回复开头都会多出这段文字，原生思考也会被压制、影响答题深度）。
-            </div>
+            <div id="h_injp" class="helpbox">当客户端请求未带预填充时，自动补一条 assistant 预填充；若客户端已自带预填充则自动跳过。</div>
           </div>
           <div>
             <div class="lbl mb-1">续写指令模板<span class="helpq" onclick="hlp(this,'h_pfi')">?</span></div>
             <textarea id="prefill_instruction" rows="2" class="inp log" placeholder="留空 = 使用内置默认"></textarea>
-            <div id="h_pfi" class="helpbox">留空即用内置默认，一般不用改。<br><b>「智能」模式</b>下它是那句续写指令，预填充文本会附在它后面；<b>「保留模型轮次」模式</b>下它就是末尾那句推动语。<br>若「保留模型轮次」老是重复开标签，可以把这里改得更短更像催促（例如只填 <code>继续</code>），减少“新一轮”的暗示。<br><b>与生图的关系</b>：留空时，生图模型会自动换用一句“直接输出图片”的指令；<b>一旦你在这里填了内容，生图模型也会用你填的这句</b>——若那句写的是“接着往下写”，生图会吐字符画而不是图片。所以给生图模型请用<b>“保存为该模型专属”</b>单独配一句（例如“直接输出图片，不要任何文字”），别让文本模型的模板串过去。</div>
+            <div id="h_pfi" class="helpbox">留空即使用内置默认续写引导语（生图模型留空时会自动换用要求输出图片的专用指令）。</div>
           </div>
         </div>
       </div>
-
     </div>
 
-    <div class="flex items-center gap-2 mb-2 mt-6">
-      <span class="pill" style="text-transform:none;background:#f1f1f5;color:#52525b">② 全局设置</span>
-      <span class="text-xs text-neutral-500">对所有模型统一生效，<b>不支持</b>按模型专属；改动后点页面底部「保存全局设置」，它只保存本区、不影响 ① 区。</span>
+    <!-- ② 全局设置 -->
+    <div class="flex items-center gap-2 mb-2.5 mt-7">
+      <span class="pill pill-apricot" style="text-transform:none">② 全局基础设施设置</span>
+      <span class="text-xs text-[#7d738e]">对所有模型统一生效；修改后点击页面底部「保存全局设置」，不会影响上方 ① 区的任何参数。</span>
     </div>
 
     <div class="grid md:grid-cols-2 gap-4">
       <div class="card p-5">
-            <div class="flex items-center justify-between gap-3">
-              <span class="text-sm">标准模式 location<span class="helpq" onclick="hlp(this,'h_loc')">?</span></span>
-              <select id="express_location" class="inp" style="max-width:180px">
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-sm font-semibold">标准模式 location<span class="helpq" onclick="hlp(this,'h_loc')">?</span></span>
+          <select id="express_location" class="inp" style="max-width:190px">
             <option value="global">global（默认·推荐）</option>
             <option value="">默认（后端自选·旧行为）</option>
             <optgroup label="美国">
@@ -587,17 +680,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <option value="me-west1">me-west1（特拉维夫）</option>
             </optgroup>
           </select>
-            </div>
-            <div id="h_loc" class="helpbox">
-              <b>作用</b>：决定标准（Express）模式请求发到哪个区域，解决“偶发 404、报错里出现没见过的区域”。<br><br>
-              <b>为什么会 404</b>：不指定时由 Google 后端自己挑区域，可能挑到<b>不提供该模型</b>的区域。<br>
-              实测同一个 Key、同一个模型：<code>gemini-2.5-pro</code> 不指定 → 被路由到新加坡区域报 404；选 <code>global</code> → <b>正常出文</b>。<br><br>
-              <b>默认 global</b>：多数 Gemini 模型只在 global 提供，选具体区域反而可能 404，按需再换。<br><br>
-              <b>用哪个项目</b>：自动使用「通道与凭证」里填的 Project ID（或环境变量 <code>GOOGLE_PROJECT_ID</code>）。两者都没有时自动退回不指定区域的旧方式。<br><br>
-              <b>注意</b>：该项目必须是这个 API Key <b>有权、且已开启计费</b>的项目。<br><br>
-              <b>失败会自动兜底</b>：若上游回“模型不存在 / 需要计费”，代理会<b>自动改回不指定区域重试一次</b>，并在运行日志说明怎么修——所以这个设置不会让原本能用的配置变得不能用。
-            </div>
-          </div>
+        </div>
+        <div id="h_loc" class="helpbox">
+          决定标准（Express）模式请求钉定到哪个区域，优先使用当前选中 Key 自有的 Project ID 拼装完整资源路径；若钉定路径失败会自动回退裸模型名重试一次。
+        </div>
+      </div>
 
       <!-- 输入图压缩 -->
       <div class="card p-5">
@@ -621,68 +708,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 开关 -->
+      <!-- 全局开关 -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">开关 & 预填充</div>
+        <div class="text-sm font-semibold mb-3">流式、弱网续传 &amp; 调试开关</div>
         <div class="space-y-3">
-          <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）</span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）<span class="helpq" onclick="hlp(this,'h_fks')">?</span></span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
+          <div id="h_fks" class="helpbox">开启后在等待长思考模型（如 gemini-4-argon）完整生成期间，按下方间隔持续向客户端发送保活数据帧，防止前端超时断连。两条通道均生效。</div>
           <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
-            <div id="h_rsm" class="helpbox">反代收到 Google 的完整回复后先放进服务端缓冲区再吐给前端；前端断线可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传，也可轮询 <code>/v1/resumable/{id}</code> 拉分片。关掉则回到原有直通行为。</div>
+            <div id="h_rsm" class="helpbox">反代将上游回复放入带序号缓冲区，前端断网重连可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传；首包产出前若前端主动取消，会自动停止重试。</div>
           </div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
-            <div id="h_ss" class="helpbox">在每条回复<b>正文末尾</b>附一个可折叠块，列出该回复各安全分类的概率与严重度评分（Hate Speech / Dangerous Content / Sexually Explicit / Harassment / Jailbreak）。用来判断内容离触发拦截还有多远。<br>前端若不渲染 HTML，会看到一段 <code>&lt;details&gt;</code> 原文，属正常。<br><b>Cookie 通道注意</b>：该通道平时下发 <code>OFF</code>（分类器整个关闭、上游不回传评分）。打开本开关后会改为下发 <code>BLOCK_NONE</code>——仍然<b>永不拦截</b>，只是让上游把评分算出来回传。不需要看评分就关掉，保持 <code>OFF</code>。</div>
+            <div id="h_ss" class="helpbox">在回复末尾附加可折叠的安全分类评分块。</div>
           </div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
-            <div id="h_dbg" class="helpbox">两条通道都会在运行日志里打印<b>实际发出</b>的思考档位与采样参数。排查“设置没生效”时先开这个——日志里看到什么，模型就收到了什么。平时可关。</div>
+            <div id="h_dbg" class="helpbox">在运行日志里打印实际发出的思考档位与采样参数。</div>
           </div>
           <div>
             <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
-            <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。<b>无正文时的原始响应样本总是会自动记录，不需要开这个</b>。</div>
+            <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。</div>
           </div>
-
-
-          <div class="pt-1 border-t border-neutral-100"></div>
-          <div class="text-xs font-semibold text-neutral-500 pt-1">预填充</div>
-
-          <div class="flex items-center justify-between gap-3"><span class="text-sm">思维链守卫<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
-          <div id="h_cotg" class="helpbox">
-            解决<b>“预设思维链经常不写、直接出正文”</b>：预填充只是把话头停在 <code>&lt;思维链标签&gt;</code> 上，<b>没有任何一句话告诉模型必须先完成思考</b>，模型于是常常跳过思考直接写正文，前端正则就抓不到思维链。<br>
-            打开后，代理会自动识别预填充里<b>未闭合的开标签</b>，在续写指令末尾追加一条硬性要求：先逐条写完该标签内的思考、用对应闭合标签收尾，然后才写正文。<br>
-            没检测到未闭合标签时（例如预填充只是普通句子）本项不做任何事；生图模型不适用。<br>
-            <b>仍不稳定时</b>：把「原生思考控制」从“关闭原生思考”改为“强制用上方档位 + low”再对比——压到 minimal 会让模型倾向“直接给答案”，可能连带跳过预设要求的长思考。
-          </div>
-          <div>
-            <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
-              <select id="prefill_mode" class="inp" style="width:150px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
-            </div>
-            <div id="h_pfm" class="helpbox">
-              <b>什么是预填充</b>：请求里<b>最后一条 assistant 消息</b>（酒馆预设里通常是最底部那条“助手”条目，内容多为思维链的开标签）。它替模型写好了回复开头，模型只能顺着往下写——这是破限最强的杠杆，也用来顶掉原生思维链。预设里那些 system 条目<b>不是</b>预填充。<br>
-              <b>为什么需要兼容</b>：Gemini 3.x 拒绝以 assistant 结尾的请求（400），必须改造成 user 结尾。<br><br>
-              <b>智能（默认）</b>：删掉那条 assistant，把它的文字并进最后一条 user。模型视角＝“用户给了我一段参考文字”。输出干净（实测开闭标签各 1 个），但模型没有“说过”这句话，破限杠杆最弱。<br>
-              <b>保留模型轮次</b>：assistant 原样留着，后面补一句很短的 user 推动语。模型视角＝“这是我自己写了一半的”，破限杠杆保留。代价是模型容易当成新一轮、<b>把开标签再写一遍</b>（实测 3/3）。<br>
-              <b>最小</b>：只补占位 user 保证不报错，<b>不把预填充拼回输出</b>——思考开标签会缺失，前端正则可能抓不到。<br>
-              <b>关闭</b>：原样发出，3.x 直接 400；而且代理检测不到预填充，思考压制也不会触发。<br><br>
-              2.5 及更早的模型不受影响，走的是<b>原生透传</b>，效果等同老式预填充。
-            </div>
-          </div>
-          <div>
-            <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
-            <div id="h_pst" class="helpbox">检测到预填充时，把模型的<b>原生思维链压到最低并不回传</b>，让预设自带的思维链接管（写作效果通常更好，也避免“只有思考没有正文”）。<br>3.x 压到最低档（无法完全关闭），2.5-flash 预算 0 全关，2.5-pro 降到 128。<br><b>只在请求真的带预填充时才触发</b>；若你的预设把思维链写在 system 里、没有 assistant 条目，请改用上方“思考强度”卡片的“关闭原生思考”。</div>
-          </div>
-
         </div>
       </div>
     </div>
 
     <div class="flex items-center justify-end gap-3 mt-4">
-      <span class="text-xs text-neutral-500">只保存 ② 区（图压缩 / 重试 / 假流式 / 调试开关）；① 区请用上方那个保存按钮</span>
+      <span class="text-xs text-[#7d738e]">仅保存「② 全局基础设施设置」；① 区请用顶部按钮保存</span>
       <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
@@ -690,11 +747,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Logs -->
   <section id="view-logs" class="hidden">
     <div class="card overflow-hidden">
-      <div class="px-4 py-2.5 border-b border-neutral-200 flex items-center gap-2">
-        <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full bg-rose-400"></div><div class="w-3 h-3 rounded-full bg-amber-400"></div><div class="w-3 h-3 rounded-full bg-emerald-400"></div></div>
-        <span class="ml-2 text-xs text-neutral-400 log">terminal · 实时监控</span>
+      <div class="px-4 py-2.5 border-b border-[#ece5f5] flex items-center gap-2 bg-[#faf8ff]">
+        <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full" style="background:#f68697"></div><div class="w-3 h-3 rounded-full" style="background:#f8c27a"></div><div class="w-3 h-3 rounded-full" style="background:#5fd3bc"></div></div>
+        <span class="ml-2 text-xs text-[#8a7fa0] log">terminal · 实时监控</span>
       </div>
-      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fbfbfb]" style="height:60vh"></div>
+      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto bg-[#fdfcff]" style="height:60vh"></div>
     </div>
   </section>
 </div>
@@ -704,10 +761,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let CAPS = {}, chart = null, curAR = "";
 let GLOBAL_SETTINGS = {}, OVERRIDES = {};
-const PER_MODEL_KEYS = ['native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio','default_temperature','default_top_p','default_max_tokens','inject_system_instruction','inject_prefill','prefill_instruction','image_system_instruction','inject_prefill_for_image','sampling_policy','prefill_cot_guard'];
+const PER_MODEL_KEYS = [
+  'native_thinking_mode','thinking_g3_level','image_size','image_aspect_ratio',
+  'default_temperature','default_top_p','default_max_tokens',
+  'inject_system_instruction','inject_prefill','prefill_instruction',
+  'image_system_instruction','inject_prefill_for_image','sampling_policy',
+  'prefill_cot_guard','prefill_mode','prefill_suppress_thinking'
+];
 const COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
-function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1800); }
+function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
 function fmt(n){ return (n||0).toLocaleString('en-US'); }
 async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href='/'; }
 
@@ -716,23 +779,77 @@ function switchTab(t){
   ['overview','channel','params','logs'].forEach(v=>$('view-'+v).classList.toggle('hidden', v!==t));
 }
 
-/* ---------- Overview ---------- */
+/* ---------- Overview (Macaron Donut & Dynamic Token Bars) ---------- */
 function renderChart(s,e,r){
   const ctx=$('donut').getContext('2d');
-  let data=[s,e,r], colors=['#171717','#e11d48','#f59e0b'];
-  if(s===0&&e===0&&r===0){ data=[1]; colors=['#ededed']; }
-  if(chart){ chart.data.datasets[0].data=data; chart.data.datasets[0].backgroundColor=colors; chart.update(); return; }
-  chart=new Chart(ctx,{type:'doughnut',data:{labels:['成功','错误','重试'],datasets:[{data,backgroundColor:colors,borderWidth:2,borderColor:'#fff'}]},options:{cutout:'72%',plugins:{legend:{display:false}}}});
+  const isEmpty = (s===0 && e===0 && r===0);
+  const labels = isEmpty ? ['暂无请求'] : ['成功响应','拥堵重试','错误 / 拦截'];
+  const data   = isEmpty ? [1] : [s, r, e];
+  const colors = isEmpty ? ['#ede7f8'] : ['#5fd3bc', '#f8c27a', '#f68697'];
+
+  const totalDone = s + e;
+  const rateEl = $('health-rate');
+  if(rateEl){
+    if(totalDone === 0){
+      rateEl.textContent = '待命';
+      rateEl.className = 'pill pill-accent';
+    } else {
+      const pct = ((s / totalDone) * 100).toFixed(1).replace(/\.0$/, '');
+      rateEl.textContent = `成功率 ${pct}%`;
+      rateEl.className = pct >= 90 ? 'pill pill-mint' : 'pill pill-apricot';
+    }
+  }
+
+  if(chart){
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.data.datasets[0].backgroundColor = colors;
+    chart.update();
+    return;
+  }
+  chart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        backgroundColor: colors,
+        borderWidth: 3,
+        borderColor: '#ffffff',
+        hoverOffset: 4
+      }]
+    },
+    options: {
+      cutout: '72%',
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#4a3f63',
+          cornerRadius: 8,
+          padding: 9
+        }
+      }
+    }
+  });
 }
+
 async function fetchStats(){
   try{
     const d=await (await fetch('/api/stats')).json();
-    $('s-total').textContent=fmt(d.total); $('s-success').textContent=fmt(d.success);
-    $('s-error').textContent=fmt(d.error); $('s-retries').textContent=fmt(d.retries);
-    $('t-prompt').textContent=fmt(d.prompt_tokens); $('t-comp').textContent=fmt(d.completion_tokens);
-    $('t-total').textContent=fmt((d.prompt_tokens||0)+(d.completion_tokens||0));
+    $('s-total').textContent=fmt(d.total);
+    $('s-success').textContent=fmt(d.success);
+    $('s-error').textContent=fmt(d.error);
+    $('s-retries').textContent=fmt(d.retries);
+    const pTk = d.prompt_tokens || 0;
+    const cTk = d.completion_tokens || 0;
+    const totTk = pTk + cTk;
+    $('t-prompt').textContent=fmt(pTk);
+    $('t-comp').textContent=fmt(cTk);
+    $('t-total').textContent=fmt(totTk);
+    $('bar-prompt').style.width = totTk > 0 ? Math.max(4, Math.round((pTk / totTk) * 100)) + '%' : '0%';
+    $('bar-comp').style.width   = totTk > 0 ? Math.max(4, Math.round((cTk / totTk) * 100)) + '%' : '0%';
     $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
-    renderChart(d.success,d.error,d.retries);
+    renderChart(d.success||0, d.error||0, d.retries||0);
   }catch(e){}
 }
 
@@ -764,8 +881,6 @@ async function loadRuntime(){
     document.querySelector(`input[name=mode][value=${m}]`).checked=true;
     $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
     $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-    /* S-1：后端只返回掩码，绝不回填到输入框（否则保存时会把真实 Cookie 覆盖成掩码）。
-       输入框留空 = 保持现有 Cookie；填了才更新。 */
     const ci=$('cookie-input');
     if(ci){
       ci.value='';
@@ -777,37 +892,36 @@ async function loadRuntime(){
   }catch(e){}
 }
 
-/* ---------- Express Key 列表（多账号，热编辑） ---------- */
+/* ---------- Express Key 列表（多账号，热编辑，即添即探） ---------- */
 let KEYS = [];
 function keySrcPill(rec){
-  if(rec.project_source==='auto') return '<span class="pill" style="text-transform:none">来源 auto</span>';
-  if(rec.project_source==='manual') return '<span class="pill" style="text-transform:none">来源 manual</span>';
-  return '<span class="pill" style="text-transform:none;color:#b45309">未探测</span>';
+  if(rec.project_source==='auto') return '<span class="pill pill-mint" style="text-transform:none">来源 auto</span>';
+  if(rec.project_source==='manual') return '<span class="pill pill-accent" style="text-transform:none">来源 manual</span>';
+  return '<span class="pill pill-apricot" style="text-transform:none">未探测</span>';
 }
 function renderKeys(){
   const box=$('keys-list');
   box.innerHTML = KEYS.map((rec,i)=>`
-    <div class="border border-neutral-200 rounded-lg p-3" data-i="${i}">
+    <div class="border border-[#ebe4f7] bg-[#fcfbff] rounded-xl p-3.5" data-i="${i}">
       <div class="flex items-center gap-2 mb-2">
-        <span class="pill" style="text-transform:none">#${i+1}</span>
+        <span class="pill pill-accent" style="text-transform:none">#${i+1}</span>
         <input class="inp log k-key" style="flex:1" placeholder="粘贴 Express API Key（明文显示）" value="${(rec.key||'').replace(/"/g,'&quot;')}">
-        <label class="flex items-center gap-1 text-xs text-neutral-500 whitespace-nowrap"><input type="checkbox" class="k-enabled" ${rec.enabled===false?'':'checked'}>启用</label>
-        <button class="px-2 py-1 text-xs rounded-lg border border-neutral-300 hover:bg-neutral-50" onclick="probeOneKey(${i})">探测</button>
-        <button class="px-2 py-1 text-xs rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50" onclick="removeKeyRow(${i})">删除</button>
+        <label class="flex items-center gap-1 text-xs text-[#6e6480] whitespace-nowrap"><input type="checkbox" class="k-enabled accent-[#8b7cf6]" ${rec.enabled===false?'':'checked'}>启用</label>
+        <button class="btn-soft px-2.5 py-1 text-xs" onclick="probeOneKey(${i})">探测</button>
+        <button class="px-2.5 py-1 text-xs rounded-lg border border-[#fbd2da] text-[#d64860] bg-[#fff5f7] hover:bg-[#ffecef]" onclick="removeKeyRow(${i})">删除</button>
       </div>
       <div class="flex items-center gap-2 flex-wrap">
         <span class="lbl whitespace-nowrap">Project ID</span>
-        <input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 等待自动探测" value="${(rec.project_id||'').replace(/"/g,'&quot;')}">
+        <input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 点击「探测」自动获取" value="${(rec.project_id||'').replace(/"/g,'&quot;')}">
         ${keySrcPill(rec)}
-        <span class="text-xs text-neutral-400">${rec.detected_at?('探测于 '+new Date(rec.detected_at*1000).toLocaleString()):''}</span>
+        <span class="text-xs text-[#9a90ab]">${rec.detected_at?('探测于 '+new Date(rec.detected_at*1000).toLocaleString()):''}</span>
       </div>
-      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-rose-600':'text-neutral-500'}">${rec._msg||''}</div>
+      <div class="text-xs mt-1 ${(rec._msg_ok===false)?'text-[#d64860]':'text-[#239480]'}">${rec._msg||''}</div>
     </div>`).join('');
-  $('keys-count').textContent = KEYS.length + ' 个';
+  $('keys-count').textContent = KEYS.filter(r=>r.key).length + ' 个';
   $('keys-empty').classList.toggle('hidden', KEYS.length>0);
 }
-function collectKeys(){
-  // 以输入框的当前内容为准（用户可能改了还没保存）
+function syncKeysFromDom(){
   [...document.querySelectorAll('#keys-list [data-i]')].forEach(row=>{
     const i=Number(row.dataset.i);
     if(!KEYS[i]) return;
@@ -816,10 +930,13 @@ function collectKeys(){
     if(pid !== (KEYS[i].project_id||'')){ KEYS[i].project_id = pid; KEYS[i].project_source = pid?'manual':''; }
     KEYS[i].enabled = row.querySelector('.k-enabled').checked;
   });
+}
+function collectKeys(){
+  syncKeysFromDom();
   return KEYS.filter(r=>r.key);
 }
-function addKeyRow(){ collectKeys(); KEYS.push({key:'',project_id:'',project_source:'',enabled:true}); renderKeys(); }
-function removeKeyRow(i){ collectKeys(); KEYS.splice(i,1); renderKeys(); }
+function addKeyRow(){ syncKeysFromDom(); KEYS.push({key:'',project_id:'',project_source:'',enabled:true}); renderKeys(); }
+function removeKeyRow(i){ syncKeysFromDom(); KEYS.splice(i,1); renderKeys(); }
 async function loadExpressKeys(){
   try{
     const d=await (await fetch('/api/express-keys')).json();
@@ -838,45 +955,72 @@ async function saveExpressKeys(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function probeOneKey(i){
-  collectKeys();
-  const rec=KEYS[i]; if(!rec||!rec.key){ toast('请先填入 Key'); return; }
-  toast('正在探测…');
+  syncKeysFromDom();
+  const rec=KEYS[i];
+  if(!rec||!rec.key){ toast('请先在该行填入 Express API Key'); return; }
+  const targetKey = rec.key;
+  const emptyRows = KEYS.filter(r=>!r.key);
+  const payload = KEYS.filter(r=>r.key);
+  toast('正在自动保存并探测归属项目…');
   try{
-    const r=await fetch('/api/express-keys/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:rec.key,force:true})});
+    // 将当前界面上的全部非空 Key 一并传给后端先保存入库再探测，避免未保存的新 Key 被覆盖丢失
+    const r=await fetch('/api/express-keys/probe',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:targetKey, force:true, keys:payload})
+    });
     const d=await r.json();
     if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
     const res=(d.results||[])[0]||{};
-    await loadExpressKeys();
-    const hit=KEYS.find(x=>x.key===rec.key);
-    if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; renderKeys(); }
-    toast(res.ok?('项目：'+(res.project_id||'—')):('❌ '+(res.message||'探测失败')));
+    KEYS=(d.keys||[]).map(x=>Object.assign({},x)).concat(emptyRows);
+    const hit=KEYS.find(x=>x.key===targetKey);
+    if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; }
+    renderKeys();
+    toast(res.ok?('✅ 已保存并探测成功：'+(res.project_id||'—')):('⚠️ Key 已保存，但探测未果：'+(res.message||'请手动填写项目')));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function probeAllKeys(){
-  collectKeys();
-  toast('正在探测全部 Key…');
+  syncKeysFromDom();
+  const emptyRows = KEYS.filter(r=>!r.key);
+  const payload = KEYS.filter(r=>r.key);
+  if(payload.length===0){ toast('请先至少添加一个 Express API Key'); return; }
+  toast('正在自动保存并探测全部 Key…');
   try{
-    const r=await fetch('/api/express-keys/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true,force:true})});
+    const r=await fetch('/api/express-keys/probe',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({all:true, force:true, keys:payload})
+    });
     const d=await r.json();
     if(!r.ok){ toast('❌ '+(d.error||'探测失败')); return; }
     const results=d.results||[];
-    await loadExpressKeys();
+    KEYS=(d.keys||[]).map(x=>Object.assign({},x)).concat(emptyRows);
     results.forEach(res=>{ const hit=KEYS.find(x=>x.key===res.key); if(hit){ hit._msg=res.message||''; hit._msg_ok=!!res.ok; } });
     renderKeys();
-    toast('探测完成：成功 '+results.filter(x=>x.ok).length+' / '+results.length);
+    toast('已保存并完成探测：成功 '+results.filter(x=>x.ok).length+' / '+results.length);
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
-/* ---------- Params ---------- */
+/* ---------- Params (① 按模型参数 vs ② 全局基础设施 严格分离) ---------- */
 function setV(id,v){ const el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
   try{
     const s=await (await fetch('/api/settings')).json();
     GLOBAL_SETTINGS=s;
     curAR = s.image_aspect_ratio || "";
-    ['native_thinking_mode','thinking_g3_level','image_size','default_temperature','default_top_p','default_max_tokens','img_compress_max_dim','img_compress_max_mb','img_compress_quality','retry_max','retry_backoff_seconds','fake_streaming_interval','prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill','sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'].forEach(k=>setV(k,s[k]));
-    ['img_compress_enabled','fake_streaming','roundrobin','safety_score','cookie_debug','debug_outbound','prefill_suppress_thinking','image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'].forEach(k=>setV(k,s[k]));
-    // 向后兼容：旧版布尔开关映射到新的 native_thinking_mode 下拉
+    [
+      'native_thinking_mode','thinking_g3_level','image_size',
+      'default_temperature','default_top_p','default_max_tokens',
+      'img_compress_max_dim','img_compress_max_mb','img_compress_quality',
+      'retry_max','retry_backoff_seconds','fake_streaming_interval',
+      'prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill',
+      'sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'
+    ].forEach(k=>setV(k,s[k]));
+    [
+      'img_compress_enabled','fake_streaming','roundrobin','safety_score',
+      'cookie_debug','debug_outbound','prefill_suppress_thinking',
+      'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'
+    ].forEach(k=>setV(k,s[k]));
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
       else if(s.thinking_force_console) setV('native_thinking_mode','console');
@@ -891,29 +1035,27 @@ async function loadParams(){
     renderCaps();
   }catch(e){}
 }
-// 按所选模型把“可覆盖的 7 个参数字段”填成：有专属值用专属，否则回退全局
+
 function applyModelParamFields(model){
-  // __global__ = 全局默认作用域：只显示全局值，不掺任何模型专属值
-  const ov = (model==='__global__') ? {} : (OVERRIDES[model] || {});
+  const isGlobal = (model==='__global__');
+  const ov = isGlobal ? {} : (OVERRIDES[model] || {});
   PER_MODEL_KEYS.forEach(k=>{
     const v = (k in ov) ? ov[k] : GLOBAL_SETTINGS[k];
     if(k==='image_aspect_ratio'){ curAR = v || ""; }
     else setV(k, v);
   });
-  const isGlobal = (model==='__global__');
   const has = !isGlobal && !!OVERRIDES[model] && Object.keys(OVERRIDES[model]).length>0;
   $('ov-badge').classList.toggle('hidden', !has);
-  // 保存按钮的落点随作用域切换，避免"看着像全局、存进了专属"（或反过来）
-  $('btn-scope-save').textContent = isGlobal ? '💾 保存为全局默认' : '💾 保存为该模型专属';
+  $('btn-scope-save').textContent = isGlobal ? '💾 保存 ① 区为全局默认' : '💾 保存 ① 区为该模型专属';
   $('btn-scope-clear').classList.toggle('hidden', isGlobal);
   $('ov-hint').textContent = isGlobal
-    ? '当前编辑的是全局默认值，对所有未设专属的模型生效。'
-    : (has ? '当前显示该模型的专属值（带 ★）；改动后点“保存为该模型专属”更新。'
-           : '当前显示全局默认值；改动后点“保存为该模型专属”即可只对此模型生效。');
+    ? '当前编辑的是「① 按模型参数」的全局默认值，对所有未设 ★ 专属的模型生效。'
+    : (has ? '当前显示该模型的 ★ 专属参数；修改后点左侧按钮更新。'
+           : '当前继承全局默认值；修改后点左侧按钮即可存为该模型专属。');
 }
-async function saveModelOverride(){
-  const m=$('model-sel').value; if(!m) return;
-  const patch={
+
+function collectSectionOnePatch(){
+  return {
     native_thinking_mode:$('native_thinking_mode').value,
     thinking_g3_level:$('thinking_g3_level').value,
     image_size:$('image_size').value,
@@ -928,37 +1070,53 @@ async function saveModelOverride(){
     inject_prefill_for_image:$('inject_prefill_for_image').checked,
     sampling_policy:$('sampling_policy').value,
     prefill_cot_guard:$('prefill_cot_guard').checked,
+    prefill_mode:$('prefill_mode').value,
+    prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
   };
+}
+
+async function saveModelOverride(){
+  const m=$('model-sel').value; if(!m) return;
+  const patch = collectSectionOnePatch();
   if(m==='__global__'){
-    // 全局默认作用域：写进全局设置，而不是任何模型的专属值
     try{
       const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
-      if(r.ok){ Object.assign(GLOBAL_SETTINGS,patch); toast('已保存为全局默认'); }
-      else toast('保存失败');
-    }catch(e){ toast('保存失败'); }
+      if(r.ok){ GLOBAL_SETTINGS=await r.json(); toast('✅ 已将 ① 区参数保存为全局默认'); }
+      else toast('❌ 保存失败');
+    }catch(e){ toast('❌ 保存失败'); }
     return;
   }
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
     const d=await r.json();
-    if(r.ok){ OVERRIDES[m]=d.override||patch; toast('已保存 '+m+' 专属参数'); refreshModelSelStars(); applyModelParamFields(m); }
-    else toast('保存失败');
+    if(r.ok){ OVERRIDES[m]=d.override||patch; toast('✅ 已保存 '+m+' 的专属参数'); refreshModelSelStars(); applyModelParamFields(m); }
+    else toast('❌ 保存失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
+
 async function clearModelOverride(){
-  const m=$('model-sel').value; if(!m) return;
-  if(!OVERRIDES[m]){ toast('该模型没有专属参数'); return; }
+  const m=$('model-sel').value; if(!m || m==='__global__') return;
+  if(!OVERRIDES[m]){ toast('该模型当前没有专属参数'); return; }
   try{
     const r=await fetch('/api/model-overrides/'+encodeURIComponent(m),{method:'DELETE'});
-    if(r.ok){ delete OVERRIDES[m]; toast('已清除 '+m+' 专属参数，回退全局'); refreshModelSelStars(); applyModelParamFields(m); }
-    else toast('清除失败');
+    if(r.ok){ delete OVERRIDES[m]; toast('已清除 '+m+' 专属参数，回退全局默认'); refreshModelSelStars(); applyModelParamFields(m); }
+    else toast('❌ 清除失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
+
 function refreshModelSelStars(){
   const sel=$('model-sel'); const cur=sel.value;
-  [...sel.options].forEach(o=>{ const base=o.value; o.textContent = base + (OVERRIDES[base]?' ★':''); });
+  [...sel.options].forEach(o=>{
+    const base=o.value;
+    if(base==='__global__'){
+      o.textContent = '＊ 全局默认（对所有模型）';
+    } else {
+      o.textContent = base + (OVERRIDES[base] ? ' ★' : '');
+    }
+  });
   sel.value=cur;
 }
+
 function chip(t, accent){ return `<span class="pill${accent?' pill-accent':''}">${t}</span>`; }
 function fillARFor(cap){
   const sel=$('image_aspect_ratio');
@@ -970,16 +1128,17 @@ function renderCaps(){
   const m=$('model-sel').value;
   if(m==='__global__'){
     applyModelParamFields(m);
-    $('caps-summary').innerHTML='<span class="text-xs text-neutral-500">全局默认作用域：下面的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力与专属值。</span>';
+    fillARFor(null);
+    $('caps-summary').innerHTML='<span class="text-xs text-[#7d738e]">全局默认作用域：下方 ① 区的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力白名单与专属值。</span>';
     ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(id=>{const el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
     $('think-note').textContent='全局默认：具体下发时仍按各模型能力自动裁剪（例如 Pro 上 minimal 会就近取 low）。';
-    $('image-note').textContent='全局默认：仅生图模型会用到。';
+    $('image-note').textContent='全局默认：仅生图模型会用到分辨率与宽高比。';
     $('sampling-note').textContent='全局默认：已废弃采样参数的模型会自动剥离。';
     return;
   }
   const cap=CAPS[m]; if(!cap) return;
-  applyModelParamFields(m);   // 按模型填入专属/全局参数值（含 curAR）
+  applyModelParamFields(m);
   const th=cap.thinking||{};
   let sum=[chip('家族 '+cap.family, true)];
   if(th.kind==='level') sum.push(chip('思考档位 '+(th.levels||[]).join(' / ')));
@@ -1008,26 +1167,25 @@ function renderCaps(){
   $('image_size').disabled=!imgOn; $('image_aspect_ratio').disabled=!imgOn;
   fillARFor(cap);
   $('image-note').textContent = imgOn
-    ? ('该模型支持比例：' + cap.image_aspect_ratios.join('、') + '；分辨率 ' + cap.image_sizes.join('/') + '。选到不支持的比例不会报错，会自动回退为“由模型决定”。')
-    : '仅生图模型（名称含 image）使用此项。';
+    ? ('该模型支持比例：' + cap.image_aspect_ratios.join('、') + '；分辨率 ' + cap.image_sizes.join('/') + '。')
+    : '仅生图模型使用此项。';
 
   $('sampling-note').textContent = cap.is_image
     ? '生图模型会自动剥离采样参数。'
     : (cap.sampling_advice==='deprecated'
-        ? '⚠️ 该模型已废弃 temperature/top_p/top_k（官方要求移除，现忽略、未来 400），代理会自动移除；如需更确定的输出请改用系统指令。candidate_count 在 3.x 也不支持。'
+        ? '⚠️ 该模型已废弃 temperature/top_p/top_k，代理会自动移除以避免 400。'
         : cap.sampling_advice==='recommend_default'
-          ? '官方建议 Gemini 3.x 保持采样默认值（可调，但改动可能致循环/降智）；留空即用模型默认。'
+          ? '官方建议保持采样默认值；留空即用模型默认。'
           : '该模型支持采样参数；留空即用模型默认。');
 }
 function numOrNull(id){ const v=$(id).value.trim(); return v===''?null:Number(v); }
 function numOr(id,d){ const v=$(id).value.trim(); return v===''?d:Number(v); }
-// 说明折叠：点 ⓘ 展开/收起对应的说明块
 function hlp(el,id){const b=document.getElementById(id);const on=b.classList.toggle('show');el.classList.toggle('on',on);}
+
 async function saveSettings(){
-  // 只保存 ② 全局设置区（基础设施项）。
-  // ① 按模型参数不在这里保存——那些字段显示的是"当前所选模型"的生效值，
-  // 一起提交会把某个模型的专属值（比如生图的注入内容）写成全局默认。
+  // 严格只保存「② 全局基础设施设置」，绝不触碰「① 按模型参数」
   const patch={
+    express_location:$('express_location').value,
     img_compress_enabled:$('img_compress_enabled').checked,
     img_compress_max_dim:numOr('img_compress_max_dim',1536),
     img_compress_max_mb:numOr('img_compress_max_mb',1.5),
@@ -1036,47 +1194,34 @@ async function saveSettings(){
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
-    roundrobin:$('roundrobin').checked,
-    safety_score:$('safety_score').checked,
-    cookie_debug:$('cookie_debug').checked,
-    debug_outbound:$('debug_outbound').checked,
-    prefill_mode:$('prefill_mode').value,
-    express_location:$('express_location').value,
-    prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
     resumable_enabled:$('resumable_enabled').checked,
     resumable_ttl_seconds:numOr('resumable_ttl_seconds',1800),
     resumable_max_streams:numOr('resumable_max_streams',200),
+    roundrobin:$('roundrobin').checked,
+    safety_score:$('safety_score').checked,
+    debug_outbound:$('debug_outbound').checked,
+    cookie_debug:$('cookie_debug').checked,
   };
-  // 7 个可覆盖参数：仅当所选模型“没有专属配置”时，才作为全局默认保存，
-  // 避免把某模型的专属值误存成全局（专属值请用“保存为该模型专属”）。
-  const m=$('model-sel').value;
-  const overriding = !!(OVERRIDES[m] && Object.keys(OVERRIDES[m]).length>0);
-  if(!overriding){
-    Object.assign(patch,{
-    });
-  }
-  const scope = overriding
-    ? '将保存全局的基础设施项（图压缩/重试/假流式/预填充/思考控制开关等）。\n当前所选模型有专属思考/生图/采样参数，不会被改动。'
-    : '将保存为全局默认，影响所有【未设置专属参数】的模型。\n已设专属参数的模型不受影响。';
-  if(!confirm(scope + '\n\n确定保存全局设置吗？')) return;
   try{
     const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
-    if(r.ok){ GLOBAL_SETTINGS=await r.json(); toast(overriding?'已保存全局(基础设施)设置；该模型的思考/生图/采样为专属值，未改全局':'全局设置已保存'); }
-    else toast('保存失败');
+    if(r.ok){
+      GLOBAL_SETTINGS=await r.json();
+      toast('✅ 全局基础设施设置已保存');
+    } else toast('❌ 保存失败');
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
-/* ---------- Logs ---------- */
+/* ---------- Logs (Macaron Soft Log Highlighting) ---------- */
 const logwin=$('logwin'); let autoscroll=true;
 logwin.addEventListener('scroll',()=>{ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; });
 function logLine(t){
-  let c='#525252',bg='transparent',bl='2px solid transparent';
-  if(t.includes('✅')||t.includes('🎉')){c='#0369a1';bl='2px solid #38bdf8';}
-  else if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')){c='#b45309';bg='#fffbeb';bl='2px solid #f59e0b';}
-  else if(t.includes('❌')||t.includes('ERROR')){c='#be123c';bg='#fef2f2';bl='2px solid #f43f5e';}
-  else if(t.includes('💰')){c='#6d28d9';bg='#faf5ff';bl='2px solid #a855f7';}
-  let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#059669;font-weight:600">$1</span>');
-  return `<div style="color:${c};background:${bg};border-left:${bl};padding:5px 9px;border-radius:4px;white-space:pre-wrap;word-break:break-word">${s}</div>`;
+  let c='#4d4460',bg='transparent',bl='3px solid transparent';
+  if(t.includes('✅')||t.includes('🎉')){c='#1f8270';bg='#f1fcf9';bl='3px solid #5fd3bc';}
+  else if(t.includes('⚠️')||t.includes('WARN')||t.includes('🔄')||t.includes('重试')||t.includes('🛑')){c='#b56c14';bg='#fffaf2';bl='3px solid #f8c27a';}
+  else if(t.includes('❌')||t.includes('ERROR')||t.includes('🔴')){c='#c43c54';bg='#fff4f6';bl='3px solid #f68697';}
+  else if(t.includes('💰')){c='#5e4bc4';bg='#f7f4ff';bl='3px solid #8b7cf6';}
+  let s=t.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/(gemini-[a-zA-Z0-9.\-]+)/g,'<span style="color:#239480;font-weight:600">$1</span>');
+  return `<div style="color:${c};background:${bg};border-left:${bl};padding:6px 10px;border-radius:6px;white-space:pre-wrap;word-break:break-word">${s}</div>`;
 }
 try{
   const es=new EventSource('/stream-logs');
@@ -1110,7 +1255,6 @@ class LoginBody(BaseModel):
 async def login(body: LoginBody, request: Request):
     ip = request.client.host if request.client else "unknown"
 
-    # P2-2：失败三次后指数退避，避免对口令（同时也是 API Key）无限爆破
     remain = _login_retry_after(ip)
     if remain > 0:
         return JSONResponse(status_code=429,
@@ -1122,7 +1266,6 @@ async def login(body: LoginBody, request: Request):
         resp.set_cookie(
             AUTH_COOKIE, _issue_session(),
             httponly=True, samesite="lax", max_age=SESSION_TTL_SECONDS, path="/",
-            # 反代后 request.url.scheme 可能是 http，这里同时看 x-forwarded-proto
             secure=(request.url.scheme == "https"
                     or request.headers.get("x-forwarded-proto", "") == "https"),
         )
@@ -1158,8 +1301,6 @@ async def get_runtime_settings(_auth: bool = Depends(require_auth)):
     cookie = app_state.get_google_cookie()
     return JSONResponse(content={
         "use_web_proxy": app_state.is_web_proxy_enabled(),
-        # S-1：只回显掩码。完整 Cookie 等价于该 Google 账号的完整访问权，
-        # 没有任何理由让它出现在前端 JS / 浏览器缓存 / 截图里。
         "google_cookie": mask_cookie(cookie),
         "google_cookie_configured": bool(cookie),
         "google_project_id": app_state.get_project_id(),
@@ -1195,9 +1336,7 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
         models = await get_express_models()
     except Exception:
         models = []
-    # 能力摘要要反映该模型生效的采样策略，否则控制台提示与实际下发不一致
     caps = {m: mc.capabilities_summary(m, app_state.get_effective_settings(m)) for m in models}
-    # 附带各模型是否已有专属参数覆盖，供前端标示
     overrides = app_state.get_model_overrides()
     return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})
 
@@ -1229,16 +1368,17 @@ async def delete_model_override(model_name: str, _auth: bool = Depends(require_a
 
 
 # ==========================================
-# Express API Key 列表（多账号，热编辑）
+# Express API Key 列表（多账号，热编辑，支持未存先探自动保存）
 # ==========================================
 class ExpressKeysBody(BaseModel):
     keys: list = []
 
 
 class ProbeBody(BaseModel):
-    key: str = ""             # 指定单个 Key 探测
-    all: bool = False         # 探测全部
-    force: bool = False       # 忽略「已有 Project ID / 人工填写」的跳过规则
+    key: str = ""
+    all: bool = False
+    force: bool = False
+    keys: Optional[list] = None  # 若前端传入当前编辑中的 keys 列表，探测前先自动保存入库
 
 
 class KeyProjectBody(BaseModel):
@@ -1247,7 +1387,6 @@ class KeyProjectBody(BaseModel):
 
 
 def _express_keys_payload() -> dict:
-    """控制台按用户要求**明文**返回 Key（控制台本身有密码保护）；日志里仍打掩码。"""
     records = app_state.get_express_keys()
     return {
         "keys": records,
@@ -1265,16 +1404,10 @@ async def list_express_keys(_auth: bool = Depends(require_auth)):
 
 @app.post("/api/express-keys")
 async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require_auth)):
-    """整表覆盖保存（增删改都走这里），立即热生效，无需重启。
-
-    保存空列表是合法操作：之后即使环境变量 VERTEX_EXPRESS_API_KEY 仍有值，
-    启动时也不会再把 Key 复种回来（见 runtime_state.import_env_express_keys_once）。
-    """
     if not isinstance(body.keys, list):
         return JSONResponse(status_code=400, content={"error": "keys 必须是数组。"})
     saved = app_state.set_express_keys(body.keys)
     express_key_manager.refresh_keys()
-    # 新加进来、还没有 Project ID 的 Key 立刻在后台探一次
     pending = [r["key"] for r in saved if not r.get("project_id")]
     if pending:
         asyncio.create_task(express_key_probe.probe_all(keys=pending))
@@ -1285,7 +1418,11 @@ async def save_express_keys(body: ExpressKeysBody, _auth: bool = Depends(require
 
 @app.post("/api/express-keys/probe")
 async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth)):
-    """手动触发探测：指定单个 Key，或 all=true 探测全部。"""
+    """手动触发探测：若请求附带前端当前 keys 列表，先同步保存再探测，彻底避免新加 Key 消失。"""
+    if isinstance(body.keys, list) and len(body.keys) > 0:
+        app_state.set_express_keys(body.keys)
+        express_key_manager.refresh_keys()
+
     if body.all:
         results = await express_key_probe.probe_all(force=body.force)
     else:
@@ -1293,6 +1430,7 @@ async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth
         if not key:
             return JSONResponse(status_code=400, content={"error": "请提供 key，或设 all=true。"})
         results = [await express_key_probe.probe_and_store(key, force=body.force)]
+        express_key_manager.refresh_keys()
     payload = _express_keys_payload()
     payload["results"] = results
     return JSONResponse(content=payload)
@@ -1300,7 +1438,6 @@ async def probe_express_keys(body: ProbeBody, _auth: bool = Depends(require_auth
 
 @app.post("/api/express-keys/project")
 async def set_express_key_project(body: KeyProjectBody, _auth: bool = Depends(require_auth)):
-    """人工覆盖某个 Key 的 Project ID（来源标记为 manual，自动探测不会再覆盖它）。"""
     ok = app_state.update_express_key_project(
         body.key, body.project_id, source=("manual" if body.project_id.strip() else ""))
     if not ok:
@@ -1311,17 +1448,12 @@ async def set_express_key_project(body: KeyProjectBody, _auth: bool = Depends(re
 
 
 class CookieSetting(BaseModel):
-    cookie: str = ""          # 留空 = 保持现有 Cookie
+    cookie: str = ""
     project_id: str = ""
 
 
 @app.post("/api/cookie")
 async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(require_auth)):
-    """保存 Cookie 与 Project ID。
-
-    S-1：cookie 传空字符串表示「保持现有 Cookie 不变，只更新 Project ID」，
-    这样前端就不需要为了改 Project ID 而把完整 Cookie 再取回来一次。
-    """
     new_cookie = (setting.cookie or "").strip()
     project_id = (setting.project_id or "").strip()
 
@@ -1345,10 +1477,6 @@ async def set_google_cookie(setting: CookieSetting, _auth: bool = Depends(requir
 @app.get("/stream-logs")
 async def stream_logs_endpoint(request: Request, _auth: bool = Depends(require_auth)):
     def _event_chunks(msg: str):
-        # SSE 规范写法：多行消息必须拆成多个 `data:` 行，浏览器会用换行拼回 e.data。
-        # 之前是 yield f"data: {msg}\n\n"，msg 里的裸换行会导致换行后的每一行被浏览器
-        # 当成未知字段直接丢弃——多行诊断、traceback 在控制台永远只剩第一行，
-        # 只能去 Docker 日志看完整版（2026-10-04 修复）。
         for line in msg.splitlines() or [""]:
             yield f"data: {line}\n"
         yield "\n"
