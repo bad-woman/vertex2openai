@@ -1,24 +1,32 @@
 from typing import Optional
+import httpx
 from google.genai import types
 import config as app_config
+
+# Google GenAI SDK 的 HttpOptions.timeout 单位为毫秒（600_000 ms = 10 分钟），
+# 防止 gemini-4-argon 等长思考模型在假流式或深思考期间被默认 60s 超时掐断。
+DEFAULT_TIMEOUT_MS = 600_000
+DEFAULT_HTTPX_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0)
 
 
 def get_http_options(
     base_url: Optional[str] = None,
-) -> Optional[types.HttpOptions]:
-    """构造 google-genai HTTP 选项：代理、自定义证书、base_url 与请求头。"""
-    client_args = {}
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+) -> types.HttpOptions:
+    """构造 google-genai HTTP 选项：长思考超时、代理、自定义证书、base_url。"""
+    client_args = {"timeout": DEFAULT_HTTPX_TIMEOUT}
     if app_config.PROXY_URL:
         client_args["proxy"] = app_config.PROXY_URL
     if app_config.SSL_CERT_FILE:
         client_args["verify"] = app_config.SSL_CERT_FILE
 
-    options = {}
-    base_url = base_url or (app_config.VERTEX_BASE_URL or None)
-    if base_url:
-        options["base_url"] = base_url
-    if client_args:
-        options["client_args"] = client_args
-        options["async_client_args"] = client_args
+    options = {
+        "timeout": timeout_ms,
+        "client_args": client_args,
+        "async_client_args": dict(client_args),
+    }
+    resolved_base_url = base_url or (app_config.VERTEX_BASE_URL or None)
+    if resolved_base_url:
+        options["base_url"] = resolved_base_url
 
-    return types.HttpOptions(**options) if options else None
+    return types.HttpOptions(**options)

@@ -1,18 +1,4 @@
-"""Express API Key 的 GCP Project ID 自动探测。
-
-背景：Express Key 是绑定到某个 Google 账号/项目上的，而「标准模式 location 钉定」
-需要拼出 `projects/{project}/locations/{location}/...` 的完整资源路径。
-多账号轮换时每个 Key 的项目都不一样，不能再共用 Cookie 通道那份全局 Project ID。
-
-探测方式：用「调模型的正确 URL」，把模型名换成一个不存在的模型名发一次请求：
-  POST https://aiplatform.googleapis.com/v1/publishers/google/models/{fake}:generateContent?key={key}
-（这正是 Express 标准模式实际在用的全局端点格式。）
-模型不存在时 Google 返回 404，错误信息里会带上按该 Key 解析出的完整资源路径，
-形如 …projects/{project}/locations/…/publishers/google/models/{fake}… was not found，
-从中提取 project。请求在模型解析阶段即失败，不产生任何 token、不消耗配额；
-Key 本身非法时则返回 400/401/403，顺带校验 Key 有效性。
-探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。
-"""
+"""Express API Key 的 GCP Project ID 自动探测。"""
 
 import asyncio
 import re
@@ -24,7 +10,6 @@ import httpx
 import config as app_config
 from runtime_state import app_state
 
-# 调模型的正确 URL（Express 全局端点格式），{model} 处填一个不存在的模型名来探测
 GENERATE_CONTENT_URL = (
     "https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent"
 )
@@ -50,12 +35,7 @@ def mask_key(key: str) -> str:
 
 
 async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
-    """探测单个 Key 所属的 GCP Project ID。返回 (project_id, 说明)。
-
-    用不存在的模型名调一次 generateContent：Key 有效时上游返回 404，
-    错误信息里带 `projects/{project}/...` 路径，从中提取项目；
-    Key 无效时返回 400/401/403。全程不消耗配额。
-    """
+    """探测单个 Key 所属的 GCP Project ID。返回 (project_id, 说明)。"""
     key = (key or "").strip()
     if not key:
         return None, "Key 为空。"
@@ -81,23 +61,32 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
 
 
 async def probe_and_store(key: str, *, force: bool = False) -> dict:
-    """探测并写回状态。force=False 时已有 Project ID 的 Key 直接跳过。"""
-    records = {r["key"]: r for r in app_state.get_express_keys()}
-    rec = records.get((key or "").strip())
-    if rec is None:
-        return {"key": key, "ok": False, "message": "该 Key 不在列表中（可能刚被删除）。"}
-    if rec.get("project_id") and not force:
-        return {"key": key, "ok": True, "project_id": rec["project_id"], "message": "已有 Project ID，跳过探测。"}
-    if rec.get("project_source") == "manual" and not force:
-        return {"key": key, "ok": True, "project_id": rec.get("project_id", ""), "message": "人工填写值，跳过探测。"}
+    """探测并写回状态。若该 Key 尚未保存入库，自动将其追加到列表中再探测。"""
+    clean_key = (key or "").strip()
+    if not clean_key:
+        return {"key": key, "ok": False, "project_id": "", "message": "Key 为空。"}
 
-    project_id, message = await probe_project_id(key)
+    current_list = app_state.get_express_keys()
+    records = {r["key"]: r for r in current_list}
+    rec = records.get(clean_key)
+    if rec is None:
+        # 用户在控制台刚添加该 Key 尚未点保存就直接点探测：自动入库保存，避免丢失
+        current_list.append({"key": clean_key, "project_id": "", "project_source": "", "enabled": True})
+        app_state.set_express_keys(current_list)
+        rec = {"key": clean_key, "project_id": "", "project_source": "", "enabled": True}
+
+    if rec.get("project_id") and not force:
+        return {"key": clean_key, "ok": True, "project_id": rec["project_id"], "message": "已有 Project ID，跳过探测。"}
+    if rec.get("project_source") == "manual" and not force:
+        return {"key": clean_key, "ok": True, "project_id": rec.get("project_id", ""), "message": "人工填写值，跳过探测。"}
+
+    project_id, message = await probe_project_id(clean_key)
     if project_id:
-        app_state.update_express_key_project(key, project_id, source="auto")
-        print(f"🔎 [密钥探测] Key {mask_key(key)} 归属项目：{project_id}")
-        return {"key": key, "ok": True, "project_id": project_id, "message": message}
-    print(f"⚠️ [密钥探测] Key {mask_key(key)} 未能自动探测到 Project ID：{message}")
-    return {"key": key, "ok": False, "project_id": "", "message": message}
+        app_state.update_express_key_project(clean_key, project_id, source="auto")
+        print(f"🔎 [密钥探测] Key {mask_key(clean_key)} 归属项目：{project_id}")
+        return {"key": clean_key, "ok": True, "project_id": project_id, "message": message}
+    print(f"⚠️ [密钥探测] Key {mask_key(clean_key)} 未能自动探测到 Project ID：{message}")
+    return {"key": clean_key, "ok": False, "project_id": "", "message": message}
 
 
 async def probe_all(*, force: bool = False, keys: Optional[list] = None) -> list:
