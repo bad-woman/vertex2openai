@@ -84,7 +84,7 @@ def _extract_json_response_error(resp: JSONResponse, status: int) -> str:
 
 
 async def _abort_placeholder(buf, stream_id: str, message: str, code: int = 500) -> None:
-    err = {"error": {"message": message[:1024], "type": "upstream_error", "code": code}}
+    err = {"error": {"message": message[:2000], "type": "upstream_error", "code": code}}
     await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
     await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
     await buf.finish("error", error=message)
@@ -128,6 +128,7 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
     if not isinstance(resp, StreamingResponse):
         status = getattr(resp, "status_code", 500)
         detail_msg = _extract_json_response_error(resp, status)
+        print(f"❌ [流式请求被拒] 模型={request_obj.model} | {detail_msg[:2000]}")
         await _abort_placeholder(buf, stream_id, detail_msg, status)
         return resp
 
@@ -210,9 +211,9 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
             raise
         except Exception as e:
             err_code, err_msg = extract_upstream_error(e)
-            print(f"❌ [非流式缓冲报错] {stream_id} | 模型={request_obj.model} | HTTP {err_code} | {err_msg[:450]}")
+            print(f"❌ [非流式缓冲报错] {stream_id} | 模型={request_obj.model} | HTTP {err_code} | {err_msg[:2000]}")
             await buf.finish("error", error=err_msg,
-                             payload=create_openai_error_response(err_code, err_msg[:1024], "upstream_error"),
+                             payload=create_openai_error_response(err_code, err_msg[:2000], "upstream_error"),
                              status_code=err_code)
             return
         body = getattr(resp, "body", b"") or b""
@@ -267,7 +268,7 @@ async def chat_completions(fastapi_request: Request, request: OpenAIRequest, api
     except Exception as e:
         code, msg = extract_upstream_error(e)
         channel = "Studio(Cookie)" if app_state.is_web_proxy_enabled() else "Express(API Key)"
-        print(f"❌ [路由兜底报错] 通道={channel} | 模型={request.model} | HTTP {code} | {msg[:450]}")
+        print(f"❌ [路由兜底报错] 通道={channel} | 模型={request.model} | HTTP {code} | {msg[:2000]}")
         return JSONResponse(status_code=code, content=create_openai_error_response(code, msg, "upstream_error"))
 
 
