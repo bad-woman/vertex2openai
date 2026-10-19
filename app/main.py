@@ -595,10 +595,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               </select>
             </div>
             <div id="h_at" class="helpbox">
-              通过动态注入随机命名的合成函数（<code>deliver_reply_xxx</code>）并锁定 <code>mode: ANY</code>，让模型将回复正文放入工具参数中传输，有效规避流式文本后置审查截断与早停。<br>
+              通过动态注入随机命名的合成函数（<code>deliver_reply_xxx</code>）并锁定 <code>mode: ANY</code>，将合成工具作为纯粹的字符传输通道（指令仅追加在 <code>system</code> 层，完全不触碰预填充、推动语与思维链守卫）。<br>
               • <b>流式工具抗截断</b>：开启 Vertex 原生 <code>streamFunctionCallArguments</code>，实时将 <code>partialArgs</code> 还原为普通文本流（边写边出字）。<br>
               • <b>非流式工具抗截断</b>：等待工具调用完整生成后解包为正文。<br>
-              • <b>自适应保护</b>：与预填充/思维链守卫完全兼容；若 Cookie 通道遇到不支持的模型，会自动无感回退为普通文本生成。
+              • <b>零干扰兼容</b>：预填充续写与 <code>PrefillDeduper</code> 输出去重原封不动；若 Cookie 通道遇到不支持的模型，会自动无感回退为普通文本生成。
             </div>
           </div>
           <div>
@@ -620,6 +620,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div>
             <div class="flex items-center justify-between gap-2"><span class="text-sm">思维链守卫（防跳过思考）<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
             <div id="h_cotg" class="helpbox">自动识别预填充中未闭合的思维链开标签（如 <code>&lt;thinking&gt;</code>、<code>&lt;cot&gt;</code>），前置注入格式硬性要求并在输出侧去重双开标签，防止模型跳过思考直接写正文。</div>
+          </div>
+          <div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">Unicode 紧凑转码（防输入软拒绝）<span class="helpq" onclick="hlp(this,'h_uni')">?</span></span><label class="switch"><input type="checkbox" id="unicode_input"><span class="slider"></span></label></div>
+            <div id="h_uni" class="helpbox">将最后一条真实 user 消息中的汉字与英文字母转为 <code>⟦U:HEX...⟧</code> 码点格式（保留 <code>&lt;...&gt;</code> 标签与预填充不变），绕过输入端敏感词分类器的条件反射式软回避，模型会正常用原文回复。</div>
           </div>
           <div class="pt-2 border-t border-[#f0eaf8] divider-line">
             <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
@@ -780,7 +784,7 @@ var PER_MODEL_KEYS = [
   'default_temperature','default_top_p','default_max_tokens',
   'inject_system_instruction','inject_prefill','prefill_instruction',
   'image_system_instruction','inject_prefill_for_image','sampling_policy',
-  'prefill_cot_guard','prefill_mode','prefill_suppress_thinking','anti_truncation_mode'
+  'prefill_cot_guard','prefill_mode','prefill_suppress_thinking','anti_truncation_mode','unicode_input'
 ];
 var COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
@@ -1120,7 +1124,7 @@ async function loadParams(){
     [
       'img_compress_enabled','fake_streaming','roundrobin','safety_score',
       'cookie_debug','debug_outbound','prefill_suppress_thinking',
-      'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'
+      'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','unicode_input','resumable_enabled'
     ].forEach(function(k){setV(k,s[k]);});
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -1174,6 +1178,7 @@ function collectSectionOnePatch(){
     prefill_mode:$('prefill_mode').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
     anti_truncation_mode:$('anti_truncation_mode').value,
+    unicode_input:$('unicode_input').checked,
   };
 }
 
@@ -1232,7 +1237,7 @@ function renderCaps(){
     applyModelParamFields(m);
     fillARFor(null);
     $('caps-summary').innerHTML='<span class="text-xs text-[#7d738e]">全局默认作用域：下方 ① 区的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力白名单与专属值。</span>';
-    ['thinking_g3_level','image_size','image_aspect_ratio','anti_truncation_mode'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
+    ['thinking_g3_level','image_size','image_aspect_ratio','anti_truncation_mode','unicode_input'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
     $('think-note').textContent='全局默认：具体下发时仍按各模型能力自动裁剪（例如 Pro 上 minimal 会就近取 low）。';
     $('image-note').textContent='全局默认：仅生图模型会用到分辨率与宽高比。';
@@ -1268,6 +1273,7 @@ function renderCaps(){
   var imgOn=cap.is_image;
   $('image_size').disabled=!imgOn; $('image_aspect_ratio').disabled=!imgOn;
   if($('anti_truncation_mode')) $('anti_truncation_mode').disabled=imgOn;
+  if($('unicode_input')) $('unicode_input').disabled=imgOn;
   fillARFor(cap);
   $('image-note').textContent = imgOn
     ? ('该模型支持比例：' + cap.image_aspect_ratios.join('、') + '；分辨率 ' + cap.image_sizes.join('/') + '。')
