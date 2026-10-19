@@ -77,6 +77,7 @@ DEFAULT_SETTINGS = {
     "prefill_suppress_thinking": True,
     "prefill_cot_guard": True,
     "anti_truncation_mode": "off",
+    "unicode_input": False,
     # 输入图片压缩（全局）
     "img_compress_enabled": True,
     "img_compress_max_dim": 1536,
@@ -119,4 +120,5 @@ PER_MODEL_KEYS = [
     "prefill_mode",
     "prefill_suppress_thinking",
     "anti_truncation_mode",
+    "unicode_input",
 ]
