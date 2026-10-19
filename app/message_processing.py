@@ -88,6 +88,18 @@ SUPPORTED_ROLES = ["user", "model", "function"]
 
 LEGACY_THOUGHT_SEP = "__thought__"
 
+ANTI_TRUNC_TOOL_PREFIX = "deliver_reply_"
+
+
+def is_anti_truncation_tool_name(name: Optional[str], expected_name: Optional[str] = None) -> bool:
+    """判断函数名是否为本代理注入的合成抗截断工具。"""
+    n = str(name or "").strip()
+    if not n:
+        return False
+    if expected_name and n == expected_name:
+        return True
+    return n.startswith(ANTI_TRUNC_TOOL_PREFIX)
+
 
 def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
     """从 part / function_call 上取出思考签名，统一成 bytes。"""
@@ -477,6 +489,153 @@ def apply_prefill_compat(
     return new_msgs, prefill, True
 
 
+# ============================================================
+# 合成工具抗截断引擎（Synthetic Tool Anti-Truncation）
+# 结合预填充断点与 Vertex 原生 streamFunctionCallArguments
+# ============================================================
+
+def _build_anti_truncation_instruction(
+    tool_name: str,
+    has_callable_client_tools: bool = False,
+    prefill_text: str = "",
+) -> str:
+    """构造合成工具传输格式指令（与预填充/思维链守卫自然衔接）。"""
+    if prefill_text:
+        target_desc = (
+            "only the new continuation text that immediately follows the existing opening above "
+            "(do not repeat the opening itself; if the opening ends inside an unclosed tag, "
+            "complete the content inside that tag, close it, and then write the full body)"
+        )
+    else:
+        target_desc = "the entire user-visible reply text"
+
+    if has_callable_client_tools:
+        return (
+            f"[Transport Format] Put all user-visible text, if any, in exactly one call of `{tool_name}` "
+            f"(put {target_desc} into its `content` string argument, preserving all required formatting, "
+            f"tags, markup, language, and sections). `{tool_name}` only transports text and performs no "
+            f"external action. Call other declared tools whenever the task needs them."
+        )
+    return (
+        f"[Transport Format] Call `{tool_name}` exactly once to deliver your reply. "
+        f"Put {target_desc} into its `content` string argument, preserving all required formatting, "
+        f"tags, markup, language, and sections. `{tool_name}` only transports text and performs no external action."
+    )
+
+
+def prepare_anti_truncation_request(
+    request_obj: Any,
+    mode: str = "streaming",
+    prefill_text: str = "",
+) -> Tuple[Any, Optional[str], bool, str]:
+    """为请求注入合成抗截断工具与传输指令。
+
+    返回: (更新后的 request_obj, 合成工具名 tool_name, 是否启用流式函数参数 stream_args, 日志说明)
+    """
+    mode = str(mode or "off").strip().lower()
+    if mode not in ("streaming", "buffered"):
+        return request_obj, None, False, ""
+
+    # 1. 结构化 JSON 输出不包装
+    fmt = getattr(request_obj, "response_format", None)
+    if fmt is not None:
+        fmt_type = fmt.get("type", "") if isinstance(fmt, dict) else getattr(fmt, "type", "")
+        if fmt_type and fmt_type != "text":
+            return request_obj, None, False, "🛡️ [工具抗截断] 请求要求结构化 JSON 输出，已自动跳过工具抗截断包装。"
+
+    # 2. 多候选请求不包装
+    if (getattr(request_obj, "n", None) or 1) > 1:
+        return request_obj, None, False, "🛡️ [工具抗截断] 多候选请求（n > 1），已自动跳过工具抗截断包装。"
+
+    # 3. 客户端显式锁定了特定工具调用（tool_choice 为 required 或指定函数）时不包装
+    choice = getattr(request_obj, "tool_choice", None)
+    if choice is not None and choice not in ("auto", "none"):
+        return request_obj, None, False, "🛡️ [工具抗截断] 客户端已强制指定工具调用（tool_choice），已自动跳过工具抗截断包装。"
+
+    client_tools = list(getattr(request_obj, "tools", None) or [])
+    callable_client_tools = bool(client_tools) and str(choice or "").lower() != "none"
+
+    tool_name = f"{ANTI_TRUNC_TOOL_PREFIX}{uuid.uuid4().hex[:16]}"
+    instruction = _build_anti_truncation_instruction(
+        tool_name=tool_name,
+        has_callable_client_tools=callable_client_tools,
+        prefill_text=prefill_text,
+    )
+
+    synthetic_tool = {
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": (
+                "Deliver only the new continuation text to append to the existing opening."
+                if prefill_text
+                else "Deliver the complete user-visible reply as text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "The exact continuation text starting immediately from the breakpoint."
+                            if prefill_text
+                            else "The complete user-visible response text."
+                        ),
+                    }
+                },
+                "required": ["content"],
+            },
+        },
+    }
+
+    # 4. 将传输指令注入消息列表：
+    # 若末尾 user 消息刚刚合并了 prefill_text（smart 模式），将传输指令插在 prefill_text 之前，
+    # 保证整条消息的最后几个字符依然严格是用户的 prefill 断点！
+    new_msgs = list(getattr(request_obj, "messages", None) or [])
+    inserted_before_prefill = False
+    if prefill_text and new_msgs and new_msgs[-1].role == "user":
+        last_m = new_msgs[-1]
+        sep_target = "\n\n" + prefill_text
+        if isinstance(last_m.content, str) and last_m.content.endswith(sep_target):
+            prefix_part = last_m.content[:-len(sep_target)]
+            merged_content = prefix_part + "\n" + instruction + sep_target
+            new_msgs[-1] = last_m.model_copy(update={"content": merged_content})
+            inserted_before_prefill = True
+        elif isinstance(last_m.content, list) and last_m.content:
+            last_part = last_m.content[-1]
+            if isinstance(last_part, dict) and last_part.get("type") == "text":
+                t_val = str(last_part.get("text") or "")
+                if t_val.endswith(sep_target):
+                    prefix_part = t_val[:-len(sep_target)]
+                    updated_list = list(last_m.content[:-1]) + [
+                        {"type": "text", "text": prefix_part + "\n" + instruction + sep_target}
+                    ]
+                    new_msgs[-1] = last_m.model_copy(update={"content": updated_list})
+                    inserted_before_prefill = True
+
+    if not inserted_before_prefill:
+        new_msgs.append(OpenAIMessage(role="user", content=instruction))
+
+    new_tools = client_tools + [synthetic_tool]
+    new_tool_choice: Any = "required" if callable_client_tools else {
+        "type": "function",
+        "function": {"name": tool_name},
+    }
+
+    # 原生流式参数（streamFunctionCallArguments）仅在流式请求且无额外可调用客户端工具时启用
+    stream_args = (mode == "streaming") and bool(getattr(request_obj, "stream", False)) and (not callable_client_tools)
+
+    updated_req = request_obj.model_copy(update={
+        "messages": new_msgs,
+        "tools": new_tools,
+        "tool_choice": new_tool_choice,
+    })
+
+    mode_label = "流式参数抗截断 (streamFunctionCallArguments)" if stream_args else "整块工具抗截断 (buffered)"
+    note = f"🛡️ [工具抗截断] 已启用{mode_label}，合成工具名={tool_name}。"
+    return updated_req, tool_name, stream_args, note
+
+
 def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 4) -> str:
     """预填充智能去重：裁掉模型在输出开头复述的预填充文本或重复开启的未闭合标签。"""
     if not prefill or not output:
@@ -603,7 +762,7 @@ class PrefillDeduper:
 
 
 # ============================================================
-# 流式工具调用参数分片聚合器（支持 streamFunctionCallArguments / partialArgs / willContinue）
+# 流式工具调用参数分片聚合器 & 合成抗截断工具实时解包器
 # ============================================================
 
 _JSON_PATH_TOKEN_RE = re.compile(r"\.([A-Za-z0-9_$-]+)|\[(\d+)\]|\[['\"]([^'\"]+)['\"]\]")
@@ -705,16 +864,82 @@ def _set_json_path_value(root: Dict[str, Any], tokens: List[Any], value: Any, ap
 
 class FunctionCallStreamAssembler:
     """将 Gemini streamFunctionCallArguments 的分片 FunctionCall (partialArgs / willContinue)
-    安全聚合成完整的函数调用事件，同时 100% 兼容普通单块 FunctionCall。"""
+    安全聚合成完整的函数调用事件；若检测到是合成抗截断工具（deliver_reply_xxx），
+    则不等待流结束，直接将每个分片的 stringValue 实时提取为正文流吐出！"""
 
-    def __init__(self):
+    def __init__(self, anti_trunc_tool_name: Optional[str] = None):
         self._pending: Optional[Dict[str, Any]] = None
+        self.anti_trunc_tool_name = anti_trunc_tool_name
+        self._in_synthetic_call = False
+        self.restored_any_text = False
 
     def has_pending(self) -> bool:
         return self._pending is not None
 
+    def feed_with_text(
+        self,
+        fc: Any,
+        thought_signature: Optional[bytes] = None,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """喂入一个 function_call 对象或字典。
+        返回: (已聚合完成的真实工具调用列表, 实时解包出的抗截断正文片段)
+        """
+        if fc is None:
+            return [], ""
+
+        if isinstance(fc, dict):
+            fc_id = str(fc.get("id") or "").strip() or None
+            fc_name = str(fc.get("name") or "").strip()
+            fc_args = fc.get("args")
+            fc_partial = fc.get("partialArgs") if "partialArgs" in fc else fc.get("partial_args")
+            fc_will_continue = bool(fc.get("willContinue") if "willContinue" in fc else fc.get("will_continue"))
+        else:
+            fc_id = str(getattr(fc, "id", "") or "").strip() or None
+            fc_name = str(getattr(fc, "name", "") or "").strip()
+            fc_args = getattr(fc, "args", None)
+            fc_partial = getattr(fc, "partial_args", None)
+            fc_will_continue = bool(getattr(fc, "will_continue", False))
+
+        has_args = isinstance(fc_args, dict) and len(fc_args) > 0
+        has_partial = isinstance(fc_partial, list) and len(fc_partial) > 0
+
+        if not fc_name and not has_args and not has_partial and not fc_will_continue and self._pending is None and not self._in_synthetic_call:
+            return [], ""
+
+        # 判断当前块是否属于合成抗截断工具
+        if fc_name:
+            if is_anti_truncation_tool_name(fc_name, self.anti_trunc_tool_name):
+                self._in_synthetic_call = True
+            else:
+                self._in_synthetic_call = False
+
+        if self._in_synthetic_call:
+            text_pieces: List[str] = []
+            if has_args and isinstance(fc_args.get("content"), str):
+                text_pieces.append(fc_args["content"])
+            if has_partial:
+                for parg in fc_partial:
+                    raw_path = (
+                        parg.get("jsonPath", parg.get("json_path"))
+                        if isinstance(parg, dict)
+                        else getattr(parg, "json_path", getattr(parg, "jsonPath", None))
+                    )
+                    path_s = str(raw_path or "").strip()
+                    if path_s in ("$.content", "content", ""):
+                        has_val, val, _ = _extract_partial_arg_value(parg)
+                        if has_val and isinstance(val, str) and val:
+                            text_pieces.append(val)
+            if not fc_will_continue:
+                self._in_synthetic_call = False
+            joined = "".join(text_pieces)
+            if joined:
+                self.restored_any_text = True
+            return [], joined
+
+        return self.feed(fc, thought_signature=thought_signature), ""
+
     def feed(self, fc: Any, thought_signature: Optional[bytes] = None) -> List[Dict[str, Any]]:
-        """喂入一个 function_call 对象或字典，返回目前已聚合完成的调用列表。"""
+        """喂入一个普通 function_call 对象或字典，返回目前已聚合完成的调用列表。"""
         if fc is None:
             return []
 
@@ -1318,7 +1543,11 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
     return "".join(reasoning_text_parts), "".join(normal_text_parts)
 
 
-def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_model_str: str) -> Dict[str, Any]:
+def process_gemini_response_to_openai_dict(
+    gemini_response_obj: Any,
+    request_model_str: str,
+    anti_trunc_tool_name: Optional[str] = None,
+) -> Dict[str, Any]:
     choices = []
     response_timestamp = int(time.time())
     base_id = f"chatcmpl-{response_timestamp}-{random.randint(1000,9999)}"
@@ -1346,18 +1575,30 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
 
             parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
             reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
-            if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
-                normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
 
             tool_index = 0
             ordinary_metadata = []
             order_descriptors = []
             message_signature = None
             message_signature_kind = None
+            restored_from_synthetic_tool = False
+
             for part in parts_in_order:
                 fc = getattr(part, "function_call", None)
                 sig = _signature_bytes(part, fc)
                 if fc is not None:
+                    fc_name = str(getattr(fc, "name", "") or "")
+                    if is_anti_truncation_tool_name(fc_name, anti_trunc_tool_name):
+                        # 合成抗截断工具：将其中的 content 参数直接还原为普通正文，不当作外部 tool_calls
+                        fc_args = getattr(fc, "args", None)
+                        if isinstance(fc_args, dict) and isinstance(fc_args.get("content"), str):
+                            normal_content_str += fc_args["content"]
+                            restored_from_synthetic_tool = True
+                        if sig:
+                            message_signature = sig
+                            message_signature_kind = "text"
+                        continue
+
                     missing_state = (SignatureState.UNSIGNED_FOLLOWER if tool_index > 0
                                      else SignatureState.UNKNOWN)
                     tool_call_id = build_tool_call_id(fc, part, missing_state=missing_state)
@@ -1398,6 +1639,12 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                 if sig:
                     message_signature = sig
                     message_signature_kind = ordinary_kind
+
+            if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
+                normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
+
+            if restored_from_synthetic_tool and not message_payload.get("tool_calls") and openai_finish_reason == "tool_calls":
+                openai_finish_reason = "stop"
 
             if normal_content_str or not message_payload.get("tool_calls"):
                 message_payload["content"] = normal_content_str
@@ -1452,5 +1699,11 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
     }
 
 
-def convert_to_openai_format(gemini_response: Any, model: str) -> Dict[str, Any]:
-    return process_gemini_response_to_openai_dict(gemini_response, model)
+def convert_to_openai_format(
+    gemini_response: Any,
+    model: str,
+    anti_trunc_tool_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    return process_gemini_response_to_openai_dict(
+        gemini_response, model, anti_trunc_tool_name=anti_trunc_tool_name
+    )
