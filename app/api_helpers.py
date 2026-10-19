@@ -16,6 +16,7 @@ from message_processing import (
     _create_safety_ratings_html,
     strip_prefill_overlap,
     PrefillDeduper,
+    is_anti_truncation_tool_name,
 )
 import config as app_config
 from config import VERTEX_REASONING_TAG
@@ -297,7 +298,19 @@ def is_retryable_exception(e):
     return False
 
 
-def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
+def _sdk_supports_stream_fc_args() -> bool:
+    """检测当前安装的 google-genai SDK 是否支持 FunctionCallingConfig.stream_function_call_arguments。"""
+    try:
+        fields = getattr(types.FunctionCallingConfig, "model_fields", None) or {}
+        return "stream_function_call_arguments" in fields
+    except Exception:
+        return False
+
+
+def create_generation_config(
+    request: OpenAIRequest,
+    stream_function_call_arguments: bool = False,
+) -> Dict[str, Any]:
     config: Dict[str, Any] = {}
 
     system_texts = []
@@ -471,9 +484,14 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                 mode = "ANY"
                 allowed_functions = [func_name]
         if mode:
-            config_dict = {"mode": mode}
+            config_dict: Dict[str, Any] = {"mode": mode}
             if allowed_functions:
                 config_dict["allowed_function_names"] = allowed_functions
+            if stream_function_call_arguments:
+                if _sdk_supports_stream_fc_args():
+                    config_dict["stream_function_call_arguments"] = True
+                else:
+                    print("⚠️ [工具抗截断] 当前 google-genai SDK 版本不支持 stream_function_call_arguments，已自动降级为整块工具抗截断。")
             tool_config = {"function_calling_config": config_dict}
 
     if tool_config:
@@ -546,26 +564,33 @@ def is_gemini_response_valid(response: Any) -> bool:
 
 
 class ToolCallIndexer:
-    """一次流式响应内，为 tool_calls 分配稳定递增的 index，并聚合分片函数参数（streamFunctionCallArguments）。"""
+    """一次流式响应内，为 tool_calls 分配稳定递增的 index，
+    同时支持分片函数参数聚合与合成抗截断工具（deliver_reply_xxx）实时解包。"""
 
-    def __init__(self):
+    def __init__(self, anti_trunc_tool_name: Optional[str] = None):
         from message_processing import FunctionCallStreamAssembler
         self._next: Dict[int, int] = {}
         self._seen_tool_calls: set[int] = set()
         self._ordinary_parts: Dict[int, list] = {}
         self._part_order: Dict[int, list] = {}
         self._assemblers: Dict[int, FunctionCallStreamAssembler] = {}
+        self.anti_trunc_tool_name = anti_trunc_tool_name
 
     def _assembler(self, candidate_index: int = 0):
         from message_processing import FunctionCallStreamAssembler
         asm = self._assemblers.get(candidate_index)
         if asm is None:
-            asm = FunctionCallStreamAssembler()
+            asm = FunctionCallStreamAssembler(anti_trunc_tool_name=self.anti_trunc_tool_name)
             self._assemblers[candidate_index] = asm
         return asm
 
     def feed_function_call(self, candidate_index: int, fc: Any, sig: Optional[bytes]) -> List[Dict[str, Any]]:
         return self._assembler(candidate_index).feed(fc, thought_signature=sig)
+
+    def feed_function_call_with_text(
+        self, candidate_index: int, fc: Any, sig: Optional[bytes]
+    ) -> tuple[List[Dict[str, Any]], str]:
+        return self._assembler(candidate_index).feed_with_text(fc, thought_signature=sig)
 
     def flush_function_calls(self, candidate_index: int = 0) -> List[Dict[str, Any]]:
         asm = self._assemblers.get(candidate_index)
@@ -640,6 +665,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         part_order = []
         ordinary_signature = None
         ordinary_signature_kind = None
+        restored_synthetic_texts: List[str] = []
 
         def _emit_assembled_call(call_dict: Dict[str, Any]) -> None:
             tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
@@ -703,29 +729,47 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     continue
 
                 if indexer is not None:
-                    completed_calls = indexer.feed_function_call(candidate_index, fc, sig)
+                    completed_calls, restored_text = indexer.feed_function_call_with_text(candidate_index, fc, sig)
+                    if restored_text:
+                        restored_synthetic_texts.append(restored_text)
+                        metadata = ordinary_part_metadata("text", restored_text, sig)
+                        ordinary_index = indexer.record_ordinary_part(candidate_index, metadata)
+                        part_order.append({"type": "ordinary", "index": ordinary_index})
+                        ordinary_metadata.append(metadata)
+                    if sig and not completed_calls:
+                        ordinary_signature = sig
+                        ordinary_signature_kind = "text"
                     for c_item in completed_calls:
                         _emit_assembled_call(c_item)
                 else:
-                    _emit_assembled_call({
-                        "id": getattr(fc, "id", None),
-                        "name": getattr(fc, "name", "unknown"),
-                        "args": getattr(fc, "args", None) or {},
-                        "thought_signature": sig,
-                    })
+                    fc_name = str(getattr(fc, "name", "") or "")
+                    if is_anti_truncation_tool_name(fc_name):
+                        fc_args = getattr(fc, "args", None) or {}
+                        if isinstance(fc_args, dict) and isinstance(fc_args.get("content"), str):
+                            restored_synthetic_texts.append(fc_args["content"])
+                    else:
+                        _emit_assembled_call({
+                            "id": getattr(fc, "id", None),
+                            "name": fc_name or "unknown",
+                            "args": getattr(fc, "args", None) or {},
+                            "thought_signature": sig,
+                        })
 
         if openai_finish_reason and indexer is not None and indexer.has_pending_function_call(candidate_index):
             for c_item in indexer.flush_function_calls(candidate_index):
                 _emit_assembled_call(c_item)
 
-        if (openai_finish_reason == "stop" and indexer
-                and indexer.has_tool_calls(candidate_index)):
+        if openai_finish_reason == "stop" and indexer and indexer.has_tool_calls(candidate_index):
             openai_finish_reason = "tool_calls"
+        elif openai_finish_reason == "tool_calls" and indexer and not indexer.has_tool_calls(candidate_index):
+            openai_finish_reason = "stop"
 
         if tool_call_deltas:
             delta_payload["tool_calls"] = tool_call_deltas
 
         reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
+        if restored_synthetic_texts:
+            normal_text = normal_text + "".join(restored_synthetic_texts)
 
         if (openai_finish_reason and _safety_score_enabled()
                 and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
@@ -911,6 +955,7 @@ async def gemini_fake_stream_generator(
     is_auto_attempt: bool,
     prefill_text: str = "",
     fastapi_request: Optional[Any] = None,
+    anti_trunc_tool_name: Optional[str] = None,
 ):
     print(f"🌊 [假流式] 已开始调用 Gemini 模型 {model_for_api_call}，客户端请求模型名为 {request_obj.model}。")
 
@@ -944,6 +989,16 @@ async def gemini_fake_stream_generator(
             except (asyncio.CancelledError, Exception):
                 pass
 
+    # 假流式底层走非流式 generate_content，移除 stream_function_call_arguments 以免非流式接口拒收
+    nonstream_gen_config = dict(gen_config_dict_for_api_call)
+    if isinstance(nonstream_gen_config.get("tool_config"), dict):
+        tc_copy = dict(nonstream_gen_config["tool_config"])
+        if isinstance(tc_copy.get("function_calling_config"), dict):
+            fcc_copy = dict(tc_copy["function_calling_config"])
+            fcc_copy.pop("stream_function_call_arguments", None)
+            tc_copy["function_calling_config"] = fcc_copy
+        nonstream_gen_config["tool_config"] = tc_copy
+
     try:
         for attempt in range(max_retries + 1):
             if await _client_gone():
@@ -954,7 +1009,7 @@ async def gemini_fake_stream_generator(
                 gemini_client_instance.aio.models.generate_content(
                     model=model_for_api_call,
                     contents=prompt_for_api_call,
-                    config=gen_config_dict_for_api_call,
+                    config=nonstream_gen_config,
                 )
             )
 
@@ -1029,7 +1084,11 @@ async def gemini_fake_stream_generator(
 
         _record_usage(raw_gemini_response)
 
-        openai_response_dict = convert_to_openai_format(raw_gemini_response, request_obj.model)
+        openai_response_dict = convert_to_openai_format(
+            raw_gemini_response,
+            request_obj.model,
+            anti_trunc_tool_name=anti_trunc_tool_name,
+        )
         _prepend_prefill(openai_response_dict, prefill_text)
 
         async for chunk_sse in _chunk_openai_response_dict_for_sse(
@@ -1076,6 +1135,7 @@ async def execute_gemini_call(
     is_auto_attempt: bool = False,
     fastapi_request: Optional[Any] = None,
     prefill_text: str = "",
+    anti_trunc_tool_name: Optional[str] = None,
     fallback_model: Optional[str] = None,
     fallback_client_factory: Optional[Callable[[], Any]] = None,
 ):
@@ -1112,6 +1172,7 @@ async def execute_gemini_call(
                     current_client, model_to_call, actual_prompt_for_call,
                     gen_config_dict, request_obj, is_auto_attempt, prefill_text=prefill_text,
                     fastapi_request=fastapi_request,
+                    anti_trunc_tool_name=anti_trunc_tool_name,
                 ), media_type="text/event-stream"
             )
         else:  # True Streaming
@@ -1133,7 +1194,7 @@ async def execute_gemini_call(
                             config=gen_config_dict
                         )
 
-                        tool_indexer = ToolCallIndexer()
+                        tool_indexer = ToolCallIndexer(anti_trunc_tool_name=anti_trunc_tool_name)
                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (request_obj.n or 1) == 1) else None
                         prefill_emitted = not bool(prefill_text)
 
@@ -1351,6 +1412,10 @@ async def execute_gemini_call(
 
         _record_usage(response_obj_call)
 
-        openai_response_content = convert_to_openai_format(response_obj_call, request_obj.model)
+        openai_response_content = convert_to_openai_format(
+            response_obj_call,
+            request_obj.model,
+            anti_trunc_tool_name=anti_trunc_tool_name,
+        )
         _prepend_prefill(openai_response_content, prefill_text)
         return JSONResponse(content=openai_response_content)
