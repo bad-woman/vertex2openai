@@ -194,13 +194,29 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>登录 · agentplatform2api</title>
 <script>
-(function(){try{var t=localStorage.getItem('ap_theme');if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){document.documentElement.classList.add('dark');}}catch(e){}})();
+(function(){
+  try{
+    var t=localStorage.getItem('ap_theme');
+    if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){
+      document.documentElement.classList.add('dark');
+    }
+  }catch(e){}
+})();
 </script>
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-body{background:radial-gradient(circle at 15% 20%,#f5eeff 0%,transparent 45%),radial-gradient(circle at 85% 80%,#e8fbf6 0%,transparent 45%),#fdfbf9;font-family:'Inter',system-ui,sans-serif;color:#3d354b;transition:background .25s,color .25s}
-.card{background:rgba(255,255,255,.92);backdrop-filter:blur(10px);border:1px solid #ede7f6;border-radius:20px;box-shadow:0 10px 30px -10px rgba(139,124,246,.14)}
+body{
+  background:radial-gradient(circle at 15% 20%, #f5eeff 0%, transparent 45%),
+             radial-gradient(circle at 85% 80%, #e8fbf6 0%, transparent 45%),
+             #fdfbf9;
+  font-family:'Inter',system-ui,sans-serif;color:#3d354b;transition:background .25s,color .25s;
+}
+.card{
+  background:rgba(255,255,255,.92);backdrop-filter:blur(10px);
+  border:1px solid #ede7f6;border-radius:20px;
+  box-shadow:0 10px 30px -10px rgba(139,124,246,.14);
+}
 .inp{border:1px solid #e6dff2;border-radius:12px;padding:11px 14px;width:100%;outline:none;font-size:15px;background:#fcfaff;color:#3d354b;transition:.2s}
 .inp:focus{border-color:#8b7cf6;background:#fff;box-shadow:0 0 0 3px rgba(139,124,246,.16)}
 .btn{background:linear-gradient(135deg,#8b7cf6 0%,#f48fb1 100%);color:#fff;border-radius:12px;font-weight:600;padding:11px;width:100%;transition:.2s;box-shadow:0 4px 12px rgba(139,124,246,.28)}
@@ -208,7 +224,12 @@ body{background:radial-gradient(circle at 15% 20%,#f5eeff 0%,transparent 45%),ra
 .theme-seg{display:inline-flex;align-items:center;padding:2px;border-radius:999px;border:1px solid #e6dff2;background:rgba(255,255,255,.85);font-size:12px}
 .theme-seg span{padding:3px 9px;border-radius:999px;cursor:pointer;transition:.18s;color:#7d738e;user-select:none}
 .theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#f48fb1);color:#fff;font-weight:600;box-shadow:0 2px 6px rgba(139,124,246,.25)}
-html.dark body{background:radial-gradient(circle at 15% 20%,rgba(139,124,246,.12) 0%,transparent 45%),radial-gradient(circle at 85% 80%,rgba(95,211,188,.08) 0%,transparent 45%),#15131d;color:#e6e1f2}
+html.dark body{
+  background:radial-gradient(circle at 15% 20%, rgba(139,124,246,.12) 0%, transparent 45%),
+             radial-gradient(circle at 85% 80%, rgba(95,211,188,.08) 0%, transparent 45%),
+             #15131d;
+  color:#e6e1f2;
+}
 html.dark .card{background:rgba(30,27,41,.94);border-color:#2f2a40;box-shadow:0 12px 32px -10px rgba(0,0,0,.45)}
 html.dark .inp{background:#171421;border-color:#352f47;color:#e6e1f2}
 html.dark .inp:focus{background:#1c1828;border-color:#9d8df8;box-shadow:0 0 0 3px rgba(157,141,248,.2)}
@@ -239,10 +260,29 @@ html.dark .theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#5fd3bc);
     </div>
   </div>
 <script>
-function syncThemeSeg(){var isDark=document.documentElement.classList.contains('dark');var l=document.getElementById('t-light'),d=document.getElementById('t-dark');if(l)l.classList.toggle('on',!isDark);if(d)d.classList.toggle('on',isDark);}
-function setTheme(mode){var wantDark=(mode==='dark');document.documentElement.classList.toggle('dark',wantDark);try{localStorage.setItem('ap_theme',wantDark?'dark':'light');}catch(e){}syncThemeSeg();}
+function syncThemeSeg(){
+  var isDark=document.documentElement.classList.contains('dark');
+  var l=document.getElementById('t-light'), d=document.getElementById('t-dark');
+  if(l) l.classList.toggle('on', !isDark);
+  if(d) d.classList.toggle('on', isDark);
+}
+function setTheme(mode){
+  var wantDark=(mode==='dark');
+  document.documentElement.classList.toggle('dark', wantDark);
+  try{localStorage.setItem('ap_theme',wantDark?'dark':'light');}catch(e){}
+  syncThemeSeg();
+}
 syncThemeSeg();
-async function doLogin(e){e.preventDefault();var pw=document.getElementById('pw').value;var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});if(r.ok){location.href='/';}else{var d=await r.json().catch(function(){return {};});document.getElementById('err').textContent=d.error||'密码错误，请重试';}return false;}
+async function doLogin(e){
+  e.preventDefault();
+  var pw=document.getElementById('pw').value;
+  var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+  if(r.ok){ location.href='/'; } else {
+    var d=await r.json().catch(function(){return {};});
+    document.getElementById('err').textContent=d.error||'密码错误，请重试';
+  }
+  return false;
+}
 </script>
 </body></html>
 """
@@ -258,96 +298,244 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>agentplatform2api · 控制台</title>
 <script>
-(function(){try{var t=localStorage.getItem('ap_theme');if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){document.documentElement.classList.add('dark');}}catch(e){}})();
+(function(){
+  try{
+    var t=localStorage.getItem('ap_theme');
+    if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){
+      document.documentElement.classList.add('dark');
+    }
+  }catch(e){}
+})();
 </script>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root{--border:#ece5f5;--muted:#7d738e;--fg:#3b334a;--bg:#fdfbf9;--card-bg:rgba(255,255,255,.94);--inp-bg:#ffffff;--inp-dis:#f7f5fa;--accent:#8b7cf6;--accent2:#f48fb1;--accent-hover:#7665e8;--mint:#5fd3bc;--mint-text:#239480;--apricot:#f8c27a;--apricot-text:#c97b1e;--coral:#f68697;--coral-text:#d64860;--sky:#74b9ff}
-  html.dark{--border:#2f2a40;--muted:#9a90b0;--fg:#e6e1f2;--bg:#15131d;--card-bg:rgba(30,27,41,.94);--inp-bg:#171421;--inp-dis:#211d2c;--accent:#9d8df8;--accent2:#f48fb1;--accent-hover:#8b7cf6;--mint:#5fd3bc;--mint-text:#65dbc4;--apricot:#f8c27a;--apricot-text:#fad096;--coral:#f68697;--coral-text:#ff9bab;--sky:#74b9ff}
-  *{-webkit-font-smoothing:antialiased;box-sizing:border-box}
-  body{background:radial-gradient(circle at 8% 12%,rgba(243,232,255,.65) 0%,transparent 40%),radial-gradient(circle at 92% 18%,rgba(230,252,245,.65) 0%,transparent 40%),radial-gradient(circle at 50% 90%,rgba(255,238,244,.55) 0%,transparent 45%),var(--bg);color:var(--fg);font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;transition:background-color .25s ease,color .25s ease;overflow-x:hidden}
-  html.dark body{background:radial-gradient(circle at 8% 12%,rgba(139,124,246,.10) 0%,transparent 42%),radial-gradient(circle at 92% 18%,rgba(95,211,188,.07) 0%,transparent 42%),radial-gradient(circle at 50% 90%,rgba(244,143,177,.06) 0%,transparent 45%),var(--bg)}
-  @keyframes fadeSlideUp{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
-  .tab-pane{animation:fadeSlideUp .18s cubic-bezier(.16,1,.3,1)}
-  .card{background:var(--card-bg);border:1px solid var(--border);border-radius:16px;box-shadow:0 4px 18px -4px rgba(139,124,246,.07);transition:background-color .25s ease,border-color .25s ease}
-  html.dark .card{box-shadow:0 6px 22px -6px rgba(0,0,0,.45)}
-  .stat-total{background:linear-gradient(145deg,#ffffff 0%,#f6f2ff 100%);border-color:#e6defa}
-  .stat-ok{background:linear-gradient(145deg,#ffffff 0%,#eefcf8 100%);border-color:#d5f5ec}
-  .stat-retry{background:linear-gradient(145deg,#ffffff 0%,#fff9ef 100%);border-color:#fae7c8}
-  .stat-err{background:linear-gradient(145deg,#ffffff 0%,#fff2f5 100%);border-color:#fbd5dc}
-  html.dark .stat-total{background:linear-gradient(145deg,#1e1b29 0%,#251f3d 100%);border-color:#382e5c}
-  html.dark .stat-ok{background:linear-gradient(145deg,#1e1b29 0%,#182e2b 100%);border-color:#234740}
-  html.dark .stat-retry{background:linear-gradient(145deg,#1e1b29 0%,#2f251a 100%);border-color:#4c3b24}
-  html.dark .stat-err{background:linear-gradient(145deg,#1e1b29 0%,#331d25 100%);border-color:#522b38}
-  .lbl{font-size:12px;color:var(--muted);font-weight:500}
-  .val{font-variant-numeric:tabular-nums;letter-spacing:-.02em}
-  .btn{background:linear-gradient(135deg,#8b7cf6 0%,#a288f8 100%);color:#fff;border-radius:10px;font-weight:600;transition:.18s;box-shadow:0 3px 10px rgba(139,124,246,.24)}
-  .btn:hover{background:linear-gradient(135deg,#7a6ae8 0%,#9175f0 100%);transform:translateY(-1px)}
-  .btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
-  .btn-soft{background:#f8f5ff;color:#6b5bd6;border:1px solid #e4dcfa;border-radius:10px;font-weight:500;transition:.15s}
-  .btn-soft:hover{background:#f0ebff;border-color:#d2c5f8}
-  html.dark .btn-soft{background:#252036;color:#b8abff;border-color:#3b3354}
-  html.dark .btn-soft:hover{background:#2e2842;border-color:#4e4370}
-  .inp{border:1px solid var(--border);border-radius:10px;background:var(--inp-bg);font-size:14px;padding:8px 11px;width:100%;outline:none;transition:.15s;color:var(--fg)}
-  .inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(139,124,246,.16)}
-  .inp:disabled{background:var(--inp-dis);color:#888098}
-  .tab{padding:13px 6px;font-size:14px;font-weight:600;color:var(--muted);border-bottom:2.5px solid transparent;cursor:pointer;white-space:nowrap;transition:.15s}
-  .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
-  .tab:hover:not(.active){color:var(--fg)}
-  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3.5px 11px;border-radius:999px;border:1px solid var(--border);background:var(--inp-bg);color:var(--muted);transition:.15s;white-space:nowrap}
-  .pill-accent{border-color:#e2d9fc;background:linear-gradient(135deg,rgba(139,124,246,.12),rgba(244,143,177,.12));color:#6b5bd6;font-weight:600}
-  html.dark .pill-accent{border-color:#3d335c;background:linear-gradient(135deg,rgba(139,124,246,.22),rgba(244,143,177,.16));color:#c1b6ff}
-  .pill-mint{border-color:#cdeee5;background:#eefcf8;color:var(--mint-text);font-weight:600}
-  html.dark .pill-mint{border-color:#244a42;background:rgba(95,211,188,.14);color:#6de0c9}
-  .pill-apricot{border-color:#f9e2be;background:#fff8ee;color:var(--apricot-text);font-weight:600}
-  html.dark .pill-apricot{border-color:#4d3b24;background:rgba(248,194,122,.14);color:#fad096}
-  .theme-seg{display:inline-flex;align-items:center;padding:2px;border-radius:999px;border:1px solid var(--border);background:var(--inp-bg);font-size:12px}
-  .theme-seg span{padding:2.5px 9px;border-radius:999px;cursor:pointer;transition:.18s;color:var(--muted);user-select:none;white-space:nowrap}
-  .theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#f48fb1);color:#fff;font-weight:600;box-shadow:0 2px 6px rgba(139,124,246,.24)}
-  html.dark .theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#5fd3bc);color:#fff}
-  .chan-card{border:1.5px solid var(--border);border-radius:14px;padding:14px 16px;cursor:pointer;transition:all .2s ease;position:relative;opacity:.78}
-  .chan-card:hover{opacity:1;border-color:#d4c8f8}
-  .chan-card.active{opacity:1;border-color:var(--accent);background:linear-gradient(135deg,rgba(139,124,246,.07) 0%,rgba(95,211,188,.06) 100%);box-shadow:0 4px 16px -4px rgba(139,124,246,.18)}
-  html.dark .chan-card.active{background:linear-gradient(135deg,rgba(139,124,246,.16) 0%,rgba(95,211,188,.10) 100%);box-shadow:0 4px 18px -4px rgba(0,0,0,.5)}
-  .log{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
-  .log-item{cursor:pointer;transition:filter .12s ease}
-  .log-item:hover{filter:brightness(0.96)}
-  html.dark .log-item:hover{filter:brightness(1.15)}
+  :root {
+    --border:#ece5f5;
+    --muted:#7d738e;
+    --fg:#3b334a;
+    --bg:#fdfbf9;
+    --card-bg:rgba(255,255,255,.94);
+    --inp-bg:#ffffff;
+    --inp-dis:#f7f5fa;
+    --accent:#8b7cf6;
+    --accent2:#f48fb1;
+    --accent-hover:#7665e8;
+    --mint:#5fd3bc;
+    --mint-text:#239480;
+    --apricot:#f8c27a;
+    --apricot-text:#c97b1e;
+    --coral:#f68697;
+    --coral-text:#d64860;
+    --sky:#74b9ff;
+  }
+  html.dark {
+    --border:#2f2a40;
+    --muted:#9a90b0;
+    --fg:#e6e1f2;
+    --bg:#15131d;
+    --card-bg:rgba(30,27,41,.94);
+    --inp-bg:#171421;
+    --inp-dis:#211d2c;
+    --accent:#9d8df8;
+    --accent2:#f48fb1;
+    --accent-hover:#8b7cf6;
+    --mint:#5fd3bc;
+    --mint-text:#65dbc4;
+    --apricot:#f8c27a;
+    --apricot-text:#fad096;
+    --coral:#f68697;
+    --coral-text:#ff9bab;
+    --sky:#74b9ff;
+  }
+  * { -webkit-font-smoothing:antialiased; box-sizing:border-box; }
+  body {
+    background:
+      radial-gradient(circle at 8% 12%, rgba(243,232,255,.65) 0%, transparent 40%),
+      radial-gradient(circle at 92% 18%, rgba(230,252,245,.65) 0%, transparent 40%),
+      radial-gradient(circle at 50% 90%, rgba(255,238,244,.55) 0%, transparent 45%),
+      var(--bg);
+    color:var(--fg);
+    font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+    transition:background-color .25s ease, color .25s ease;
+    overflow-x:hidden;
+  }
+  html.dark body {
+    background:
+      radial-gradient(circle at 8% 12%, rgba(139,124,246,.10) 0%, transparent 42%),
+      radial-gradient(circle at 92% 18%, rgba(95,211,188,.07) 0%, transparent 42%),
+      radial-gradient(circle at 50% 90%, rgba(244,143,177,.06) 0%, transparent 45%),
+      var(--bg);
+  }
+  @keyframes fadeSlideUp {
+    from { opacity:0; transform:translateY(5px); }
+    to   { opacity:1; transform:translateY(0); }
+  }
+  .tab-pane { animation:fadeSlideUp .18s cubic-bezier(.16,1,.3,1); }
+  .card {
+    background:var(--card-bg);
+    border:1px solid var(--border);
+    border-radius:16px;
+    box-shadow:0 4px 18px -4px rgba(139,124,246,.07);
+    transition:background-color .25s ease, border-color .25s ease;
+  }
+  html.dark .card { box-shadow:0 6px 22px -6px rgba(0,0,0,.45); }
+  .stat-total { background:linear-gradient(145deg,#ffffff 0%,#f6f2ff 100%); border-color:#e6defa; }
+  .stat-ok    { background:linear-gradient(145deg,#ffffff 0%,#eefcf8 100%); border-color:#d5f5ec; }
+  .stat-retry { background:linear-gradient(145deg,#ffffff 0%,#fff9ef 100%); border-color:#fae7c8; }
+  .stat-err   { background:linear-gradient(145deg,#ffffff 0%,#fff2f5 100%); border-color:#fbd5dc; }
+  html.dark .stat-total { background:linear-gradient(145deg,#1e1b29 0%,#251f3d 100%); border-color:#382e5c; }
+  html.dark .stat-ok    { background:linear-gradient(145deg,#1e1b29 0%,#182e2b 100%); border-color:#234740; }
+  html.dark .stat-retry { background:linear-gradient(145deg,#1e1b29 0%,#2f251a 100%); border-color:#4c3b24; }
+  html.dark .stat-err   { background:linear-gradient(145deg,#1e1b29 0%,#331d25 100%); border-color:#522b38; }
+
+  .lbl { font-size:12px; color:var(--muted); font-weight:500; }
+  .val { font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+  .btn {
+    background:linear-gradient(135deg, #8b7cf6 0%, #a288f8 100%);
+    color:#fff; border-radius:10px; font-weight:600; transition:.18s;
+    box-shadow:0 3px 10px rgba(139,124,246,.24);
+  }
+  .btn:hover { background:linear-gradient(135deg, #7a6ae8 0%, #9175f0 100%); transform:translateY(-1px); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+  .btn-soft {
+    background:#f8f5ff; color:#6b5bd6; border:1px solid #e4dcfa;
+    border-radius:10px; font-weight:500; transition:.15s;
+  }
+  .btn-soft:hover { background:#f0ebff; border-color:#d2c5f8; }
+  html.dark .btn-soft {
+    background:#252036; color:#b8abff; border-color:#3b3354;
+  }
+  html.dark .btn-soft:hover { background:#2e2842; border-color:#4e4370; }
+
+  .inp {
+    border:1px solid var(--border); border-radius:10px; background:var(--inp-bg);
+    font-size:14px; padding:8px 11px; width:100%; outline:none; transition:.15s; color:var(--fg);
+  }
+  .inp:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(139,124,246,.16); }
+  .inp:disabled { background:var(--inp-dis); color:#888098; }
+  .tab {
+    padding:13px 6px; font-size:14px; font-weight:600; color:var(--muted);
+    border-bottom:2.5px solid transparent; cursor:pointer; white-space:nowrap; transition:.15s;
+  }
+  .tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+  .tab:hover:not(.active){ color:var(--fg); }
+  .pill {
+    display:inline-flex; align-items:center; gap:6px; font-size:12px;
+    padding:3.5px 11px; border-radius:999px; border:1px solid var(--border);
+    background:var(--inp-bg); color:var(--muted); transition:.15s; white-space:nowrap;
+  }
+  .pill-accent {
+    border-color:#e2d9fc;
+    background:linear-gradient(135deg,rgba(139,124,246,.12),rgba(244,143,177,.12));
+    color:#6b5bd6; font-weight:600;
+  }
+  html.dark .pill-accent {
+    border-color:#3d335c;
+    background:linear-gradient(135deg,rgba(139,124,246,.22),rgba(244,143,177,.16));
+    color:#c1b6ff;
+  }
+  .pill-mint { border-color:#cdeee5; background:#eefcf8; color:var(--mint-text); font-weight:600; }
+  html.dark .pill-mint { border-color:#244a42; background:rgba(95,211,188,.14); color:#6de0c9; }
+  .pill-apricot { border-color:#f9e2be; background:#fff8ee; color:var(--apricot-text); font-weight:600; }
+  html.dark .pill-apricot { border-color:#4d3b24; background:rgba(248,194,122,.14); color:#fad096; }
+
+  /* 双态日夜胶囊切换器（方案 B） */
+  .theme-seg {
+    display:inline-flex; align-items:center; padding:2px; border-radius:999px;
+    border:1px solid var(--border); background:var(--inp-bg); font-size:12px;
+  }
+  .theme-seg span {
+    padding:2.5px 9px; border-radius:999px; cursor:pointer; transition:.18s;
+    color:var(--muted); user-select:none; white-space:nowrap;
+  }
+  .theme-seg span.on {
+    background:linear-gradient(135deg,#8b7cf6,#f48fb1); color:#fff; font-weight:600;
+    box-shadow:0 2px 6px rgba(139,124,246,.24);
+  }
+  html.dark .theme-seg span.on {
+    background:linear-gradient(135deg,#8b7cf6,#5fd3bc); color:#fff;
+  }
+
+  /* 通道选择卡片激活态高亮（提议 2） */
+  .chan-card {
+    border:1.5px solid var(--border); border-radius:14px; padding:14px 16px;
+    cursor:pointer; transition:all .2s ease; position:relative; opacity:.78;
+  }
+  .chan-card:hover { opacity:1; border-color:#d4c8f8; }
+  .chan-card.active {
+    opacity:1;
+    border-color:var(--accent);
+    background:linear-gradient(135deg,rgba(139,124,246,.07) 0%,rgba(95,211,188,.06) 100%);
+    box-shadow:0 4px 16px -4px rgba(139,124,246,.18);
+  }
+  html.dark .chan-card.active {
+    background:linear-gradient(135deg,rgba(139,124,246,.16) 0%,rgba(95,211,188,.10) 100%);
+    box-shadow:0 4px 18px -4px rgba(0,0,0,.5);
+  }
+
+  .log { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
+  .log-item { cursor:pointer; transition:filter .12s ease; }
+  .log-item:hover { filter:brightness(0.96); }
+  html.dark .log-item:hover { filter:brightness(1.15); }
   ::-webkit-scrollbar{width:8px;height:8px}
   ::-webkit-scrollbar-thumb{background:#dfd8ec;border-radius:8px}
   ::-webkit-scrollbar-thumb:hover{background:#c9bfe0}
   html.dark ::-webkit-scrollbar-thumb{background:#352f47}
   html.dark ::-webkit-scrollbar-thumb:hover{background:#473f5e}
-  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:linear-gradient(135deg,#4a3f63,#635380);color:#fff;padding:10px 20px;border-radius:12px;font-size:14px;opacity:0;transition:.25s;pointer-events:none;z-index:50;max-width:92vw;text-align:center;box-shadow:0 8px 24px rgba(74,63,99,.22)}
-  .toast.show{opacity:1}
-  .switch{position:relative;width:40px;height:22px;display:inline-block;flex-shrink:0}
+
+  .toast {
+    position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
+    background:linear-gradient(135deg,#4a3f63,#635380); color:#fff;
+    padding:10px 20px; border-radius:12px; font-size:14px; opacity:0;
+    transition:.25s; pointer-events:none; z-index:50; max-width:92vw; text-align:center;
+    box-shadow:0 8px 24px rgba(74,63,99,.22);
+  }
+  .toast.show { opacity:1; }
+  .switch { position:relative; width:40px; height:22px; display:inline-block; flex-shrink:0; }
   .switch input{opacity:0;width:0;height:0}
   .slider{position:absolute;inset:0;background:#e6e0f0;border-radius:999px;transition:.2s;cursor:pointer}
   html.dark .slider{background:#342e46}
   .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.15)}
   input:checked + .slider{background:linear-gradient(135deg,#8b7cf6,#5fd3bc)}
   input:checked + .slider:before{transform:translateX(18px)}
-  .hero{background:linear-gradient(135deg,rgba(255,255,255,.96) 0%,rgba(249,245,255,.94) 55%,rgba(239,252,248,.94) 100%);border:1px solid var(--border);border-radius:18px;box-shadow:0 6px 20px -6px rgba(139,124,246,.09)}
-  html.dark .hero{background:linear-gradient(135deg,rgba(32,28,44,.96) 0%,rgba(37,31,54,.94) 55%,rgba(26,38,41,.94) 100%);box-shadow:0 8px 24px -6px rgba(0,0,0,.45)}
-  .helpq{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;border:1px solid #d5cce6;color:#9286a8;font-size:10px;line-height:1;cursor:pointer;user-select:none;vertical-align:middle;margin-left:5px;transition:.15s;background:#faf8ff}
-  html.dark .helpq{background:#252036;border-color:#3d3554;color:#a89ec2}
-  .helpq:hover{border-color:var(--accent);color:var(--accent);background:#f2edff}
-  html.dark .helpq:hover{background:#2f2846}
-  .helpq.on{border-color:var(--accent);color:#fff;background:var(--accent)}
-  .helpbox{display:none;margin-top:7px;padding:10px 12px;border-radius:10px;background:#faf8fd;border:1px solid #ece5f7;font-size:12px;line-height:1.75;color:#5e5470;animation:fadeSlideUp .16s ease-out}
-  html.dark .helpbox{background:#181523;border-color:#2f2942;color:#b5abc9}
-  .helpbox.show{display:block}
-  .helpbox,.helpbox code{overflow-wrap:anywhere;word-break:break-word}
-  .helpbox code{display:inline;white-space:normal;background:#ede6fa;color:#5a48b8;padding:1px 5px;border-radius:5px;font-size:11px}
-  html.dark .helpbox code{background:#2b2442;color:#c4b8ff}
-  .helpbox b{color:var(--fg)}
-  html.dark .key-row{background:#181523 !important;border-color:#2f2942 !important}
-  html.dark .divider-line{border-color:#2b263b !important}
-  html.dark #logwin{background:#121018 !important}
-  html.dark .log-header{background:#191624 !important;border-color:#2f2a40 !important}
+  .hero {
+    background:linear-gradient(135deg,rgba(255,255,255,.96) 0%,rgba(249,245,255,.94) 55%,rgba(239,252,248,.94) 100%);
+    border:1px solid var(--border); border-radius:18px;
+    box-shadow:0 6px 20px -6px rgba(139,124,246,.09);
+  }
+  html.dark .hero {
+    background:linear-gradient(135deg,rgba(32,28,44,.96) 0%,rgba(37,31,54,.94) 55%,rgba(26,38,41,.94) 100%);
+    box-shadow:0 8px 24px -6px rgba(0,0,0,.45);
+  }
+  .helpq {
+    display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px;
+    border-radius:50%; border:1px solid #d5cce6; color:#9286a8; font-size:10px; line-height:1;
+    cursor:pointer; user-select:none; vertical-align:middle; margin-left:5px; transition:.15s;
+    background:#faf8ff;
+  }
+  html.dark .helpq { background:#252036; border-color:#3d3554; color:#a89ec2; }
+  .helpq:hover { border-color:var(--accent); color:var(--accent); background:#f2edff; }
+  html.dark .helpq:hover { background:#2f2846; }
+  .helpq.on { border-color:var(--accent); color:#fff; background:var(--accent); }
+  .helpbox {
+    display:none; margin-top:7px; padding:10px 12px; border-radius:10px; background:#faf8fd;
+    border:1px solid #ece5f7; font-size:12px; line-height:1.75; color:#5e5470;
+    animation:fadeSlideUp .16s ease-out;
+  }
+  html.dark .helpbox { background:#181523; border-color:#2f2942; color:#b5abc9; }
+  .helpbox.show { display:block; }
+  .helpbox, .helpbox code { overflow-wrap:anywhere; word-break:break-word; }
+  .helpbox code { display:inline; white-space:normal; background:#ede6fa; color:#5a48b8; padding:1px 5px; border-radius:5px; font-size:11px; }
+  html.dark .helpbox code { background:#2b2442; color:#c4b8ff; }
+  .helpbox b { color:var(--fg); }
+
+  html.dark .key-row { background:#181523 !important; border-color:#2f2942 !important; }
+  html.dark .divider-line { border-color:#2b263b !important; }
+  html.dark #logwin { background:#121018 !important; }
+  html.dark .log-header { background:#191624 !important; border-color:#2f2a40 !important; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -506,7 +694,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div id="caps-summary" class="text-xs flex flex-wrap gap-2 max-w-xl"></div>
       </div>
       <p class="text-xs text-[#7d738e] mt-3 leading-relaxed">
-        • <b>① 按模型参数</b>（思考 / 生图 / 采样 / 预填充与抗截断）完全跟随上方下拉框：选「＊ 全局默认」时修改的是所有模型的默认值；选具体模型时修改的是该模型的专属值（带 ★），通过本卡片的按钮保存。<br>
+        • <b>① 按模型参数</b>（思考 / 生图 / 采样 / 预填充与注入）完全跟随上方下拉框：选「＊ 全局默认」时修改的是所有模型的默认值；选具体模型时修改的是该模型的专属值（带 ★），通过本卡片的按钮保存。<br>
         • <b>② 全局设置</b>（location 区域 / 图片压缩 / 重试退避 / 假流式与弱网续传 / 调试开关）全局唯一，通过页面底部的「保存全局设置」按钮保存，<b>两个分区完全独立、互不覆盖</b>。
       </p>
       <div class="flex items-center gap-2.5 mt-3.5 flex-wrap">
@@ -582,28 +770,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <p id="sampling-note" class="text-xs text-[#7d738e] mt-2"></p>
       </div>
 
-      <!-- 预填充、抗截断与注入（全部归入 ① 按模型参数区） -->
+      <!-- 预填充与注入（全部归入 ① 按模型参数区） -->
       <div class="card p-5">
-        <div class="text-sm font-semibold mb-3">预填充、抗截断与注入 <span class="text-xs font-normal text-[#9a90ab]">（支持按模型单独配置）</span></div>
+        <div class="text-sm font-semibold mb-3">预填充兼容与注入 <span class="text-xs font-normal text-[#9a90ab]">（支持按模型单独配置）</span></div>
         <div class="space-y-3">
           <div>
-            <div class="flex items-center justify-between gap-3"><span class="text-sm">工具抗截断模式<span class="helpq" onclick="hlp(this,'h_at')">?</span></span>
-              <select id="anti_truncation_mode" class="inp" style="width:175px">
-                <option value="off">关闭（默认）</option>
-                <option value="streaming">流式工具抗截断（推荐）</option>
-                <option value="buffered">非流式工具抗截断</option>
-              </select>
-            </div>
-            <div id="h_at" class="helpbox">
-              通过动态注入随机命名的合成函数（<code>deliver_reply_xxx</code>）并锁定 <code>mode: ANY</code>，将合成工具作为纯粹的字符传输通道（指令仅追加在 <code>system</code> 层，完全不触碰预填充、推动语与思维链守卫）。<br>
-              • <b>流式工具抗截断</b>：开启 Vertex 原生 <code>streamFunctionCallArguments</code>，实时将 <code>partialArgs</code> 还原为普通文本流（边写边出字）。<br>
-              • <b>非流式工具抗截断</b>：等待工具调用完整生成后解包为正文。<br>
-              • <b>零干扰兼容</b>：预填充续写与 <code>PrefillDeduper</code> 输出去重原封不动；若 Cookie 通道遇到不支持的模型，会自动无感回退为普通文本生成。
-            </div>
-          </div>
-          <div>
             <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
-              <select id="prefill_mode" class="inp" style="width:175px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
+              <select id="prefill_mode" class="inp" style="width:155px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
             </div>
             <div id="h_pfm" class="helpbox">
               Gemini 3.x / 4.x 拒绝以 assistant 轮次结尾的请求。<br>
@@ -620,10 +793,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div>
             <div class="flex items-center justify-between gap-2"><span class="text-sm">思维链守卫（防跳过思考）<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
             <div id="h_cotg" class="helpbox">自动识别预填充中未闭合的思维链开标签（如 <code>&lt;thinking&gt;</code>、<code>&lt;cot&gt;</code>），前置注入格式硬性要求并在输出侧去重双开标签，防止模型跳过思考直接写正文。</div>
-          </div>
-          <div>
-            <div class="flex items-center justify-between gap-2"><span class="text-sm">Unicode 紧凑转码（防输入软拒绝）<span class="helpq" onclick="hlp(this,'h_uni')">?</span></span><label class="switch"><input type="checkbox" id="unicode_input"><span class="slider"></span></label></div>
-            <div id="h_uni" class="helpbox">将最后一条真实 user 消息中的汉字与英文字母转为 <code>⟦U:HEX...⟧</code> 码点格式（保留 <code>&lt;...&gt;</code> 标签与预填充不变），绕过输入端敏感词分类器的条件反射式软回避，模型会正常用原文回复。</div>
           </div>
           <div class="pt-2 border-t border-[#f0eaf8] divider-line">
             <div class="lbl mb-1">附加 system 指令<span class="helpq" onclick="hlp(this,'h_injs')">?</span></div>
@@ -784,7 +953,7 @@ var PER_MODEL_KEYS = [
   'default_temperature','default_top_p','default_max_tokens',
   'inject_system_instruction','inject_prefill','prefill_instruction',
   'image_system_instruction','inject_prefill_for_image','sampling_policy',
-  'prefill_cot_guard','prefill_mode','prefill_suppress_thinking','anti_truncation_mode','unicode_input'
+  'prefill_cot_guard','prefill_mode','prefill_suppress_thinking'
 ];
 var COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
@@ -800,6 +969,7 @@ async function copyEndpoint(){
   }catch(e){ toast('接口地址：' + url); }
 }
 
+/* ---------- 夜间护眼双态胶囊切换（方案 B） ---------- */
 function isDarkMode(){ return document.documentElement.classList.contains('dark'); }
 function syncThemeSeg(){
   var dark = isDarkMode();
@@ -820,7 +990,9 @@ syncThemeSeg();
 function scrollLogsToBottom(){
   var lw=$('logwin');
   if(!lw) return;
-  requestAnimationFrame(function(){ lw.scrollTop = lw.scrollHeight; });
+  requestAnimationFrame(function(){
+    lw.scrollTop = lw.scrollHeight;
+  });
 }
 
 function switchTab(t){
@@ -832,6 +1004,7 @@ function switchTab(t){
   }
 }
 
+/* ---------- Overview (Macaron Donut + Center Percentage & Dynamic Token Bars) ---------- */
 function renderChart(s,e,r){
   lastStats = {s:s, e:e, r:r};
   var ctx=$('donut').getContext('2d');
@@ -844,7 +1017,9 @@ function renderChart(s,e,r){
   var colors = isEmpty ? [emptyColor] : ['#5fd3bc', '#f8c27a', '#f68697'];
 
   var totalDone = s + e;
-  var rateEl = $('health-rate'), pctEl = $('donut-pct'), subEl = $('donut-sub');
+  var rateEl = $('health-rate');
+  var pctEl  = $('donut-pct');
+  var subEl  = $('donut-sub');
   if(totalDone === 0){
     if(rateEl){ rateEl.textContent = '待命'; rateEl.className = 'pill pill-accent'; }
     if(pctEl){ pctEl.textContent = '100%'; pctEl.style.color = 'var(--fg)'; }
@@ -875,11 +1050,24 @@ function renderChart(s,e,r){
     type: 'doughnut',
     data: {
       labels: labels,
-      datasets: [{ data: data, backgroundColor: colors, borderWidth: 3, borderColor: borderColor, hoverOffset: 4 }]
+      datasets: [{
+        data: data,
+        backgroundColor: colors,
+        borderWidth: 3,
+        borderColor: borderColor,
+        hoverOffset: 4
+      }]
     },
     options: {
       cutout: '74%',
-      plugins: { legend: { display: false }, tooltip: { backgroundColor: '#4a3f63', cornerRadius: 8, padding: 9 } }
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#4a3f63',
+          cornerRadius: 8,
+          padding: 9
+        }
+      }
     }
   });
 }
@@ -891,7 +1079,9 @@ async function fetchStats(){
     $('s-success').textContent=fmt(d.success);
     $('s-error').textContent=fmt(d.error);
     $('s-retries').textContent=fmt(d.retries);
-    var pTk = d.prompt_tokens || 0, cTk = d.completion_tokens || 0, totTk = pTk + cTk;
+    var pTk = d.prompt_tokens || 0;
+    var cTk = d.completion_tokens || 0;
+    var totTk = pTk + cTk;
     $('t-prompt').textContent=fmt(pTk);
     $('t-comp').textContent=fmt(cTk);
     $('t-total').textContent=fmt(totTk);
@@ -902,6 +1092,7 @@ async function fetchStats(){
   }catch(e){}
 }
 
+/* ---------- Channel（激活卡片高亮边框 + 徽章） ---------- */
 function applyChannelHighlight(m){
   var isWeb = (m==='web_proxy');
   $('opt-api').classList.toggle('active', !isWeb);
@@ -954,6 +1145,7 @@ async function loadRuntime(){
   }catch(e){}
 }
 
+/* ---------- Express Key 列表（增/删/改全自动保存 + 手机/电脑响应式） ---------- */
 var KEYS = [];
 function keySrcPill(rec){
   if(rec.project_source==='auto') return '<span class="pill pill-mint" style="text-transform:none">来源 auto</span>';
@@ -1017,6 +1209,7 @@ async function autoSaveExpressKeys(customMsg){
       KEYS=(d.keys||[]).map(function(x){return Object.assign({},x);}).concat(emptyRows);
       renderKeys();
       toast(customMsg || ('✅ 已自动保存（共 ' + payload.length + ' 个有效 Key）'));
+      // 若有尚无 Project ID 的 Key，2秒后自动拉取一次后台探测结果刷新界面
       if(payload.some(function(k){return !k.project_id;})){
         setTimeout(refreshKeysQuietly, 2200);
       }
@@ -1052,7 +1245,10 @@ async function removeKeyRow(i){
   var target = KEYS[i];
   var hadKey = !!(target && target.key);
   KEYS.splice(i,1);
-  if(!hadKey){ renderKeys(); return; }
+  if(!hadKey){
+    renderKeys();
+    return;
+  }
   await autoSaveExpressKeys('🗑️ 已删除 Key 并自动保存');
 }
 async function loadExpressKeys(){
@@ -1072,7 +1268,8 @@ async function probeOneKey(i){
   toast('正在自动保存并探测归属项目…');
   try{
     var r=await fetch('/api/express-keys/probe',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:targetKey, force:true, keys:payload})
     });
     var d=await r.json();
@@ -1093,7 +1290,8 @@ async function probeAllKeys(){
   toast('正在自动保存并探测全部 Key…');
   try{
     var r=await fetch('/api/express-keys/probe',{
-      method:'POST',headers:{'Content-Type':'application/json'},
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
       body:JSON.stringify({all:true, force:true, keys:payload})
     });
     var d=await r.json();
@@ -1106,6 +1304,7 @@ async function probeAllKeys(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
+/* ---------- Params (① 按模型参数 vs ② 全局基础设施 严格分离) ---------- */
 function setV(id,v){ var el=$(id); if(!el) return; if(el.type==='checkbox') el.checked=!!v; else el.value=(v===null||v===undefined)?'':v; }
 async function loadParams(){
   try{
@@ -1118,13 +1317,12 @@ async function loadParams(){
       'img_compress_max_dim','img_compress_max_mb','img_compress_quality',
       'retry_max','retry_backoff_seconds','fake_streaming_interval',
       'prefill_mode','prefill_instruction','inject_system_instruction','inject_prefill',
-      'sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams',
-      'anti_truncation_mode'
+      'sampling_policy','express_location','resumable_ttl_seconds','resumable_max_streams'
     ].forEach(function(k){setV(k,s[k]);});
     [
       'img_compress_enabled','fake_streaming','roundrobin','safety_score',
       'cookie_debug','debug_outbound','prefill_suppress_thinking',
-      'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','unicode_input','resumable_enabled'
+      'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'
     ].forEach(function(k){setV(k,s[k]);});
     if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
       if(s.hide_thoughts) setV('native_thinking_mode','off');
@@ -1177,8 +1375,6 @@ function collectSectionOnePatch(){
     prefill_cot_guard:$('prefill_cot_guard').checked,
     prefill_mode:$('prefill_mode').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
-    anti_truncation_mode:$('anti_truncation_mode').value,
-    unicode_input:$('unicode_input').checked,
   };
 }
 
@@ -1237,7 +1433,7 @@ function renderCaps(){
     applyModelParamFields(m);
     fillARFor(null);
     $('caps-summary').innerHTML='<span class="text-xs text-[#7d738e]">全局默认作用域：下方 ① 区的值对所有未设 ★ 专属的模型生效。切到具体模型可查看该模型的能力白名单与专属值。</span>';
-    ['thinking_g3_level','image_size','image_aspect_ratio','anti_truncation_mode','unicode_input'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
+    ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
     $('think-note').textContent='全局默认：具体下发时仍按各模型能力自动裁剪（例如 Pro 上 minimal 会就近取 low）。';
     $('image-note').textContent='全局默认：仅生图模型会用到分辨率与宽高比。';
@@ -1272,8 +1468,6 @@ function renderCaps(){
 
   var imgOn=cap.is_image;
   $('image_size').disabled=!imgOn; $('image_aspect_ratio').disabled=!imgOn;
-  if($('anti_truncation_mode')) $('anti_truncation_mode').disabled=imgOn;
-  if($('unicode_input')) $('unicode_input').disabled=imgOn;
   fillARFor(cap);
   $('image-note').textContent = imgOn
     ? ('该模型支持比例：' + cap.image_aspect_ratios.join('、') + '；分辨率 ' + cap.image_sizes.join('/') + '。')
@@ -1319,6 +1513,7 @@ async function saveSettings(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
+/* ---------- Logs (默认置底 + 点击单条复制) ---------- */
 var logwin=$('logwin'); var autoscroll=true;
 var LOG_RAW_LINES = [];
 logwin.addEventListener('scroll',function(){
@@ -1343,7 +1538,7 @@ function logLine(t, idx){
     bg = dark ? 'rgba(246,134,151,.14)' : '#fff4f6';
     bl = '3px solid #f68697';
   }
-  else if(t.includes('💰')||t.includes('🛡️')){
+  else if(t.includes('💰')){
     c = dark ? '#c2b6ff' : '#5e4bc4';
     bg = dark ? 'rgba(139,124,246,.13)' : '#f7f4ff';
     bl = '3px solid #8b7cf6';
@@ -1388,9 +1583,11 @@ try{
   };
 }catch(e){}
 
+/* ---------- Project ID auto-extract ---------- */
 $('project-input').addEventListener('input',function(e){ var v=e.target.value.trim(); var m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
 $('image_aspect_ratio').addEventListener('change', function(e){ curAR=e.target.value; });
 
+/* init */
 fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
 </script>
 </body>
@@ -1447,6 +1644,9 @@ async def get_stats_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=stats.get_json_stats())
 
 
+# ==========================================
+# 设置与通道控制
+# ==========================================
 class ModeSetting(BaseModel):
     mode: str
 
@@ -1496,6 +1696,9 @@ async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})
 
 
+# ==========================================
+# 按模型参数覆盖（per-model overrides）
+# ==========================================
 @app.get("/api/model-overrides")
 async def list_model_overrides(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=app_state.get_model_overrides())
@@ -1519,6 +1722,9 @@ async def delete_model_override(model_name: str, _auth: bool = Depends(require_a
     return JSONResponse(content={"status": "success" if ok else "not_found", "model": model_name})
 
 
+# ==========================================
+# Express API Key 列表（多账号，热编辑，支持未存先探自动保存）
+# ==========================================
 class ExpressKeysBody(BaseModel):
     keys: list = []
 
