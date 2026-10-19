@@ -69,13 +69,14 @@ DEFAULT_SETTINGS = {
     "default_top_p": None,
     "default_max_tokens": None,
     "sampling_policy": "auto",
-    # 预填充与注入（支持按模型单独保存）
+    # 预填充、注入与工具抗截断（支持按模型单独保存）
     "inject_system_instruction": "",
     "inject_prefill": "",
     "prefill_instruction": "",
     "prefill_mode": "smart",
     "prefill_suppress_thinking": True,
     "prefill_cot_guard": True,
+    "anti_truncation_mode": "off",
     # 输入图片压缩（全局）
     "img_compress_enabled": True,
     "img_compress_max_dim": 1536,
@@ -117,4 +118,5 @@ PER_MODEL_KEYS = [
     "prefill_cot_guard",
     "prefill_mode",
     "prefill_suppress_thinking",
+    "anti_truncation_mode",
 ]
