@@ -31,8 +31,6 @@ from message_processing import (
     _create_safety_ratings_html,
     apply_console_injection,
     apply_prefill_compat,
-    apply_unicode_input,
-    prepare_anti_truncation_request,
     strip_prefill_overlap,
     PrefillDeduper,
     FunctionCallStreamAssembler,
@@ -431,7 +429,7 @@ def _build_function_declarations(tools: Any) -> tuple[list[dict], bool]:
     return declarations, builtin_search
 
 
-def _build_tool_config(tool_choice: Any, function_names: list[str], stream_args: bool = False) -> Optional[dict]:
+def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[dict]:
     if tool_choice is None:
         mode, allowed = "AUTO", None
     elif isinstance(tool_choice, str):
@@ -450,27 +448,20 @@ def _build_tool_config(tool_choice: Any, function_names: list[str], stream_args:
     else:
         mode, allowed = "AUTO", None
 
-    config: Dict[str, Any] = {"mode": mode}
+    config = {"mode": mode}
     if allowed:
         config["allowedFunctionNames"] = allowed
-    if stream_args:
-        config["streamFunctionCallArguments"] = True
     return {"functionCallingConfig": config}
 
 
 def _native_tool_error(error_msg: str) -> bool:
     lower = (error_msg or "").lower()
-    tool_terms = (
-        "functiondeclaration", "function declaration", "functioncallingconfig",
-        "function calling", "toolconfig", "tool config", "variables.tools",
-        "streamfunctioncallarguments", "allowedfunctionnames",
-    )
-    reject_terms = (
-        "unsupported", "not supported", "unknown field", "unrecognized",
-        "invalid argument", "invalid value", "cannot use", "not enabled",
-        "error in $toolconfig", "error in $tools",
-    )
+    tool_terms = ("functiondeclaration", "function declaration", "functioncallingconfig",
+                  "function calling", "toolconfig", "tool config", "variables.tools")
+    reject_terms = ("unsupported", "not supported", "unknown field", "unrecognized",
+                    "invalid argument", "invalid value", "cannot use", "not enabled")
     return any(term in lower for term in tool_terms) and any(term in lower for term in reject_terms)
+
 
 def _native_tool_error_response(status_code: int, payload: str) -> bool:
     if status_code != 200:
@@ -724,10 +715,9 @@ async def build_batch_graphql_body_async(project_id: str, model_name: str,
                                          request: OpenAIRequest,
                                          prefill_active: bool = False,
                                          force_search: bool = False,
-                                         native_tools: bool = True,
-                                         stream_fc_args: bool = False) -> dict:
+                                         native_tools: bool = True) -> dict:
     return await asyncio.to_thread(_build_batch_graphql_body, project_id, model_name,
-                                   request, prefill_active, force_search, native_tools, stream_fc_args)
+                                   request, prefill_active, force_search, native_tools)
 
 
 def _build_batch_graphql_body(
@@ -737,7 +727,6 @@ def _build_batch_graphql_body(
     prefill_active: bool = False,
     force_search: bool = False,
     native_tools: bool = True,
-    stream_fc_args: bool = False,
 ) -> dict:
     contents, system_text = _convert_messages_to_contents(
         request.messages, model_name=model_name, native_tools=native_tools)
@@ -838,7 +827,7 @@ def _build_batch_graphql_body(
     if selected_declarations:
         variables["tools"] = [{"functionDeclarations": selected_declarations}]
         function_names = [item["name"] for item in selected_declarations]
-        variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names, stream_args=stream_fc_args)
+        variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names)
     elif use_google_search:
         variables["tools"] = [{"googleSearch": {}}]
 
@@ -1217,7 +1206,6 @@ async def _execute_stream_request_generator(
     sampler: "_RawSampler | None" = None,
     fallback_body: Any = None,
     fallback_state: Optional[dict] = None,
-    plain_fallback_body: Any = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
     async for status, data in _execute_stream_request_generator_once(client, headers, body, sampler):
         if status != "native_tool_unsupported":
@@ -1231,23 +1219,10 @@ async def _execute_stream_request_generator(
         resolved_fallback = fallback_body() if callable(fallback_body) else fallback_body
         if hasattr(resolved_fallback, "__await__"):
             resolved_fallback = await resolved_fallback
-        print("⚠️ [Studio 自适应回退] 当前模型或 batchGraphql 协议不支持当前工具参数形态，已自动降级重试。")
-        async for fb_status, fb_data in _execute_stream_request_generator_once(
+        print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
+        async for fallback_status, fallback_data in _execute_stream_request_generator_once(
                 client, headers, resolved_fallback, sampler):
-            if fb_status != "native_tool_unsupported":
-                yield fb_status, fb_data
-                continue
-            if plain_fallback_body is None:
-                yield "fatal_error", fb_data
-                return
-            resolved_plain = plain_fallback_body() if callable(plain_fallback_body) else plain_fallback_body
-            if hasattr(resolved_plain, "__await__"):
-                resolved_plain = await resolved_plain
-            print("⚠️ [Studio 自适应回退] batchGraphql 拒绝工具声明，已自动退回纯文本模式重试。")
-            async for plain_status, plain_data in _execute_stream_request_generator_once(
-                    client, headers, resolved_plain, sampler):
-                yield plain_status, plain_data
-            return
+            yield fallback_status, fallback_data
         return
 
 
@@ -1255,8 +1230,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                                  retry_max, backoff_sec, fastapi_request,
                                  prefill_active: bool = False,
                                  force_search: bool = False,
-                                 strip_thoughts: bool = False,
-                                 anti_trunc_tool_name: Optional[str] = None) -> dict:
+                                 strip_thoughts: bool = False) -> dict:
     """完整取回一次 batchGraphql 响应（供生图假流式与 Cookie 模式假流式共用）。"""
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
@@ -1304,7 +1278,6 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
             finish_raw, blocked_msg = None, None
             safety_html = ""
             sampler = _RawSampler()
-            fc_assembler = FunctionCallStreamAssembler(anti_trunc_tool_name=anti_trunc_tool_name)
 
             class _F:
                 def __init__(self, t):
@@ -1321,10 +1294,6 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                         reasoning_text += data
                     elif et == "image":
                         full_text += data
-                    elif et == "function_call":
-                        _, restored_txt = fc_assembler.feed_with_text(data)
-                        if restored_txt:
-                            full_text += restored_txt
                     elif et == "finish":
                         finish_raw = data
                     elif et == "safety":
@@ -1475,12 +1444,6 @@ class CookieProxyUpstream(BaseUpstream):
         prefill_text = ""
         prefill_active = False
         _inj_settings = app_state.get_effective_settings(base_model_name)
-        if bool(_inj_settings.get("unicode_input", False)) and not _profile["is_image"]:
-            _uc_msgs, _uc_cnt = apply_unicode_input(request_obj.messages, enabled=True)
-            if _uc_cnt > 0:
-                request_obj = request_obj.model_copy(update={"messages": _uc_msgs})
-                print(f"🔤 [Unicode 转码] 已对最后一条 user 消息完成紧凑转码（共 {_uc_cnt} 个字符）。")
-
         _injected, _inj_notes = apply_console_injection(
             request_obj.messages,
             system_text=_inj_settings.get("inject_system_instruction", ""),
@@ -1514,26 +1477,6 @@ class CookieProxyUpstream(BaseUpstream):
             if prefill_active and _inj_settings.get("prefill_suppress_thinking", True):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
-        # ===== 3.6 合成工具抗截断包装（保留 plain_request_obj 供 Cookie 协议不支持时无感回退） =====
-        plain_request_obj = request_obj
-        _anti_mode = str(_inj_settings.get("anti_truncation_mode", "off") or "off").lower()
-        anti_tool_name: Optional[str] = None
-        anti_stream_args: bool = False
-        if (
-            _anti_mode in ("streaming", "buffered")
-            and not _profile["is_image"]
-            and not force_builtin_search
-            and not model_display.endswith("-search")
-        ):
-            request_obj, anti_tool_name, anti_stream_args, anti_note = prepare_anti_truncation_request(
-                request_obj,
-                mode=_anti_mode,
-            )
-            if anti_note:
-                print(anti_note)
-            if anti_tool_name:
-                native_custom_tools = True
-
         # ===== 4. HTTP 客户端配置（read 600s，适配 gemini-4-argon 长思考）=====
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0),
@@ -1564,8 +1507,7 @@ class CookieProxyUpstream(BaseUpstream):
         fake_stream_enabled = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
 
         # ========== 生图流式 或 显式开启假流式（且无原生工具调用需求） ==========
-        has_real_client_tools = bool(_tool_info["custom_names"] or _tool_info["history"])
-        if is_stream and (is_image or (fake_stream_enabled and not has_real_client_tools)):
+        if is_stream and (is_image or (fake_stream_enabled and not native_custom_tools)):
             async def studio_fake_stream():
                 if await fastapi_request.is_disconnected():
                     return
@@ -1588,7 +1530,6 @@ class CookieProxyUpstream(BaseUpstream):
                         prefill_active=prefill_active,
                         force_search=force_builtin_search,
                         strip_thoughts=strip_thoughts,
-                        anti_trunc_tool_name=anti_tool_name,
                     )
                 )
 
@@ -1657,7 +1598,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                 yield _sse_heartbeat()
                 last_hb_ts = time.time()
-                native_fallback_state = {"latched": False, "no_stream_args": False}
+                native_fallback_state = {"latched": False}
 
                 for attempt in range(retry_max + 1):
                     if await fastapi_request.is_disconnected():
@@ -1665,43 +1606,22 @@ class CookieProxyUpstream(BaseUpstream):
                         return
 
                     use_native_tools = not native_fallback_state["latched"]
-                    use_stream_args = anti_stream_args and not native_fallback_state["no_stream_args"]
-                    active_req = request_obj if use_native_tools else plain_request_obj
-
-                    body = await build_batch_graphql_body_async(
-                        project_id, base_model_name, active_req, prefill_active=prefill_active,
-                        force_search=force_builtin_search,
-                        native_tools=use_native_tools,
-                        stream_fc_args=use_stream_args,
-                    )
-
+                    if use_native_tools:
+                        body = await build_batch_graphql_body_async(
+                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            force_search=force_builtin_search)
+                    else:
+                        body = await build_batch_graphql_body_async(
+                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
+                            force_search=force_builtin_search, native_tools=False)
                     fallback_body = None
-                    plain_fallback_body = None
                     if native_custom_tools and use_native_tools:
-                        if use_stream_args:
-                            async def fallback_body():
-                                native_fallback_state["no_stream_args"] = True
-                                return await build_batch_graphql_body_async(
-                                    project_id, base_model_name, request_obj,
-                                    prefill_active=prefill_active,
-                                    force_search=force_builtin_search,
-                                    native_tools=True, stream_fc_args=False)
-
-                            async def plain_fallback_body():
-                                native_fallback_state["latched"] = True
-                                return await build_batch_graphql_body_async(
-                                    project_id, base_model_name, plain_request_obj,
-                                    prefill_active=prefill_active,
-                                    force_search=force_builtin_search,
-                                    native_tools=False, stream_fc_args=False)
-                        else:
-                            async def fallback_body():
-                                native_fallback_state["latched"] = True
-                                return await build_batch_graphql_body_async(
-                                    project_id, base_model_name, plain_request_obj,
-                                    prefill_active=prefill_active,
-                                    force_search=force_builtin_search,
-                                    native_tools=False, stream_fc_args=False)
+                        async def fallback_body():
+                            native_fallback_state["latched"] = True
+                            return await build_batch_graphql_body_async(
+                                project_id, base_model_name, request_obj,
+                                prefill_active=prefill_active,
+                                force_search=force_builtin_search, native_tools=False)
                     req_headers = build_headers(_get_cookie_string()) or headers
                     if cookie_debug:
                         print(f"🔎 [Studio 调试] 出站 generationConfig: "
@@ -1723,12 +1643,11 @@ class CookieProxyUpstream(BaseUpstream):
                         blocked_msg = None
                         sampler = _RawSampler()
                         deduper = PrefillDeduper(prefill_text)
-                        fc_assembler = FunctionCallStreamAssembler(anti_trunc_tool_name=anti_tool_name)
+                        fc_assembler = FunctionCallStreamAssembler()
 
                         async for status, data in _execute_stream_request_generator(
                             client, req_headers, body, sampler=sampler,
                             fallback_body=fallback_body,
-                            plain_fallback_body=plain_fallback_body,
                         ):
                             if not has_yielded_to_client and await fastapi_request.is_disconnected():
                                 print("ℹ️ [Studio] 首包产出前客户端已断开，立即终止流式请求。")
@@ -1744,24 +1663,10 @@ class CookieProxyUpstream(BaseUpstream):
                                     continue
 
                             if status == "function_call":
-                                completed_calls, restored_txt = fc_assembler.feed_with_text(
+                                completed_calls = fc_assembler.feed(
                                     data,
                                     thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
                                 )
-                                if restored_txt:
-                                    if not has_yielded_to_client:
-                                        print(f"⚡ [Studio] {base_model_name} | 合成工具流式解包连接建立，正在实时输出...")
-                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                        has_yielded_to_client = True
-                                    if prefill_text and not prefill_emitted:
-                                        prefill_emitted = True
-                                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                                    got_text = True
-                                    out = deduper.feed(restored_txt)
-                                    if out:
-                                        stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                        stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
-                                        yield _make_openai_chunk(response_id, model_display, content=out)
                                 for c_item in completed_calls:
                                     if not has_yielded_to_client:
                                         print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
@@ -1963,14 +1868,14 @@ class CookieProxyUpstream(BaseUpstream):
                             force_search=force_builtin_search)
                     else:
                         body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, plain_request_obj, prefill_active=prefill_active,
+                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
                             force_search=force_builtin_search, native_tools=False)
                     fallback_body = None
                     if native_custom_tools and use_native_tools:
                         async def fallback_body():
                             native_fallback_state["latched"] = True
                             return await build_batch_graphql_body_async(
-                                project_id, base_model_name, plain_request_obj,
+                                project_id, base_model_name, request_obj,
                                 prefill_active=prefill_active,
                                 force_search=force_builtin_search, native_tools=False)
                     req_headers = build_headers(_get_cookie_string()) or headers
@@ -2061,7 +1966,7 @@ class CookieProxyUpstream(BaseUpstream):
                     finish_raw = None
                     blocked_msg = None
                     sampler = _RawSampler()
-                    fc_assembler = FunctionCallStreamAssembler(anti_trunc_tool_name=anti_tool_name)
+                    fc_assembler = FunctionCallStreamAssembler()
 
                     class _FakeResponse:
                         def __init__(self, text):
@@ -2086,15 +1991,10 @@ class CookieProxyUpstream(BaseUpstream):
                                 part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
                                 ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                             elif event_type == "function_call":
-                                completed_calls, restored_txt = fc_assembler.feed_with_text(
+                                for c_item in fc_assembler.feed(
                                     data,
                                     thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
-                                )
-                                if restored_txt:
-                                    full_text += restored_txt
-                                    part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                    ordinary_metadata.append(ordinary_part_metadata("text", restored_txt, None))
-                                for c_item in completed_calls:
+                                ):
                                     part_order.append({"type": "tool_call", "index": len(tool_calls)})
                                     tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
                             elif event_type == "thought_signature":
