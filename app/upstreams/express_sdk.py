@@ -19,6 +19,7 @@ from message_processing import (
     create_gemini_prompt,
     apply_prefill_compat,
     apply_console_injection,
+    apply_unicode_input,
     prepare_anti_truncation_request,
     DEFAULT_IMAGE_PREFILL_NUDGE,
 )
@@ -202,6 +203,12 @@ class ExpressSDKUpstream(BaseUpstream):
         profile = mc.get_profile(base_model_name)
         is_image_model = profile["is_image"]
 
+        if bool(_inj_settings.get("unicode_input", False)) and not is_image_model:
+            _uc_msgs, _uc_cnt = apply_unicode_input(request_obj.messages, enabled=True)
+            if _uc_cnt > 0:
+                request_obj = request_obj.model_copy(update={"messages": _uc_msgs})
+                print(f"🔤 [Unicode 转码] 已对最后一条 user 消息完成紧凑转码（共 {_uc_cnt} 个字符）。")
+
         prefill_text = ""
         prefill_active = False
         _injected, _inj_notes = apply_console_injection(
@@ -245,7 +252,6 @@ class ExpressSDKUpstream(BaseUpstream):
             request_obj, anti_tool_name, anti_stream_args, anti_note = prepare_anti_truncation_request(
                 request_obj,
                 mode=_anti_mode,
-                prefill_text=prefill_text,
             )
             if anti_note:
                 print(anti_note)
