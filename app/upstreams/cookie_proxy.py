@@ -31,6 +31,7 @@ from message_processing import (
     _create_safety_ratings_html,
     apply_console_injection,
     apply_prefill_compat,
+    apply_unicode_input,
     prepare_anti_truncation_request,
     strip_prefill_overlap,
     PrefillDeduper,
@@ -1254,7 +1255,8 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
                                  retry_max, backoff_sec, fastapi_request,
                                  prefill_active: bool = False,
                                  force_search: bool = False,
-                                 strip_thoughts: bool = False) -> dict:
+                                 strip_thoughts: bool = False,
+                                 anti_trunc_tool_name: Optional[str] = None) -> dict:
     """完整取回一次 batchGraphql 响应（供生图假流式与 Cookie 模式假流式共用）。"""
     for attempt in range(retry_max + 1):
         if await fastapi_request.is_disconnected():
@@ -1302,7 +1304,7 @@ async def _collect_full_response(project_id, base_model_name, request_obj, heade
             finish_raw, blocked_msg = None, None
             safety_html = ""
             sampler = _RawSampler()
-            fc_assembler = FunctionCallStreamAssembler()
+            fc_assembler = FunctionCallStreamAssembler(anti_trunc_tool_name=anti_trunc_tool_name)
 
             class _F:
                 def __init__(self, t):
@@ -1473,6 +1475,12 @@ class CookieProxyUpstream(BaseUpstream):
         prefill_text = ""
         prefill_active = False
         _inj_settings = app_state.get_effective_settings(base_model_name)
+        if bool(_inj_settings.get("unicode_input", False)) and not _profile["is_image"]:
+            _uc_msgs, _uc_cnt = apply_unicode_input(request_obj.messages, enabled=True)
+            if _uc_cnt > 0:
+                request_obj = request_obj.model_copy(update={"messages": _uc_msgs})
+                print(f"🔤 [Unicode 转码] 已对最后一条 user 消息完成紧凑转码（共 {_uc_cnt} 个字符）。")
+
         _injected, _inj_notes = apply_console_injection(
             request_obj.messages,
             system_text=_inj_settings.get("inject_system_instruction", ""),
@@ -1520,7 +1528,6 @@ class CookieProxyUpstream(BaseUpstream):
             request_obj, anti_tool_name, anti_stream_args, anti_note = prepare_anti_truncation_request(
                 request_obj,
                 mode=_anti_mode,
-                prefill_text=prefill_text,
             )
             if anti_note:
                 print(anti_note)
@@ -1581,6 +1588,7 @@ class CookieProxyUpstream(BaseUpstream):
                         prefill_active=prefill_active,
                         force_search=force_builtin_search,
                         strip_thoughts=strip_thoughts,
+                        anti_trunc_tool_name=anti_tool_name,
                     )
                 )
 
