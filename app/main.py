@@ -221,6 +221,9 @@ body{
 .inp:focus{border-color:#8b7cf6;background:#fff;box-shadow:0 0 0 3px rgba(139,124,246,.16)}
 .btn{background:linear-gradient(135deg,#8b7cf6 0%,#f48fb1 100%);color:#fff;border-radius:12px;font-weight:600;padding:11px;width:100%;transition:.2s;box-shadow:0 4px 12px rgba(139,124,246,.28)}
 .btn:hover{opacity:.94;transform:translateY(-1px)}
+.theme-seg{display:inline-flex;align-items:center;padding:2px;border-radius:999px;border:1px solid #e6dff2;background:rgba(255,255,255,.85);font-size:12px}
+.theme-seg span{padding:3px 9px;border-radius:999px;cursor:pointer;transition:.18s;color:#7d738e;user-select:none}
+.theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#f48fb1);color:#fff;font-weight:600;box-shadow:0 2px 6px rgba(139,124,246,.25)}
 html.dark body{
   background:radial-gradient(circle at 15% 20%, rgba(139,124,246,.12) 0%, transparent 45%),
              radial-gradient(circle at 85% 80%, rgba(95,211,188,.08) 0%, transparent 45%),
@@ -230,9 +233,15 @@ html.dark body{
 html.dark .card{background:rgba(30,27,41,.94);border-color:#2f2a40;box-shadow:0 12px 32px -10px rgba(0,0,0,.45)}
 html.dark .inp{background:#171421;border-color:#352f47;color:#e6e1f2}
 html.dark .inp:focus{background:#1c1828;border-color:#9d8df8;box-shadow:0 0 0 3px rgba(157,141,248,.2)}
+html.dark .theme-seg{background:#1e1b29;border-color:#352f47}
+html.dark .theme-seg span{color:#9a90b0}
+html.dark .theme-seg span.on{background:linear-gradient(135deg,#8b7cf6,#5fd3bc);color:#fff}
 </style>
 </head><body class="min-h-screen flex items-center justify-center px-4 relative">
-  <button onclick="toggleTheme()" id="theme-btn" class="absolute top-5 right-5 text-xs px-3 py-1.5 rounded-full border border-[#e6dff2] bg-white/80 cursor-pointer" style="color:inherit;background:transparent">🌙 夜间</button>
+  <div class="theme-seg absolute top-5 right-5" title="切换日间马卡龙 / 夜间护眼模式">
+    <span id="t-light" onclick="setTheme('light')">☀️ 日间</span>
+    <span id="t-dark" onclick="setTheme('dark')">🌙 夜间</span>
+  </div>
   <div class="w-full max-w-sm">
     <div class="flex items-center gap-3 mb-6 justify-center">
       <svg width="42" height="42" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="12" fill="url(#lg)"/>
@@ -251,17 +260,19 @@ html.dark .inp:focus{background:#1c1828;border-color:#9d8df8;box-shadow:0 0 0 3p
     </div>
   </div>
 <script>
-function syncThemeBtn(){
+function syncThemeSeg(){
   var isDark=document.documentElement.classList.contains('dark');
-  var b=document.getElementById('theme-btn');
-  if(b) b.textContent=isDark?'☀️ 日间':'🌙 夜间';
+  var l=document.getElementById('t-light'), d=document.getElementById('t-dark');
+  if(l) l.classList.toggle('on', !isDark);
+  if(d) d.classList.toggle('on', isDark);
 }
-function toggleTheme(){
-  var isDark=document.documentElement.classList.toggle('dark');
-  try{localStorage.setItem('ap_theme',isDark?'dark':'light');}catch(e){}
-  syncThemeBtn();
+function setTheme(mode){
+  var wantDark=(mode==='dark');
+  document.documentElement.classList.toggle('dark', wantDark);
+  try{localStorage.setItem('ap_theme',wantDark?'dark':'light');}catch(e){}
+  syncThemeSeg();
 }
-syncThemeBtn();
+syncThemeSeg();
 async function doLogin(e){
   e.preventDefault();
   var pw=document.getElementById('pw').value;
@@ -339,7 +350,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --coral-text:#ff9bab;
     --sky:#74b9ff;
   }
-  * { -webkit-font-smoothing:antialiased; }
+  * { -webkit-font-smoothing:antialiased; box-sizing:border-box; }
   body {
     background:
       radial-gradient(circle at 8% 12%, rgba(243,232,255,.65) 0%, transparent 40%),
@@ -349,6 +360,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     color:var(--fg);
     font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
     transition:background-color .25s ease, color .25s ease;
+    overflow-x:hidden;
   }
   html.dark body {
     background:
@@ -357,6 +369,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       radial-gradient(circle at 50% 90%, rgba(244,143,177,.06) 0%, transparent 45%),
       var(--bg);
   }
+  @keyframes fadeSlideUp {
+    from { opacity:0; transform:translateY(5px); }
+    to   { opacity:1; transform:translateY(0); }
+  }
+  .tab-pane { animation:fadeSlideUp .18s cubic-bezier(.16,1,.3,1); }
   .card {
     background:var(--card-bg);
     border:1px solid var(--border);
@@ -408,7 +425,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .pill {
     display:inline-flex; align-items:center; gap:6px; font-size:12px;
     padding:3.5px 11px; border-radius:999px; border:1px solid var(--border);
-    background:var(--inp-bg); color:var(--muted); transition:.15s;
+    background:var(--inp-bg); color:var(--muted); transition:.15s; white-space:nowrap;
   }
   .pill-accent {
     border-color:#e2d9fc;
@@ -425,6 +442,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .pill-apricot { border-color:#f9e2be; background:#fff8ee; color:var(--apricot-text); font-weight:600; }
   html.dark .pill-apricot { border-color:#4d3b24; background:rgba(248,194,122,.14); color:#fad096; }
 
+  /* 双态日夜胶囊切换器（方案 B） */
+  .theme-seg {
+    display:inline-flex; align-items:center; padding:2px; border-radius:999px;
+    border:1px solid var(--border); background:var(--inp-bg); font-size:12px;
+  }
+  .theme-seg span {
+    padding:2.5px 9px; border-radius:999px; cursor:pointer; transition:.18s;
+    color:var(--muted); user-select:none; white-space:nowrap;
+  }
+  .theme-seg span.on {
+    background:linear-gradient(135deg,#8b7cf6,#f48fb1); color:#fff; font-weight:600;
+    box-shadow:0 2px 6px rgba(139,124,246,.24);
+  }
+  html.dark .theme-seg span.on {
+    background:linear-gradient(135deg,#8b7cf6,#5fd3bc); color:#fff;
+  }
+
+  /* 通道选择卡片激活态高亮（提议 2） */
+  .chan-card {
+    border:1.5px solid var(--border); border-radius:14px; padding:14px 16px;
+    cursor:pointer; transition:all .2s ease; position:relative; opacity:.78;
+  }
+  .chan-card:hover { opacity:1; border-color:#d4c8f8; }
+  .chan-card.active {
+    opacity:1;
+    border-color:var(--accent);
+    background:linear-gradient(135deg,rgba(139,124,246,.07) 0%,rgba(95,211,188,.06) 100%);
+    box-shadow:0 4px 16px -4px rgba(139,124,246,.18);
+  }
+  html.dark .chan-card.active {
+    background:linear-gradient(135deg,rgba(139,124,246,.16) 0%,rgba(95,211,188,.10) 100%);
+    box-shadow:0 4px 18px -4px rgba(0,0,0,.5);
+  }
+
   .log { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px; word-break:break-all; }
   .log-item { cursor:pointer; transition:filter .12s ease; }
   .log-item:hover { filter:brightness(0.96); }
@@ -439,11 +490,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
     background:linear-gradient(135deg,#4a3f63,#635380); color:#fff;
     padding:10px 20px; border-radius:12px; font-size:14px; opacity:0;
-    transition:.25s; pointer-events:none; z-index:50;
+    transition:.25s; pointer-events:none; z-index:50; max-width:92vw; text-align:center;
     box-shadow:0 8px 24px rgba(74,63,99,.22);
   }
   .toast.show { opacity:1; }
-  .switch { position:relative; width:40px; height:22px; display:inline-block; }
+  .switch { position:relative; width:40px; height:22px; display:inline-block; flex-shrink:0; }
   .switch input{opacity:0;width:0;height:0}
   .slider{position:absolute;inset:0;background:#e6e0f0;border-radius:999px;transition:.2s;cursor:pointer}
   html.dark .slider{background:#342e46}
@@ -472,6 +523,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .helpbox {
     display:none; margin-top:7px; padding:10px 12px; border-radius:10px; background:#faf8fd;
     border:1px solid #ece5f7; font-size:12px; line-height:1.75; color:#5e5470;
+    animation:fadeSlideUp .16s ease-out;
   }
   html.dark .helpbox { background:#181523; border-color:#2f2942; color:#b5abc9; }
   .helpbox.show { display:block; }
@@ -481,19 +533,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .helpbox b { color:var(--fg); }
 
   html.dark .key-row { background:#181523 !important; border-color:#2f2942 !important; }
-  html.dark .opt-card:hover { background:#231e33 !important; }
   html.dark .divider-line { border-color:#2b263b !important; }
   html.dark #logwin { background:#121018 !important; }
   html.dark .log-header { background:#191624 !important; border-color:#2f2a40 !important; }
 </style>
 </head>
 <body class="min-h-screen">
-<div class="max-w-5xl mx-auto px-5 md:px-8 py-6">
+<div class="max-w-5xl mx-auto px-4 sm:px-6 md:px-8 py-5 sm:py-6">
 
   <!-- Header -->
-  <header class="hero px-5 py-4 mb-6 flex items-center justify-between flex-wrap gap-3">
-    <div class="flex items-center gap-3.5">
-      <svg width="42" height="42" viewBox="0 0 40 40" fill="none" aria-hidden="true">
+  <header class="hero px-4 sm:px-5 py-4 mb-6 flex items-center justify-between flex-wrap gap-3">
+    <div class="flex items-center gap-3">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true" class="flex-shrink-0">
         <rect width="40" height="40" rx="12" fill="url(#lg)"/>
         <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
         <path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
@@ -502,20 +553,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#8b7cf6"/><stop offset=".55" stop-color="#f48fb1"/><stop offset="1" stop-color="#5fd3bc"/></linearGradient></defs>
       </svg>
       <div>
-        <h1 class="text-xl font-bold tracking-tight leading-none">agentplatform<span style="color:var(--accent)">2api</span></h1>
-        <p class="text-xs text-[#7d738e] mt-1.5">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
+        <h1 class="text-lg sm:text-xl font-bold tracking-tight leading-none">agentplatform<span style="color:var(--accent)">2api</span></h1>
+        <p class="text-xs text-[#7d738e] mt-1">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
       </div>
     </div>
-    <div class="flex items-center gap-2 flex-wrap">
+    <div class="flex items-center gap-1.5 sm:gap-2 flex-wrap">
       <span class="pill pill-accent" id="mode-pill">通道 —</span>
       <span class="pill pill-mint"><span class="relative flex h-2 w-2"><span class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" style="background:#5fd3bc"></span><span class="relative inline-flex rounded-full h-2 w-2" style="background:#2eb89e"></span></span><span id="uptime">运行中</span></span>
-      <button onclick="toggleTheme()" id="theme-btn" class="pill hover:opacity-85" style="cursor:pointer" title="切换日间马卡龙 / 夜间护眼模式">🌙 夜间护眼</button>
+      <button onclick="copyEndpoint()" class="pill hover:opacity-85" style="cursor:pointer" title="点击复制 OpenAI 兼容接口地址（/v1）">🔗 复制 /v1</button>
+      <div class="theme-seg" title="切换日间马卡龙 / 夜间护眼模式">
+        <span id="t-light" onclick="setTheme('light')">☀️ 日间</span>
+        <span id="t-dark" onclick="setTheme('dark')">🌙 夜间</span>
+      </div>
       <button onclick="logout()" class="pill hover:opacity-85" style="cursor:pointer" title="退出登录">退出</button>
     </div>
   </header>
 
   <!-- Tabs -->
-  <nav class="flex gap-6 border-b border-[#ece5f5] divider-line mb-6 overflow-x-auto">
+  <nav class="flex gap-5 sm:gap-6 border-b border-[#ece5f5] divider-line mb-6 overflow-x-auto">
     <div class="tab active" data-tab="overview" onclick="switchTab('overview')">数据概览</div>
     <div class="tab" data-tab="channel" onclick="switchTab('channel')">通道与凭证</div>
     <div class="tab" data-tab="params" onclick="switchTab('params')">模型参数</div>
@@ -523,8 +578,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </nav>
 
   <!-- Overview -->
-  <section id="view-overview">
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-3.5 mb-4">
+  <section id="view-overview" class="tab-pane">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-3.5 mb-4">
       <div class="card stat-total p-4"><div class="lbl">总请求</div><div id="s-total" class="val text-2xl font-bold mt-1" style="color:var(--accent)">0</div></div>
       <div class="card stat-ok p-4"><div class="lbl">成功响应</div><div id="s-success" class="val text-2xl font-bold mt-1" style="color:var(--mint-text)">0</div></div>
       <div class="card stat-retry p-4"><div class="lbl">拥堵重试</div><div id="s-retries" class="val text-2xl font-bold mt-1" style="color:var(--apricot-text)">0</div></div>
@@ -532,11 +587,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="grid grid-cols-1 md:grid-cols-3 gap-3.5">
       <div class="card p-5 flex flex-col items-center justify-between">
-        <div class="flex items-center justify-between w-full mb-2">
+        <div class="flex items-center justify-between w-full mb-1">
           <span class="lbl">服务健康度</span>
-          <span id="health-rate" class="pill pill-mint" style="font-size:11px;padding:2px 8px">100% 正常</span>
+          <span id="health-rate" class="pill pill-mint" style="font-size:11px;padding:2px 8px">待命</span>
         </div>
-        <div class="w-36 h-36 my-1"><canvas id="donut"></canvas></div>
+        <div class="relative flex items-center justify-center my-1" style="width:144px;height:144px">
+          <canvas id="donut"></canvas>
+          <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none">
+            <span id="donut-pct" class="val font-bold text-xl leading-none" style="color:var(--fg)">100%</span>
+            <span id="donut-sub" class="text-[11px] text-[#7d738e] mt-1">待命</span>
+          </div>
+        </div>
         <div class="flex items-center justify-center gap-4 text-xs text-[#6e6480] mt-2 w-full">
           <span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-full" style="background:#5fd3bc"></span>成功</span>
           <span class="flex items-center gap-1.5"><span class="inline-block w-2.5 h-2.5 rounded-full" style="background:#f8c27a"></span>重试</span>
@@ -548,11 +609,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="space-y-4">
           <div>
             <div class="flex justify-between text-sm mb-1.5"><span class="lbl" style="font-size:13px">Prompt（输入）</span><span id="t-prompt" class="val font-semibold" style="color:var(--accent)">0</span></div>
-            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden" style="background:rgba(139,124,246,.12)"><div id="bar-prompt" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#8b7cf6,#74b9ff)"></div></div>
+            <div class="w-full rounded-full h-2 overflow-hidden" style="background:rgba(139,124,246,.12)"><div id="bar-prompt" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#8b7cf6,#74b9ff)"></div></div>
           </div>
           <div>
             <div class="flex justify-between text-sm mb-1.5"><span class="lbl" style="font-size:13px">Completion（思考与输出）</span><span id="t-comp" class="val font-semibold" style="color:var(--mint-text)">0</span></div>
-            <div class="w-full bg-[#f3effa] rounded-full h-2 overflow-hidden" style="background:rgba(139,124,246,.12)"><div id="bar-comp" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#5fd3bc,#f48fb1)"></div></div>
+            <div class="w-full rounded-full h-2 overflow-hidden" style="background:rgba(139,124,246,.12)"><div id="bar-comp" class="h-2 rounded-full transition-all duration-300" style="width:0%;background:linear-gradient(90deg,#5fd3bc,#f48fb1)"></div></div>
           </div>
           <div class="pt-4 border-t border-[#f0eaf8] divider-line flex justify-between items-center"><span class="lbl">累计总消耗</span><span id="t-total" class="val text-xl font-bold" style="color:var(--accent)">0</span></div>
         </div>
@@ -561,42 +622,52 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </section>
 
   <!-- Channel -->
-  <section id="view-channel" class="hidden">
+  <section id="view-channel" class="tab-pane hidden">
     <div class="card p-5 mb-4">
-      <div class="lbl mb-3">上游调用通道</div>
+      <div class="lbl mb-3">上游调用通道（点击卡片直接切换）</div>
       <div class="flex flex-col sm:flex-row gap-3">
-        <label class="flex-1 border border-[#e6dff2] divider-line opt-card rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-api">
+        <label class="flex-1 chan-card flex items-start gap-3" id="opt-api">
           <input type="radio" name="mode" value="api_key" class="mt-1 accent-[#8b7cf6]" onchange="updateMode('api_key')">
-          <div><div class="font-semibold text-sm">Express API Key（标准模式）</div><div class="text-xs text-[#7d738e] mt-0.5">使用官方 google-genai SDK + 多账号 Express Key 轮询调用</div></div>
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+              <span class="font-semibold text-sm">Express API Key（标准模式）</span>
+              <span id="badge-api" class="pill pill-mint hidden" style="font-size:11px;padding:1px 8px">当前使用中</span>
+            </div>
+            <div class="text-xs text-[#7d738e] mt-1">使用官方 google-genai SDK + 多账号 Express Key 轮询调用</div>
+          </div>
         </label>
-        <label class="flex-1 border border-[#e6dff2] divider-line opt-card rounded-xl p-3.5 cursor-pointer flex items-start gap-3 hover:bg-[#faf8ff] transition" id="opt-web">
+        <label class="flex-1 chan-card flex items-start gap-3" id="opt-web">
           <input type="radio" name="mode" value="web_proxy" class="mt-1 accent-[#8b7cf6]" onchange="updateMode('web_proxy')">
-          <div><div class="font-semibold text-sm">Cookie 直连反代（Studio 模式）</div><div class="text-xs text-[#7d738e] mt-0.5">使用控制台 Cookie + SAPISIDHASH 直连 batchGraphql</div></div>
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+              <span class="font-semibold text-sm">Cookie 直连反代（Studio 模式）</span>
+              <span id="badge-web" class="pill pill-mint hidden" style="font-size:11px;padding:1px 8px">当前使用中</span>
+            </div>
+            <div class="text-xs text-[#7d738e] mt-1">使用控制台 Cookie + SAPISIDHASH 直连 batchGraphql</div>
+          </div>
         </label>
       </div>
     </div>
 
-    <!-- Express API Key 列表（多账号，热编辑，即添即探） -->
+    <!-- Express API Key 列表（多账号，增删改自动热保存） -->
     <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
         <div>
           <div class="text-sm font-semibold">Express API Key 列表<span class="helpq" onclick="hlp(this,'h_keys')">?</span></div>
-          <div class="text-xs text-[#7d738e] mt-0.5">支持添加多个谷歌账号的 Key；添加后直接点「探测」会自动保存并探测归属项目</div>
+          <div class="text-xs text-[#7d738e] mt-0.5">支持多个谷歌账号 Key；添加、修改、启用/禁用或删除后均自动保存并热生效</div>
         </div>
         <div class="flex items-center gap-2 flex-wrap">
           <span id="keys-count" class="pill pill-accent" style="text-transform:none">0 个</span>
           <button class="btn-soft px-3 py-1.5 text-sm" onclick="probeAllKeys()">🔎 探测全部项目</button>
-          <button class="btn-soft px-3 py-1.5 text-sm" onclick="addKeyRow()">＋ 添加 Key</button>
-          <button class="btn px-4 py-1.5 text-sm" onclick="saveExpressKeys()">保存 Key 列表</button>
+          <button class="btn px-3.5 py-1.5 text-sm" onclick="addKeyRow()">＋ 添加 Key</button>
         </div>
       </div>
       <div id="h_keys" class="helpbox">
-        <b>即添即探 &amp; 热生效</b>：点击「＋ 添加 Key」填入新 Key 后，无论直接点单行的「探测」、「🔎 探测全部项目」还是「保存 Key 列表」，都会<b>自动将新 Key 保存并立即热生效</b>，不会丢失已填内容，也无需重启服务。<br>
-        <b>Project ID 绑定</b>：每个 Key 对应各自谷歌账号的 GCP 项目，标准模式钉定 location 时优先使用该 Key 自己的 Project ID。<br>
-        <b>环境变量</b>：<code>VERTEX_EXPRESS_API_KEY</code> 仅在首次启动时做一次性导入；清空列表并保存后，重启不会复种。
+        <b>自动保存 &amp; 即添即探</b>：点「＋ 添加 Key」粘贴新 Key 后，移开输入框（或按回车）即<b>自动保存并后台探测归属 Project ID</b>；勾选启用/禁用、修改 Project ID 或点「删除」也会立即自动落盘生效，无需手动点保存。<br>
+        <b>Project ID 绑定</b>：每个 Key 对应各自谷歌账号的 GCP 项目，标准模式钉定 location 时优先使用该 Key 自己的 Project ID。
       </div>
       <div id="keys-list" class="space-y-2.5"></div>
-      <p id="keys-empty" class="text-xs text-[#7d738e] mt-2 hidden">当前没有任何 Express Key。点「＋ 添加 Key」粘贴一个，直接点「探测」或「保存 Key 列表」即可。</p>
+      <p id="keys-empty" class="text-xs text-[#7d738e] mt-2 hidden">当前没有任何 Express Key。点右上角「＋ 添加 Key」粘贴即可自动保存。</p>
     </div>
 
     <div id="cookie-box" class="card p-5 hidden">
@@ -604,7 +675,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <textarea id="cookie-input" rows="3" class="inp log mb-3" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Cookie-Editor 导出的 JSON / Header String，自动解析）"></textarea>
       <div class="lbl mb-2">Google Cloud Project ID</div>
       <input id="project-input" class="inp mb-3" placeholder="可直接粘贴含 ?project=xxx 的整条 URL，自动提取">
-      <div class="flex items-center justify-between">
+      <div class="flex items-center justify-between flex-wrap gap-2">
         <span class="text-xs text-[#7d738e]">保存后自动校验是否包含 SAPISID</span>
         <button class="btn px-4 py-2 text-sm" onclick="saveCookie()">保存并激活</button>
       </div>
@@ -613,12 +684,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </section>
 
   <!-- Params -->
-  <section id="view-params" class="hidden">
+  <section id="view-params" class="tab-pane hidden">
     <div class="card p-5 mb-4">
       <div class="flex items-center justify-between flex-wrap gap-3">
-        <div>
+        <div class="w-full sm:w-auto">
           <div class="lbl mb-1">选择编辑作用域（全局默认 / 指定模型专属） <span id="ov-badge" class="pill pill-accent hidden" style="text-transform:none">★ 已有专属参数</span></div>
-          <select id="model-sel" class="inp" style="min-width:260px" onchange="renderCaps()"></select>
+          <select id="model-sel" class="inp w-full sm:w-auto" style="min-width:240px;max-width:100%" onchange="renderCaps()"></select>
         </div>
         <div id="caps-summary" class="text-xs flex flex-wrap gap-2 max-w-xl"></div>
       </div>
@@ -633,7 +704,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="flex items-center gap-2 mb-2.5 mt-5">
+    <div class="flex items-center gap-2 mb-2.5 mt-5 flex-wrap">
       <span class="pill pill-accent" style="text-transform:none">① 按模型参数（跟随上方下拉框）</span>
       <span class="text-xs text-[#7d738e]">本区所有设置均支持按模型单独保存，使用上方按钮写入。</span>
     </div>
@@ -673,11 +744,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="space-y-3 mt-3 pt-3 border-t border-[#f0eaf8] divider-line">
           <div class="text-xs text-[#9a90ab]">以下两项可针对生图模型单独开启保存</div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">生图下发 system 指令<span class="helpq" onclick="hlp(this,'h_isi')">?</span></span><label class="switch"><input type="checkbox" id="image_system_instruction"><span class="slider"></span></label></div>
             <div id="h_isi" class="helpbox">开启后，system 提示词中的画风、构图要求会随生图请求一并下发给生图模型。</div>
           </div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">生图也注入预填充<span class="helpq" onclick="hlp(this,'h_ipf')">?</span></span><label class="switch"><input type="checkbox" id="inject_prefill_for_image"><span class="slider"></span></label></div>
             <div id="h_ipf" class="helpbox">默认关，避免角色扮演的思考标签误注入给生图模型。若想用预填充强力引导画风，可对生图模型单独打开并配专属预填充。</div>
           </div>
         </div>
@@ -716,11 +787,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
           </div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">预填充时压制原生思考<span class="helpq" onclick="hlp(this,'h_pst')">?</span></span><label class="switch"><input type="checkbox" id="prefill_suppress_thinking"><span class="slider"></span></label></div>
             <div id="h_pst" class="helpbox">检测到请求末尾带预填充时，自动将模型的原生思考压到最低并不回传，让预设自带的思维链接管。</div>
           </div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">思维链守卫（防跳过思考）<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">思维链守卫（防跳过思考）<span class="helpq" onclick="hlp(this,'h_cotg')">?</span></span><label class="switch"><input type="checkbox" id="prefill_cot_guard"><span class="slider"></span></label></div>
             <div id="h_cotg" class="helpbox">自动识别预填充中未闭合的思维链开标签（如 <code>&lt;thinking&gt;</code>、<code>&lt;cot&gt;</code>），前置注入格式硬性要求并在输出侧去重双开标签，防止模型跳过思考直接写正文。</div>
           </div>
           <div class="pt-2 border-t border-[#f0eaf8] divider-line">
@@ -743,7 +814,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- ② 全局设置 -->
-    <div class="flex items-center gap-2 mb-2.5 mt-7">
+    <div class="flex items-center gap-2 mb-2.5 mt-7 flex-wrap">
       <span class="pill pill-apricot" style="text-transform:none">② 全局基础设施设置</span>
       <span class="text-xs text-[#7d738e]">对所有模型统一生效；修改后点击页面底部「保存全局设置」，不会影响上方 ① 区的任何参数。</span>
     </div>
@@ -825,45 +896,45 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">流式、弱网续传 &amp; 调试开关</div>
         <div class="space-y-3">
-          <div class="flex items-center justify-between"><span class="text-sm">假流式（fake streaming）<span class="helpq" onclick="hlp(this,'h_fks')">?</span></span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between gap-2"><span class="text-sm">假流式（fake streaming）<span class="helpq" onclick="hlp(this,'h_fks')">?</span></span><label class="switch"><input type="checkbox" id="fake_streaming"><span class="slider"></span></label></div>
           <div id="h_fks" class="helpbox">开启后在等待长思考模型（如 gemini-4-argon）完整生成期间，按下方间隔持续向客户端发送保活数据帧，防止前端超时断连。两条通道均生效。</div>
-          <div class="flex items-center justify-between"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between gap-2"><span class="text-sm">假流式心跳间隔(秒)</span><input id="fake_streaming_interval" type="number" step="0.5" class="inp" style="width:90px"></div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">弱网续传（服务端缓冲）<span class="helpq" onclick="hlp(this,'h_rsm')">?</span></span><label class="switch"><input type="checkbox" id="resumable_enabled"><span class="slider"></span></label></div>
             <div id="h_rsm" class="helpbox">反代将上游回复放入带序号缓冲区，前端断网重连可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 续传；首包产出前若前端主动取消，会自动停止重试。</div>
           </div>
-          <div class="flex items-center justify-between"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
-          <div class="flex items-center justify-between"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
-          <div class="flex items-center justify-between"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
+          <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
+          <div class="flex items-center justify-between gap-2"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
             <div id="h_ss" class="helpbox">在回复末尾附加可折叠的安全分类评分块。</div>
           </div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
             <div id="h_dbg" class="helpbox">在运行日志里打印实际发出的思考档位与采样参数。</div>
           </div>
           <div>
-            <div class="flex items-center justify-between"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
             <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。</div>
           </div>
         </div>
       </div>
     </div>
 
-    <div class="flex items-center justify-end gap-3 mt-4">
+    <div class="flex items-center justify-end gap-3 mt-4 flex-wrap">
       <span class="text-xs text-[#7d738e]">仅保存「② 全局基础设施设置」；① 区请用顶部按钮保存</span>
       <button class="btn px-5 py-2.5 text-sm" onclick="saveSettings()">保存全局设置</button>
     </div>
   </section>
 
   <!-- Logs -->
-  <section id="view-logs" class="hidden">
+  <section id="view-logs" class="tab-pane hidden">
     <div class="card overflow-hidden">
-      <div class="px-4 py-2.5 border-b border-[#ece5f5] log-header flex items-center justify-between bg-[#faf8ff]">
+      <div class="px-4 py-2.5 border-b border-[#ece5f5] log-header flex items-center justify-between bg-[#faf8ff] flex-wrap gap-2">
         <div class="flex items-center gap-2">
           <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full" style="background:#f68697"></div><div class="w-3 h-3 rounded-full" style="background:#f8c27a"></div><div class="w-3 h-3 rounded-full" style="background:#5fd3bc"></div></div>
-          <span class="ml-2 text-xs text-[#8a7fa0] log">terminal · 实时监控（点击单条日志即可复制该条）</span>
+          <span class="ml-2 text-xs text-[#8a7fa0] log">terminal · 实时监控（点击单条日志可复制）</span>
         </div>
         <button class="btn-soft px-2.5 py-1 text-xs" onclick="clearLogs()">清空</button>
       </div>
@@ -890,27 +961,50 @@ function toast(m){ var t=$('toast'); t.textContent=m; t.classList.add('show'); s
 function fmt(n){ return (n||0).toLocaleString('en-US'); }
 async function logout(){ try{ await fetch('/api/logout',{method:'POST'}); }catch(e){} location.href='/'; }
 
-/* ---------- 夜间护眼模式切换 ---------- */
-function isDarkMode(){ return document.documentElement.classList.contains('dark'); }
-function syncThemeBtn(){
-  var b=$('theme-btn');
-  if(b) b.textContent = isDarkMode() ? '☀️ 日间马卡龙' : '🌙 夜间护眼';
+async function copyEndpoint(){
+  var url = window.location.origin + '/v1';
+  try{
+    await navigator.clipboard.writeText(url);
+    toast('🔗 已复制接口地址：' + url);
+  }catch(e){ toast('接口地址：' + url); }
 }
-function toggleTheme(){
-  var dark = document.documentElement.classList.toggle('dark');
-  try{ localStorage.setItem('ap_theme', dark ? 'dark' : 'light'); }catch(e){}
-  syncThemeBtn();
+
+/* ---------- 夜间护眼双态胶囊切换（方案 B） ---------- */
+function isDarkMode(){ return document.documentElement.classList.contains('dark'); }
+function syncThemeSeg(){
+  var dark = isDarkMode();
+  var l=$('t-light'), d=$('t-dark');
+  if(l) l.classList.toggle('on', !dark);
+  if(d) d.classList.toggle('on', dark);
+}
+function setTheme(mode){
+  var wantDark = (mode==='dark');
+  document.documentElement.classList.toggle('dark', wantDark);
+  try{ localStorage.setItem('ap_theme', wantDark ? 'dark' : 'light'); }catch(e){}
+  syncThemeSeg();
   renderChart(lastStats.s, lastStats.e, lastStats.r);
   rerenderAllLogs();
 }
-syncThemeBtn();
+syncThemeSeg();
+
+function scrollLogsToBottom(){
+  var lw=$('logwin');
+  if(!lw) return;
+  requestAnimationFrame(function(){
+    lw.scrollTop = lw.scrollHeight;
+  });
+}
 
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(function(e){ e.classList.toggle('active', e.dataset.tab===t); });
   ['overview','channel','params','logs'].forEach(function(v){ $('view-'+v).classList.toggle('hidden', v!==t); });
+  if(t==='logs'){
+    autoscroll = true;
+    scrollLogsToBottom();
+  }
 }
 
-/* ---------- Overview (Macaron Donut & Dynamic Token Bars) ---------- */
+/* ---------- Overview (Macaron Donut + Center Percentage & Dynamic Token Bars) ---------- */
 function renderChart(s,e,r){
   lastStats = {s:s, e:e, r:r};
   var ctx=$('donut').getContext('2d');
@@ -924,15 +1018,24 @@ function renderChart(s,e,r){
 
   var totalDone = s + e;
   var rateEl = $('health-rate');
-  if(rateEl){
-    if(totalDone === 0){
-      rateEl.textContent = '待命';
-      rateEl.className = 'pill pill-accent';
-    } else {
-      var pct = ((s / totalDone) * 100).toFixed(1).replace(/\.0$/, '');
-      rateEl.textContent = '成功率 ' + pct + '%';
-      rateEl.className = pct >= 90 ? 'pill pill-mint' : 'pill pill-apricot';
+  var pctEl  = $('donut-pct');
+  var subEl  = $('donut-sub');
+  if(totalDone === 0){
+    if(rateEl){ rateEl.textContent = '待命'; rateEl.className = 'pill pill-accent'; }
+    if(pctEl){ pctEl.textContent = '100%'; pctEl.style.color = 'var(--fg)'; }
+    if(subEl){ subEl.textContent = '待命'; }
+  } else {
+    var pctNum = (s / totalDone) * 100;
+    var pct = pctNum.toFixed(1).replace(/\.0$/, '');
+    if(rateEl){
+      rateEl.textContent = (pctNum >= 90 ? '健康 ' : '波动 ') + pct + '%';
+      rateEl.className = pctNum >= 90 ? 'pill pill-mint' : 'pill pill-apricot';
     }
+    if(pctEl){
+      pctEl.textContent = pct + '%';
+      pctEl.style.color = pctNum >= 90 ? 'var(--mint-text)' : 'var(--apricot-text)';
+    }
+    if(subEl){ subEl.textContent = '成功率'; }
   }
 
   if(chart){
@@ -956,7 +1059,7 @@ function renderChart(s,e,r){
       }]
     },
     options: {
-      cutout: '72%',
+      cutout: '74%',
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -989,11 +1092,20 @@ async function fetchStats(){
   }catch(e){}
 }
 
-/* ---------- Channel ---------- */
+/* ---------- Channel（激活卡片高亮边框 + 徽章） ---------- */
+function applyChannelHighlight(m){
+  var isWeb = (m==='web_proxy');
+  $('opt-api').classList.toggle('active', !isWeb);
+  $('opt-web').classList.toggle('active', isWeb);
+  $('badge-api').classList.toggle('hidden', isWeb);
+  $('badge-web').classList.toggle('hidden', !isWeb);
+  $('cookie-box').classList.toggle('hidden', !isWeb);
+  $('mode-pill').textContent = isWeb ? '通道 Cookie 直连' : '通道 Express API';
+}
 async function updateMode(m){
-  $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
-  $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
+  applyChannelHighlight(m);
   await fetch('/api/settings/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+  toast(m==='web_proxy' ? '已切换至 Cookie 直连反代通道' : '已切换至 Express API Key 标准通道');
 }
 function parseCookies(str){
   str=(str||'').trim();
@@ -1021,8 +1133,7 @@ async function loadRuntime(){
     var m=s.use_web_proxy?'web_proxy':'api_key';
     var radio=document.querySelector('input[name=mode][value=' + m + ']');
     if(radio) radio.checked=true;
-    $('mode-pill').textContent = m==='web_proxy' ? '通道 Cookie 直连' : '通道 Express API';
-    $('cookie-box').classList.toggle('hidden', m!=='web_proxy');
+    applyChannelHighlight(m);
     var ci=$('cookie-input');
     if(ci){
       ci.value='';
@@ -1034,7 +1145,7 @@ async function loadRuntime(){
   }catch(e){}
 }
 
-/* ---------- Express Key 列表（多账号，热编辑，即添即探） ---------- */
+/* ---------- Express Key 列表（增/删/改全自动保存 + 手机/电脑响应式） ---------- */
 var KEYS = [];
 function keySrcPill(rec){
   if(rec.project_source==='auto') return '<span class="pill pill-mint" style="text-transform:none">来源 auto</span>';
@@ -1050,18 +1161,22 @@ function renderKeys(){
     var detStr = rec.detected_at ? ('探测于 ' + new Date(rec.detected_at*1000).toLocaleString()) : '';
     var msgCls = (rec._msg_ok===false) ? 'text-[#d64860]' : 'text-[#239480]';
     return '<div class="key-row border border-[#ebe4f7] bg-[#fcfbff] rounded-xl p-3.5" data-i="' + i + '">'
-      + '<div class="flex items-center gap-2 mb-2">'
-      + '<span class="pill pill-accent" style="text-transform:none">#' + (i+1) + '</span>'
-      + '<input class="inp log k-key" style="flex:1" placeholder="粘贴 Express API Key（明文显示）" value="' + kVal + '">'
-      + '<label class="flex items-center gap-1 text-xs text-[#6e6480] whitespace-nowrap"><input type="checkbox" class="k-enabled accent-[#8b7cf6]" ' + chk + '>启用</label>'
-      + '<button class="btn-soft px-2.5 py-1 text-xs" onclick="probeOneKey(' + i + ')">探测</button>'
-      + '<button class="px-2.5 py-1 text-xs rounded-lg border border-[#fbd2da] text-[#d64860] hover:opacity-85" onclick="removeKeyRow(' + i + ')">删除</button>'
+      + '<div class="flex flex-col sm:flex-row sm:items-center gap-2 mb-2.5">'
+      +   '<div class="flex items-center gap-2 flex-1 min-w-0">'
+      +     '<span class="pill pill-accent" style="text-transform:none">#' + (i+1) + '</span>'
+      +     '<input class="inp log k-key" style="flex:1;min-width:0" placeholder="粘贴 Express API Key（移开自动保存）" value="' + kVal + '" onchange="onKeyFieldChange(' + i + ')" onkeydown="if(event.key===\'Enter\'){this.blur();}">'
+      +   '</div>'
+      +   '<div class="flex items-center justify-end gap-2 flex-shrink-0">'
+      +     '<label class="flex items-center gap-1 text-xs text-[#6e6480] whitespace-nowrap cursor-pointer"><input type="checkbox" class="k-enabled accent-[#8b7cf6]" ' + chk + ' onchange="onKeyFieldChange(' + i + ')">启用</label>'
+      +     '<button class="btn-soft px-2.5 py-1 text-xs" onclick="probeOneKey(' + i + ')">探测</button>'
+      +     '<button class="px-2.5 py-1 text-xs rounded-lg border border-[#fbd2da] text-[#d64860] hover:opacity-85" onclick="removeKeyRow(' + i + ')">删除</button>'
+      +   '</div>'
       + '</div>'
       + '<div class="flex items-center gap-2 flex-wrap">'
-      + '<span class="lbl whitespace-nowrap">Project ID</span>'
-      + '<input class="inp log k-project" style="flex:1;min-width:160px" placeholder="留空 = 点击「探测」自动获取" value="' + pVal + '">'
-      + keySrcPill(rec)
-      + '<span class="text-xs text-[#9a90ab]">' + detStr + '</span>'
+      +   '<span class="lbl whitespace-nowrap">Project ID</span>'
+      +   '<input class="inp log k-project" style="flex:1;min-width:150px" placeholder="留空 = 自动探测获取" value="' + pVal + '" onchange="onKeyFieldChange(' + i + ')" onkeydown="if(event.key===\'Enter\'){this.blur();}">'
+      +   keySrcPill(rec)
+      +   '<span class="text-xs text-[#9a90ab]">' + detStr + '</span>'
       + '</div>'
       + '<div class="text-xs mt-1 ' + msgCls + '">' + (rec._msg||'') + '</div>'
       + '</div>';
@@ -1083,24 +1198,65 @@ function collectKeys(){
   syncKeysFromDom();
   return KEYS.filter(function(r){return r.key;});
 }
-function addKeyRow(){ syncKeysFromDom(); KEYS.push({key:'',project_id:'',project_source:'',enabled:true}); renderKeys(); }
-function removeKeyRow(i){ syncKeysFromDom(); KEYS.splice(i,1); renderKeys(); }
+async function autoSaveExpressKeys(customMsg){
+  syncKeysFromDom();
+  var emptyRows = KEYS.filter(function(r){return !r.key;});
+  var payload = KEYS.filter(function(r){return r.key;});
+  try{
+    var r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
+    var d=await r.json();
+    if(r.ok){
+      KEYS=(d.keys||[]).map(function(x){return Object.assign({},x);}).concat(emptyRows);
+      renderKeys();
+      toast(customMsg || ('✅ 已自动保存（共 ' + payload.length + ' 个有效 Key）'));
+      // 若有尚无 Project ID 的 Key，2秒后自动拉取一次后台探测结果刷新界面
+      if(payload.some(function(k){return !k.project_id;})){
+        setTimeout(refreshKeysQuietly, 2200);
+      }
+    } else {
+      toast('❌ '+(d.error||'自动保存失败'));
+    }
+  }catch(e){ toast('❌ 网络请求失败'); }
+}
+async function refreshKeysQuietly(){
+  try{
+    syncKeysFromDom();
+    var emptyRows = KEYS.filter(function(r){return !r.key;});
+    var d=await (await fetch('/api/express-keys')).json();
+    KEYS=(d.keys||[]).map(function(r){return Object.assign({},r);}).concat(emptyRows);
+    renderKeys();
+  }catch(e){}
+}
+async function onKeyFieldChange(i){
+  syncKeysFromDom();
+  var rec = KEYS[i];
+  if(!rec || !rec.key) return;
+  await autoSaveExpressKeys();
+}
+function addKeyRow(){
+  syncKeysFromDom();
+  KEYS.push({key:'',project_id:'',project_source:'',enabled:true});
+  renderKeys();
+  var inputs = document.querySelectorAll('#keys-list .k-key');
+  if(inputs.length > 0) inputs[inputs.length - 1].focus();
+}
+async function removeKeyRow(i){
+  syncKeysFromDom();
+  var target = KEYS[i];
+  var hadKey = !!(target && target.key);
+  KEYS.splice(i,1);
+  if(!hadKey){
+    renderKeys();
+    return;
+  }
+  await autoSaveExpressKeys('🗑️ 已删除 Key 并自动保存');
+}
 async function loadExpressKeys(){
   try{
     var d=await (await fetch('/api/express-keys')).json();
     KEYS=(d.keys||[]).map(function(r){return Object.assign({},r);});
     renderKeys();
   }catch(e){}
-}
-async function saveExpressKeys(){
-  var payload=collectKeys();
-  if(payload.length===0 && !confirm('将保存为“空 Key 列表”。\n保存后即使环境变量 VERTEX_EXPRESS_API_KEY 有值，重启也不会再导入。\n确定吗？')) { renderKeys(); return; }
-  try{
-    var r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
-    var d=await r.json();
-    if(r.ok){ KEYS=(d.keys||[]).map(function(x){return Object.assign({},x);}); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
-    else toast('❌ '+(d.error||'保存失败'));
-  }catch(e){ toast('❌ 网络请求失败'); }
 }
 async function probeOneKey(i){
   syncKeysFromDom();
@@ -1357,10 +1513,13 @@ async function saveSettings(){
   }catch(e){ toast('❌ 网络请求失败'); }
 }
 
-/* ---------- Logs (日间/夜间自适应 + 点击单条复制) ---------- */
+/* ---------- Logs (默认置底 + 点击单条复制) ---------- */
 var logwin=$('logwin'); var autoscroll=true;
 var LOG_RAW_LINES = [];
-logwin.addEventListener('scroll',function(){ autoscroll = logwin.scrollHeight-logwin.scrollTop-logwin.clientHeight<50; });
+logwin.addEventListener('scroll',function(){
+  if($('view-logs').classList.contains('hidden')) return;
+  autoscroll = (logwin.scrollHeight - logwin.scrollTop - logwin.clientHeight) < 60;
+});
 function logLine(t, idx){
   var dark = isDarkMode();
   var c = dark ? '#ccc4de' : '#4d4460', bg = 'transparent', bl = '3px solid transparent';
@@ -1400,7 +1559,7 @@ async function copySingleLog(el){
 }
 function rerenderAllLogs(){
   logwin.innerHTML = LOG_RAW_LINES.map(function(line, i){ return logLine(line, i); }).join('');
-  if(autoscroll) logwin.scrollTop = logwin.scrollHeight;
+  if(autoscroll) scrollLogsToBottom();
 }
 function clearLogs(){
   LOG_RAW_LINES = [];
@@ -1420,7 +1579,7 @@ try{
     var idx = LOG_RAW_LINES.length;
     LOG_RAW_LINES.push(e.data);
     logwin.insertAdjacentHTML('beforeend', logLine(e.data, idx));
-    if(autoscroll) logwin.scrollTop=logwin.scrollHeight;
+    if(autoscroll) scrollLogsToBottom();
   };
 }catch(e){}
 
