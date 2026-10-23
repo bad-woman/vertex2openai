@@ -45,9 +45,6 @@ GOOGLE_COOKIE = _settings.GOOGLE_COOKIE
 GOOGLE_PROJECT_ID = _settings.GOOGLE_PROJECT_ID
 EXPERIMENT_FLAGS = _settings.EXPERIMENT_FLAGS
 
-REASONING_TAG = "agent_platform_think_tag"
-VERTEX_REASONING_TAG = REASONING_TAG
-
 
 # ============================================================
 # 控制台可调的运行时默认值（可在大盘热更新，持久化到 web_state.json）
@@ -57,8 +54,6 @@ DEFAULT_SETTINGS = {
     # 思考
     "thinking_g3_level": "",
     "native_thinking_mode": "request",
-    "thinking_force_console": False,
-    "hide_thoughts": False,
     # 生图
     "image_size": "4K",
     "image_aspect_ratio": "",
@@ -84,6 +79,7 @@ DEFAULT_SETTINGS = {
     # 重试（全局）
     "retry_max": 10,
     "retry_backoff_seconds": 5,
+    "cross_channel_fallback": True,
     # 开关与基础设施（全局）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
