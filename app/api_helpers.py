@@ -251,6 +251,7 @@ def is_retryable_exception(e: Exception) -> bool:
         "internal", "backend error", "unavailable", "overloaded", "temporarily unavailable",
         "deadline_exceeded", "remoteprotocolerror", "connecterror", "readerror", "writeerror",
         "proxyerror", "pooltimeout", "server disconnected", "connection reset", "timed out", "timeout",
+        "incomplete chunked read", "peer closed connection",
     )
     return any(k in error_str for k in retry_keywords)
 
@@ -1176,6 +1177,7 @@ async def execute_unified_completion(
                             async for chunk_sse in _chunk_openai_response_dict_for_sse(openai_response_dict=openai_response_dict):
                                 has_yielded_output = True
                                 yield chunk_sse
+                            print(f"✅ [Express] {request_obj.model} | 假流式传输完成")
                             return
 
                         except asyncio.CancelledError:
@@ -1190,6 +1192,7 @@ async def execute_unified_completion(
                     else:
                         # Express 真流式
                         response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
+                        stream_start_ts = time.time()
                         try:
                             for _pin_try in range(2):
                                 try:
@@ -1213,11 +1216,19 @@ async def execute_unified_completion(
 
                                         num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
                                         for ci in range(num_candidates):
-                                            has_yielded_output = True
                                             sse_chunk = convert_chunk_to_openai(
                                                 chunk_item_call, exp_req_obj.model, response_id_for_stream, ci,
                                                 indexer=tool_indexer,
                                             )
+                                            is_real_chunk = (
+                                                '"reasoning_content":' in sse_chunk
+                                                or '"tool_calls":' in sse_chunk
+                                                or ('"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk)
+                                            )
+                                            if is_real_chunk and not has_yielded_output:
+                                                has_yielded_output = True
+                                                print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+
                                             if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
                                                 prefill_emitted = True
                                                 _pf = {
@@ -1236,7 +1247,9 @@ async def execute_unified_completion(
 
                                     if not prefill_emitted:
                                         prefill_emitted = True
-                                        has_yielded_output = True
+                                        if not has_yielded_output:
+                                            has_yielded_output = True
+                                            print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
                                         _pf = {
                                             "id": response_id_for_stream,
                                             "object": "chat.completion.chunk",
@@ -1272,6 +1285,8 @@ async def execute_unified_completion(
                                         })
 
                                     yield "data: [DONE]\n\n"
+                                    elapsed = time.time() - stream_start_ts
+                                    print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                                     return
                                 except Exception as e_pin_stream:
                                     if (
@@ -1477,6 +1492,7 @@ async def execute_unified_completion(
                 _record_usage(response_obj_call)
                 openai_response_content = convert_to_openai_format(response_obj_call, exp_req_obj.model)
                 _prepend_prefill(openai_response_content, prefill_text)
+                print(f"✅ [Express] {request_obj.model} | 非流式响应完成")
                 return JSONResponse(content=openai_response_content)
 
             except asyncio.CancelledError:
