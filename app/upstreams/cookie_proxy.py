@@ -1769,6 +1769,8 @@ class CookieProxyUpstream(BaseUpstream):
 
                     yield "data: [DONE]\n\n"
                     elapsed = time.time() - start_time
+                    if cookie_debug:
+                        print(f"🔎 [Studio 尾包原始结构] {sampler.dump()}")
                     print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
 
             return StreamingResponse(stream_generator_once(), media_type="text/event-stream")
