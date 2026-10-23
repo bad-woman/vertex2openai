@@ -605,7 +605,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="card p-5 md:col-span-2 flex flex-col justify-between">
-        <div class="lbl mb-4">Token 算力消耗 <span class="text-[#9a90ab]" style="text-transform:none;font-weight:400">· 仅标准 Express 通道计入（Cookie 直连接口不回传用量）</span></div>
+        <div class="lbl mb-4">Token 算力消耗 <span class="text-[#9a90ab]" style="text-transform:none;font-weight:400">· 双通道实时累计（含输入 Prompt 与思考/输出 Completion）</span></div>
         <div class="space-y-4">
           <div>
             <div class="flex justify-between text-sm mb-1.5"><span class="lbl" style="font-size:13px">Prompt（输入）</span><span id="t-prompt" class="val font-semibold" style="color:var(--accent)">0</span></div>
@@ -624,16 +624,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Channel -->
   <section id="view-channel" class="tab-pane hidden">
     <div class="card p-5 mb-4">
-      <div class="lbl mb-3">上游调用通道（点击卡片直接切换）</div>
+      <div class="lbl mb-3">优先主通道选择（点击卡片切换；开启「跨通道兜底重试」时另一通道自动作为备用）</div>
       <div class="flex flex-col sm:flex-row gap-3">
         <label class="flex-1 chan-card flex items-start gap-3" id="opt-api">
           <input type="radio" name="mode" value="api_key" class="mt-1 accent-[#8b7cf6]" onchange="updateMode('api_key')">
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between gap-2 flex-wrap">
               <span class="font-semibold text-sm">Express API Key（标准模式）</span>
-              <span id="badge-api" class="pill pill-mint hidden" style="font-size:11px;padding:1px 8px">当前使用中</span>
+              <span id="badge-api" class="pill pill-mint hidden" style="font-size:11px;padding:1px 8px">当前主通道</span>
             </div>
-            <div class="text-xs text-[#7d738e] mt-1">使用官方 google-genai SDK + 多账号 Express Key 轮询调用</div>
+            <div class="text-xs text-[#7d738e] mt-1">优先使用官方 google-genai SDK + 多账号 Express Key 轮询调用</div>
           </div>
         </label>
         <label class="flex-1 chan-card flex items-start gap-3" id="opt-web">
@@ -641,9 +641,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="flex-1 min-w-0">
             <div class="flex items-center justify-between gap-2 flex-wrap">
               <span class="font-semibold text-sm">Cookie 直连反代（Studio 模式）</span>
-              <span id="badge-web" class="pill pill-mint hidden" style="font-size:11px;padding:1px 8px">当前使用中</span>
+              <span id="badge-web" class="pill pill-mint hidden" style="font-size:11px;padding:1px 8px">当前主通道</span>
             </div>
-            <div class="text-xs text-[#7d738e] mt-1">使用控制台 Cookie + SAPISIDHASH 直连 batchGraphql</div>
+            <div class="text-xs text-[#7d738e] mt-1">优先使用控制台 Cookie + SAPISIDHASH 直连 batchGraphql</div>
           </div>
         </label>
       </div>
@@ -654,7 +654,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
         <div>
           <div class="text-sm font-semibold">Express API Key 列表<span class="helpq" onclick="hlp(this,'h_keys')">?</span></div>
-          <div class="text-xs text-[#7d738e] mt-0.5">支持多个谷歌账号 Key；添加、修改、启用/禁用或删除后均自动保存并热生效</div>
+          <div class="text-xs text-[#7d738e] mt-0.5">支持多个谷歌账号 Key；单次请求触发重试时会自动挨个轮换不同 Key，坏 Key 会在日志中标红提醒</div>
         </div>
         <div class="flex items-center gap-2 flex-wrap">
           <span id="keys-count" class="pill pill-accent" style="text-transform:none">0 个</span>
@@ -663,14 +663,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div id="h_keys" class="helpbox">
-        <b>自动保存 &amp; 即添即探</b>：点「＋ 添加 Key」粘贴新 Key 后，移开输入框（或按回车）即<b>自动保存并后台探测归属 Project ID</b>；勾选启用/禁用、修改 Project ID 或点「删除」也会立即自动落盘生效，无需手动点保存。<br>
-        <b>Project ID 绑定</b>：每个 Key 对应各自谷歌账号的 GCP 项目，标准模式钉定 location 时优先使用该 Key 自己的 Project ID。
+        <b>自动保存 &amp; 即添即探</b>：点「＋ 添加 Key」粘贴新 Key 后，移开输入框（或按回车）即<b>自动保存并后台探测归属 Project ID</b>；勾选启用/禁用、修改 Project ID 或点「删除」也会立即自动落盘生效。<br>
+        <b>多 Key 轮换与 Project ID 绑定</b>：每个 Key 对应各自谷歌账号的 GCP 项目，重试切换 Key 时会自动同步切换对应的 Project ID。
       </div>
       <div id="keys-list" class="space-y-2.5"></div>
       <p id="keys-empty" class="text-xs text-[#7d738e] mt-2 hidden">当前没有任何 Express Key。点右上角「＋ 添加 Key」粘贴即可自动保存。</p>
     </div>
 
-    <div id="cookie-box" class="card p-5 hidden">
+    <!-- Studio Cookie 凭证（常驻显示，支持主用或作为 Express 模式的跨通道兜底） -->
+    <div id="cookie-box" class="card p-5">
+      <div class="mb-3">
+        <div class="text-sm font-semibold">Studio Cookie 直连凭证</div>
+        <div class="text-xs text-[#7d738e] mt-0.5">用于 Studio 直连模式，或在开启「跨通道兜底重试」时作为 Express Key 池的互备通道</div>
+      </div>
       <div class="lbl mb-2">Google Cookie（含 HttpOnly 字段）</div>
       <textarea id="cookie-input" rows="3" class="inp log mb-3" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Cookie-Editor 导出的 JSON / Header String，自动解析）"></textarea>
       <div class="lbl mb-2">Google Cloud Project ID</div>
@@ -698,7 +703,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         • <b>② 全局设置</b>（location 区域 / 图片压缩 / 重试退避 / 假流式与弱网续传 / 调试开关）全局唯一，通过页面底部的「保存全局设置」按钮保存，<b>两个分区完全独立、互不覆盖</b>。
       </p>
       <div class="flex items-center gap-2.5 mt-3.5 flex-wrap">
-        <button id="btn-scope-save" class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存为该模型专属</button>
+        <button id="btn-scope-save" class="btn px-4 py-2 text-sm" onclick="saveModelOverride()">💾 保存 ① 区为全局默认</button>
         <button id="btn-scope-clear" class="btn-soft px-4 py-2 text-sm" onclick="clearModelOverride()">清除该模型专属</button>
         <span id="ov-hint" class="text-xs text-[#7d738e]"></span>
       </div>
@@ -890,6 +895,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div><div class="lbl mb-1">最大重试次数</div><input id="retry_max" type="number" class="inp"></div>
           <div><div class="lbl mb-1">退避间隔(秒)</div><input id="retry_backoff_seconds" type="number" step="0.5" class="inp"></div>
         </div>
+        <div class="mt-3 pt-3 border-t border-[#f0eaf8] divider-line">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-sm">允许跨通道兜底重试（Key ↔ Cookie）<span class="helpq" onclick="hlp(this,'h_ccf')">?</span></span>
+            <label class="switch"><input type="checkbox" id="cross_channel_fallback"><span class="slider"></span></label>
+          </div>
+          <div id="h_ccf" class="helpbox">开启后，当主通道的所有凭证（如全部 Express Key 或 Cookie）报错/限流/失效时，自动跨通道尝试另一通道的可用凭证；若当前场景只能用单通道，可关闭此开关。</div>
+        </div>
       </div>
 
       <!-- 全局开关 -->
@@ -905,7 +917,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲保留时长(秒)</span><input id="resumable_ttl_seconds" type="number" step="60" class="inp" style="width:90px"></div>
           <div class="flex items-center justify-between gap-2"><span class="text-sm">续传缓冲数量上限</span><input id="resumable_max_streams" type="number" step="10" class="inp" style="width:90px"></div>
-          <div class="flex items-center justify-between gap-2"><span class="text-sm">多 Key 轮询（round-robin）</span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
+          <div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">多 Key 轮询（round-robin）<span class="helpq" onclick="hlp(this,'h_rr')">?</span></span><label class="switch"><input type="checkbox" id="roundrobin"><span class="slider"></span></label></div>
+            <div id="h_rr" class="helpbox">开启后，每次新请求按顺序轮流从下一个 Express Key 开始调用；关闭则随机挑选起始 Key。无论开启或关闭，单次请求触发重试时都会自动遍历其余可用 Key，绝不死磕同一个 Key。</div>
+          </div>
           <div>
             <div class="flex items-center justify-between gap-2"><span class="text-sm">输出附加安全分<span class="helpq" onclick="hlp(this,'h_ss')">?</span></span><label class="switch"><input type="checkbox" id="safety_score"><span class="slider"></span></label></div>
             <div id="h_ss" class="helpbox">在回复末尾附加可折叠的安全分类评分块。</div>
@@ -1099,8 +1114,7 @@ function applyChannelHighlight(m){
   $('opt-web').classList.toggle('active', isWeb);
   $('badge-api').classList.toggle('hidden', isWeb);
   $('badge-web').classList.toggle('hidden', !isWeb);
-  $('cookie-box').classList.toggle('hidden', !isWeb);
-  $('mode-pill').textContent = isWeb ? '通道 Cookie 直连' : '通道 Express API';
+  $('mode-pill').textContent = isWeb ? '主通道 Cookie 直连' : '主通道 Express API';
 }
 async function updateMode(m){
   applyChannelHighlight(m);
@@ -1322,12 +1336,9 @@ async function loadParams(){
     [
       'img_compress_enabled','fake_streaming','roundrobin','safety_score',
       'cookie_debug','debug_outbound','prefill_suppress_thinking',
-      'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled'
+      'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled',
+      'cross_channel_fallback'
     ].forEach(function(k){setV(k,s[k]);});
-    if((!s.native_thinking_mode || s.native_thinking_mode==='request')){
-      if(s.hide_thoughts) setV('native_thinking_mode','off');
-      else if(s.thinking_force_console) setV('native_thinking_mode','console');
-    }
   }catch(e){}
   try{
     var c=await (await fetch('/api/capabilities')).json();
@@ -1494,6 +1505,7 @@ async function saveSettings(){
     img_compress_quality:numOr('img_compress_quality',85),
     retry_max:numOr('retry_max',10),
     retry_backoff_seconds:numOr('retry_backoff_seconds',5),
+    cross_channel_fallback:$('cross_channel_fallback').checked,
     fake_streaming:$('fake_streaming').checked,
     fake_streaming_interval:numOr('fake_streaming_interval',1),
     resumable_enabled:$('resumable_enabled').checked,
