@@ -28,11 +28,6 @@ class ProxyStats:
         with self.lock:
             self.error_requests += 1
 
-    def add_request(self, success=True, is_error=False):
-        with self.lock:
-            if is_error:
-                self.error_requests += 1
-
     def add_retry(self):
         with self.lock:
             self.retry_counts += 1
