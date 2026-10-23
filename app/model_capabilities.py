@@ -1,19 +1,11 @@
 """
-模型能力矩阵（按家族识别）
+模型能力矩阵（按家族识别 · Gemini 3.x / 4.x 及生图家族）
 
 用于决定：
-- 每个模型支持的思考方式（thinking_level / 无）与合法档位
-- 可用的采样参数集合（避免把不支持的参数发给模型导致 400）
+- 每个模型支持的思考档位（thinking_level）与合法档位白名单
+- 可用的采样参数集合（避免把已废弃的参数发给模型导致 400）
 - 生图模型支持的宽高比与分辨率白名单
-- 是否要求最后一条消息为 user（Gemini 3.x 强制，否则 400 → 影响预填充）
-
-设计原则：**按家族模式识别，而非写死每个型号**，因此往 vertexModels.json 里新增模型 ID
-基本即插即用；未知/未来型号保守回退到“最新代（gemini-3）”档案。
-
-依据（2026-07 官方文档核实）：
-- thinking: ai.google.dev/gemini-api/docs/thinking
-- 3.6/3.5 开发指南（采样弃用 + 预填充 400 + 去 candidate_count）
-- 生图: ai.google.dev/gemini-api/docs/image-generation ；Agent Platform 3-pro-image / 3-1-flash-image
+- 是否要求最后一条消息为 user（Gemini 3.x / 4.x 强制，否则 400 → 触发预填充兼容）
 """
 
 import re
@@ -21,61 +13,36 @@ from typing import Any, Dict, Optional
 
 from models import normalize_content_part
 
-# 所有“采样类”参数键（用于按模型剥离）
 SAMPLING_KEYS = {
     "temperature", "top_p", "top_k",
     "presence_penalty", "frequency_penalty",
     "candidate_count", "seed", "stop_sequences", "max_output_tokens",
 }
 
-# 惩罚参数：新版 Gemini 收到非零 presence_penalty / frequency_penalty 直接 400。
-# 默认从所有模型档案的 allowed_sampling 剔除（由 sanitize_sampling 自动剥离）；
-# 前端仍可传这两个字段，但反代不会把它们发给 Google。
 PENALTY_KEYS = {
     "presence_penalty", "frequency_penalty",
 }
 
-# ---- 生图分辨率与比例白名单 ----
-# 出处：Agent Platform gemini-3-pro-image / gemini-3-1-flash-image / gemini-nano-banana-2-1
-#      模型文档（核对于 2026-10-13）：三者均为 15 种宽高比
-#      「1:1, 3:2, 2:3, 3:4, 1:4, 4:1, 4:3, 4:5, 5:4, 1:8, 8:1, 9:16, 16:9, 21:9, 9:21」
-_PRO_IMAGE_ARS = {"1:1", "3:2", "2:3", "3:4", "1:4", "4:1", "4:3", "4:5", "5:4",
-                 "1:8", "8:1", "9:16", "16:9", "21:9", "9:21"}
-_FLASH_IMAGE_ARS = _PRO_IMAGE_ARS
-_NANO_BANANA_ARS = _PRO_IMAGE_ARS
+# 生图模型支持的 15 种官方宽高比（gemini-3-pro-image / gemini-3.1-flash-image / gemini-nano-banana-2.1）
+_IMAGE_ARS = {
+    "1:1", "3:2", "2:3", "3:4", "1:4", "4:1", "4:3", "4:5", "5:4",
+    "1:8", "8:1", "9:16", "16:9", "21:9", "9:21",
+}
 
-# ---- 思考档位阶梯（由低到高）----
-# 出处：Agent Platform → Get started with Gemini 3（核对于 2026-07-26）
-#   MINIMAL 仅 Gemini 3 Flash / 3.1 Flash-Lite 有；
-#   MEDIUM 覆盖 Gemini 3 Flash / 3.1 Pro / 3.1 Flash-Lite；
-#   LOW / HIGH 所有 3.x 都有。
 _LEVEL_ORDER = ["minimal", "low", "medium", "high"]
 
-# MINIMAL 的可用性上界（含）：3.6 及更早的非 Pro 机型实测/文档支持 MINIMAL
-# （3.6-flash 已真机验证 MINIMAL 生效、思考归零）。
-# 出处：intro_gemini_3_7_flash.ipynb（核对于 2026-08-14）——3.7 Flash 的档位表
-#   只列出 LOW / MEDIUM / HIGH，未提及 MINIMAL，且默认档位为 medium
-#   （"replaced the high setting used in older Gemini 3 models"）。
-# 方向性：漏给 MINIMAL 只是少压一点思考（拿到 LOW，不报错）；多给不支持的枚举会 400。
-#   因此 3.7 及更新型号一律不提供 MINIMAL，等真机验证后再逐个放开。
+# 3.6 及更早的非 Pro 机型实测支持 MINIMAL；3.7 及更新机型最低为 LOW
 _MINIMAL_MAX_VERSION = (3, 6)
 
 
 def _supports_minimal(major: int, minor: int, is_pro: bool) -> bool:
-    """该型号是否提供 MINIMAL 思考档位。"""
     if is_pro:
-        return False                                  # Pro 系最低 LOW（官方）
+        return False
     return (major, minor) <= _MINIMAL_MAX_VERSION
 
 
 def _clamp_level(level: str, levels: set) -> str:
-    """把任意档位夹到该模型的合法档位集合内。
-
-    规则：**优先向下就近取**，向下没有再向上。
-    这条方向性很关键——用户把档位调低是为了减少思考，
-    旧实现对非法档位一律兜底成 "high"，导致 Pro 模型上选 minimal 反而拿到 high，
-    与用户意图完全相反（P0-1）。
-    """
+    """把任意档位夹到该模型的合法档位集合内（优先向下就近取，向下没有再向上）。"""
     if not levels:
         return "low"
     if level in levels:
@@ -83,25 +50,23 @@ def _clamp_level(level: str, levels: set) -> str:
     try:
         idx = _LEVEL_ORDER.index(level)
     except ValueError:
-        idx = _LEVEL_ORDER.index("high")   # 未知词按最高处理，再向下夹
-    for i in range(idx, -1, -1):           # 先向下找最接近的合法档
+        idx = _LEVEL_ORDER.index("high")
+    for i in range(idx, -1, -1):
         if _LEVEL_ORDER[i] in levels:
             return _LEVEL_ORDER[i]
-    for i in range(idx + 1, len(_LEVEL_ORDER)):   # 向下没有再向上
+    for i in range(idx + 1, len(_LEVEL_ORDER)):
         if _LEVEL_ORDER[i] in levels:
             return _LEVEL_ORDER[i]
     return sorted(levels)[0]
 
 
 def sort_levels(levels) -> list:
-    """按强度而非字典序排列档位，供控制台下拉框使用。"""
     known = [lv for lv in _LEVEL_ORDER if lv in levels]
     extra = sorted(lv for lv in levels if lv not in _LEVEL_ORDER)
     return known + extra
 
 
 def _strip_known_suffixes(name: str) -> str:
-    """去掉别名后缀（-search / 分辨率 / 思考档位后缀），得到判断家族用的基础名。"""
     n = name.lower()
     for suf in ("-search", "-1k", "-2k", "-4k", "-512"):
         if n.endswith(suf):
@@ -111,16 +76,11 @@ def _strip_known_suffixes(name: str) -> str:
 
 
 def _temp_deprecated(name: str) -> bool:
-    """temperature/top_p/top_k 是否已废弃。
-
-    据官方 latest-model 文档：自 Gemini 3.6 Flash 与 Gemini 3.5 Flash-Lite 起，
-    以及**所有更新/未来的 Gemini 模型**，这三个采样参数被废弃（现忽略、未来 400），
-    需从请求中移除。更早的 3.x（3.0–3.5 非 lite）仍接受（但建议保持默认）。
-    """
+    """自 Gemini 3.6 Flash 与 3.5 Flash-Lite 起（含 4.x 及更新模型），temperature/top_p/top_k 已废弃。"""
     n = name.lower()
     m = re.search(r"gemini-(\d+)(?:\.(\d+))?", n)
     if not m:
-        return True  # 未知/未来型号 → 前向安全，按已废弃处理
+        return True
     major = int(m.group(1))
     minor = int(m.group(2) or 0)
     if major >= 4:
@@ -138,28 +98,21 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     name = _strip_known_suffixes(raw)
 
     # ---- 生图模型 ----
-    # 识别规则："image" in name 覆盖 3.x 生图；"nano-banana" in name 覆盖 Nano Banana 家族
-    # （gemini-nano-banana-2.1 名字里不带 image，不加这条会被误判为文本模型）。
     if "image" in name or "nano-banana" in name:
         is_nano = "nano-banana" in name
         is_lite = "flash-lite" in name
         is_flash = "flash" in name
-        # 官方合法 thinking 档位（Agent Platform，核对于 2026-10-13）：
-        #   nano-banana-2.1: MINIMAL / MEDIUM / HIGH
-        #   3.1-flash-image: MINIMAL / HIGH
-        #   3-pro-image:     仅 HIGH
-        # 默认档位统一 HIGH（用户决策 2026-10-13）。
         if is_nano:
-            ars, sizes = _NANO_BANANA_ARS, {"1K", "2K", "4K"}
+            sizes = {"1K", "2K", "4K"}
             thinking_levels = {"minimal", "medium", "high"}
         elif is_lite:
-            ars, sizes = _PRO_IMAGE_ARS, {"1K"}
+            sizes = {"1K"}
             thinking_levels = {"minimal", "high"}
         elif is_flash:
-            ars, sizes = _FLASH_IMAGE_ARS, {"512", "1K", "2K", "4K"}
+            sizes = {"512", "1K", "2K", "4K"}
             thinking_levels = {"minimal", "high"}
-        else:  # pro-image 及未知生图
-            ars, sizes = _PRO_IMAGE_ARS, {"1K", "2K", "4K"}
+        else:
+            sizes = {"1K", "2K", "4K"}
             thinking_levels = {"high"}
         return {
             "family": "image",
@@ -167,64 +120,48 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "thinking_kind": "level",
             "thinking_levels": thinking_levels,
             "default_level": "high",
-            "allowed_sampling": set(),          # 生图剥离所有采样参数
-            "image_aspect_ratios": ars,
+            "allowed_sampling": set(),
+            "image_aspect_ratios": _IMAGE_ARS,
             "image_sizes": sizes,
             "supports_search": True,
             "requires_user_last_turn": True,
         }
 
-    # ---- 文本 / 多模态 ----
+    # ---- 文本 / 多模态（Gemini 3.x / 4.x）----
     m = re.search(r"gemini-(\d+)(?:\.(\d+))?", name)
-    major = int(m.group(1)) if m else 3          # 未知 → 视作最新代
+    major = int(m.group(1)) if m else 3
     minor = int(m.group(2)) if (m and m.group(2)) else 0
     is_pro = "pro" in name
 
-    if major >= 3:
-        # Gemini 3.x：思考用 thinking_level（取代 thinking_budget），且不支持 candidate_count。
-        # temperature/top_p/top_k：自 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）已废弃，
-        # 官方要求从请求移除（现忽略、未来 400）；更早的 3.x 仍可用但建议保持默认。
-        levels = {"low", "medium", "high"}
-        if _supports_minimal(major, minor, is_pro):
-            levels = levels | {"minimal"}
-        if "flash-lite" in name and "minimal" in levels:
-            default_level = "minimal"
-        elif is_pro:
-            default_level = "high"
-        else:
-            # 非 Pro 的 3.x 默认 medium。3.7 Flash 官方明确默认 medium
-            # （取代旧 3.x 的 high），与这里一致。
-            default_level = "medium"
-        allowed = set(SAMPLING_KEYS)
-        allowed.discard("candidate_count")  # 所有 Gemini 3.x 不支持 candidate_count
-        allowed -= PENALTY_KEYS  # 惩罚参数默认剥离：新版 Gemini 收到非零值直接 400
-        temp_dep = _temp_deprecated(name)
-        if temp_dep:
-            allowed -= {"temperature", "top_p", "top_k"}
-        return {
-            "family": "g3",
-            "is_image": False,
-            "thinking_kind": "level",
-            "thinking_levels": levels,
-            "default_level": default_level,
-            "allowed_sampling": allowed,
-            "sampling_advice": "deprecated" if temp_dep else "recommend_default",
-            "supports_search": True,
-            "requires_user_last_turn": True,
-        }
+    levels = {"low", "medium", "high"}
+    if _supports_minimal(major, minor, is_pro):
+        levels = levels | {"minimal"}
+    if "flash-lite" in name and "minimal" in levels:
+        default_level = "minimal"
+    elif is_pro:
+        default_level = "high"
+    else:
+        default_level = "medium"
 
-    # ---- 更早（2.0 / 1.5 等）：无思考、全采样、宽松 ----
+    allowed = set(SAMPLING_KEYS)
+    allowed.discard("candidate_count")
+    allowed -= PENALTY_KEYS
+    temp_dep = _temp_deprecated(name)
+    if temp_dep:
+        allowed -= {"temperature", "top_p", "top_k"}
     return {
-        "family": "legacy",
+        "family": "g3",
         "is_image": False,
-        "thinking_kind": None,
-        "allowed_sampling": set(SAMPLING_KEYS) - PENALTY_KEYS,
+        "thinking_kind": "level",
+        "thinking_levels": levels,
+        "default_level": default_level,
+        "allowed_sampling": allowed,
+        "sampling_advice": "deprecated" if temp_dep else "recommend_default",
         "supports_search": True,
-        "requires_user_last_turn": False,
+        "requires_user_last_turn": True,
     }
 
 
-# 客户端 reasoning_effort 归一化（SillyTavern 等会发 min/minimal/max/xhigh/auto 等）
 _EFFORT_ALIASES = {
     "min": "minimal", "minimal": "minimal",
     "low": "low", "medium": "medium", "med": "medium",
@@ -238,7 +175,7 @@ def _norm_effort(e: Optional[str]) -> Optional[str]:
         return None
     s = e.strip().lower()
     if not s or s == "auto":
-        return None  # auto/空 → 交给控制台/模型默认
+        return None
     return _EFFORT_ALIASES.get(s, s)
 
 
@@ -258,77 +195,41 @@ def _extra(request: Any, key: str) -> Any:
 
 def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
                      prefill_active: bool = False) -> Dict[str, Any]:
-    """
-    计算思考配置（中立结构，各通道再转成自己的线格式）。
-    返回 {"mode": None} 或 {"mode":"level","level":..}
-
-    优先级（默认）：单次请求 reasoning_effort > 控制台/该模型专属 > 家族默认。
-
-    控制台 native_thinking_mode（原生思考控制，向后兼容旧 hide_thoughts/thinking_force_console 布尔）：
-    - "request"（默认）：跟随请求 effort（无则控制台/模型默认），返回思考。
-    - "off"（关闭原生思考，酒馆预设推荐）：把思考压到该模型最低合法档
-      （3.x/4.x=minimal/low，生图=minimal/high），忽略前端 effort，并 include_thoughts=False。**重要：batchGraphql(Studio) 会忽略
-      includeThoughts，故 Cookie 通道还需在响应侧剥离思考块（见 chat_completions）；把档位压到 minimal
-      才是 Studio 下真正减少原生思考、避免重预设思考阶段被截断的关键（已真机验证）。**
-    - "console"（强制控制台档位）：忽略前端 effort，用控制台/该模型专属档位（未设则模型默认），返回思考。
-
-    另外 prefill_suppress_thinking（默认开）：检测到预填充时等效走 "off" 压制路径。
-    """
+    """计算思考配置：request（跟随请求）| off（关闭原生思考）| console（强制控制台档位）。"""
     prof = get_profile(model_name)
     if prof["thinking_kind"] is None:
         return {"mode": None}
 
     settings = settings or {}
-
-    # 统一的“原生思考控制”模式：request（跟随请求）| off（关闭原生思考）| console（强制控制台档位）
-    # 向后兼容旧布尔开关（上一版的 hide_thoughts / thinking_force_console）。
     mode = settings.get("native_thinking_mode")
     if mode not in ("request", "off", "console"):
-        if settings.get("hide_thoughts"):
-            mode = "off"
-        elif settings.get("thinking_force_console"):
-            mode = "console"
-        else:
-            mode = "request"
+        mode = "request"
 
-    # suppress = 关闭原生思考（压到最低 + 隐藏 + 忽略前端）。预填充压制也走这条路。
     suppress = bool(mode == "off" or (prefill_active and settings.get("prefill_suppress_thinking", True)))
     ignore_client = bool(suppress or mode == "console")
 
     req_effort = None if ignore_client else _effort(request)
     include_thoughts = not suppress
 
-    if prof["thinking_kind"] == "level":
-        levels = prof["thinking_levels"]
-        if suppress:
-            # 压制：3.x 无法完全关闭思考 → 压到该模型最低合法档并隐藏
-            return {"mode": "level", "level": _clamp_level("minimal", levels),
-                    "include_thoughts": False}
-        level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
-        level = str(level).lower()
-        if level in ("off", "none"):
-            level = "minimal"
-        # 统一就近向下夹取：Pro 上选 minimal 得到 low，而不是被抬成 high
-        level = _clamp_level(level, levels)
-        return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
-
-    return {"mode": None}
+    levels = prof["thinking_levels"]
+    if suppress:
+        return {
+            "mode": "level",
+            "level": _clamp_level("minimal", levels),
+            "include_thoughts": False,
+        }
+    level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
+    level = str(level).lower()
+    if level in ("off", "none"):
+        level = "minimal"
+    level = _clamp_level(level, levels)
+    return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
 
 
 def apply_sampling_policy(profile: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
-    """用控制台的「采样参数处理」覆盖自动判定，返回修正后的档案副本。
-
-    自动判定按版本号（3.6+ / 3.5-flash-lite / 4.x 起废弃），但版本号表达不了
-    "号更小却发布更晚"的情况——比如日后出一个 gemini-3.5-pro，官方按"更新模型"
-    废弃采样，版本判据却会放行。有了这个开关，加模型就不必改代码。
-
-      auto       —— 用内置版本判定（默认）
-      deprecated —— 强制剥离 temperature / top_p / top_k
-      allowed    —— 强制保留（官方澄清某模型仍可调时用）
-    """
     policy = str(settings.get("sampling_policy", "auto") or "auto").lower()
     if policy not in ("deprecated", "allowed") or profile.get("is_image"):
-        return profile          # 生图本来就剥离全部采样，不受该开关影响
+        return profile
     prof = dict(profile)
     allowed = set(prof.get("allowed_sampling", set()))
     if policy == "deprecated":
@@ -336,16 +237,13 @@ def apply_sampling_policy(profile: Dict[str, Any], settings: Dict[str, Any]) -> 
         prof["sampling_advice"] = "deprecated"
     else:
         allowed |= {"temperature", "top_p", "top_k"}
-        # candidate_count 是 3.x 的硬限制，不归这个开关管
-        if prof.get("family") == "g3":
-            allowed.discard("candidate_count")
+        allowed.discard("candidate_count")
         prof["sampling_advice"] = "recommend_default"
     prof["allowed_sampling"] = allowed
     return prof
 
 
 def sanitize_sampling(config: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
-    """按档案剥离不支持的采样参数（防止未来 3.x 传弃用参数直接 400）。"""
     allowed = profile.get("allowed_sampling", set())
     for key in list(config.keys()):
         if key in SAMPLING_KEYS and key not in allowed:
@@ -354,7 +252,6 @@ def sanitize_sampling(config: Dict[str, Any], profile: Dict[str, Any]) -> Dict[s
 
 
 def resolve_image_size(model_name: str, request: Any, settings: Dict[str, Any]) -> Optional[str]:
-    """确定生图分辨率（大写 1K/2K/4K/512），按模型白名单校验，缺省回退。"""
     prof = get_profile(model_name)
     if not prof["is_image"]:
         return None
@@ -364,9 +261,6 @@ def resolve_image_size(model_name: str, request: Any, settings: Dict[str, Any]) 
     size = str(raw).upper().replace("0.5K", "512").replace("512PX", "512")
     if size in sizes:
         return size
-    # 回退：就近向下取档（4K→2K→1K→512），向下没有再向上。
-    # 旧实现写成 `for cand in (...): if cand in sizes: return "1K" if "1K" in sizes else cand`，
-    # 因为 1K 在所有白名单里，任何非法值都返回 1K，注释里的“优先给相近的高档”从未生效。
     ladder = ["512", "1K", "2K", "4K"]
     idx = ladder.index(size) if size in ladder else len(ladder) - 1
     for i in range(idx, -1, -1):
@@ -379,7 +273,6 @@ def resolve_image_size(model_name: str, request: Any, settings: Dict[str, Any]) 
 
 
 def _prompt_aspect_ratio(request: Any) -> Optional[str]:
-    """从最后一条 user 消息文本里解析宽高比（--ar 优先，其次独立比例）。"""
     try:
         for msg in reversed(request.messages):
             if getattr(msg, "role", None) != "user":
@@ -389,8 +282,6 @@ def _prompt_aspect_ratio(request: Any) -> Optional[str]:
             if isinstance(c, str):
                 content = c
             elif isinstance(c, list):
-                # F-1：先归一，否则 pydantic 生成的 ContentPartText 会被 isinstance(p, dict) 漏掉，
-                # 导致列表形式内容里的 `--ar 16:9` 永远检测不到。
                 parts = [normalize_content_part(p) for p in c]
                 content = " ".join(
                     p.get("text", "") for p in parts
@@ -404,11 +295,6 @@ def _prompt_aspect_ratio(request: Any) -> Optional[str]:
 
 
 def resolve_aspect_ratio(model_name: str, request: Any, settings: Dict[str, Any]) -> Optional[str]:
-    """
-    生图宽高比解析（两通道共用）。优先级：
-    请求额外字段 aspect_ratio/ar > OpenAI size 映射 > 提示词解析 > 控制台默认，
-    最后按该生图模型白名单校验；不合法则返回 None（交给模型自动决定）。
-    """
     prof = get_profile(model_name)
     if not prof["is_image"]:
         return None
@@ -433,7 +319,6 @@ def resolve_aspect_ratio(model_name: str, request: Any, settings: Dict[str, Any]
 
 
 def validate_aspect_ratio(model_name: str, ar: Optional[str]) -> Optional[str]:
-    """校验宽高比是否在该生图模型白名单内；不在则返回 None（交给模型自动决定）。"""
     if not ar:
         return None
     prof = get_profile(model_name)
@@ -444,17 +329,11 @@ def validate_aspect_ratio(model_name: str, ar: Optional[str]) -> Optional[str]:
 
 
 def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """给控制台前端用的精简能力描述（决定显示/禁用哪些控件）。
-
-    传入该模型生效的 settings 时，会把「采样参数处理」开关算进去，
-    否则控制台显示的能力会和实际下发的参数对不上。
-    """
     prof = get_profile(model_name)
     if settings:
         prof = apply_sampling_policy(prof, settings)
     thinking: Dict[str, Any] = {"kind": prof["thinking_kind"]}
     if prof["thinking_kind"] == "level":
-        # 按强度排序（minimal→high），不要用字典序（会排成 high, low, medium, minimal）
         thinking["levels"] = sort_levels(prof["thinking_levels"])
         thinking["can_off"] = False
     return {
