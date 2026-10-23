@@ -938,12 +938,12 @@ def _is_thought_part(part: dict) -> bool:
     return bool(t)
 
 
-def _summ_obj(obj: dict, width: int = 700) -> str:
+def _summ_obj(obj: dict, width: int = 2000) -> str:
     try:
         s = json.dumps(obj, ensure_ascii=False)
     except Exception:
         s = str(obj)
-    s = re.sub(r'"data":\s*"[A-Za-z0-9+/=]{64,}"', '"data": "<base64 已省略>"', s)
+    s = re.sub(r'"(data|thoughtSignature)":\s*"[A-Za-z0-9+/=_-]{64,}"', r'"\1": "<长Base64已省略>"', s)
     return s[:width] + ("…" if len(s) > width else "")
 
 
