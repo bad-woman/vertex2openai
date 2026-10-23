@@ -23,15 +23,9 @@ _LOCAL_MODEL_FILE_CANDIDATES = [
 def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
     if not isinstance(data, dict):
         return None
-
     models = data.get("models")
     if isinstance(models, list):
         return {"models": [str(model) for model in models if isinstance(model, str) and model.strip()]}
-
-    legacy_express_models = data.get("vertex_express_models")
-    if isinstance(legacy_express_models, list):
-        return {"models": [str(model) for model in legacy_express_models if isinstance(model, str) and model.strip()]}
-
     return None
 
 
