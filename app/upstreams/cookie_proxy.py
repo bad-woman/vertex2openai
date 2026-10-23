@@ -60,12 +60,28 @@ RETRYABLE_KEYWORDS = [
     "resource_exhausted",
     "try again later",
     "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "internal",
+    "backend error",
     "quota",
     "rate limit",
     "overloaded",
     "temporarily unavailable",
     "internal error",
     "unavailable",
+    "deadline_exceeded",
+    "remoteprotocolerror",
+    "connecterror",
+    "readerror",
+    "writeerror",
+    "proxyerror",
+    "pooltimeout",
+    "server disconnected",
+    "connection reset",
+    "broken pipe",
 ]
 
 COOKIE_EXPIRED_KEYWORDS = [
@@ -277,9 +293,22 @@ def _prefill_log(mode: str, prefill_text: str) -> str:
 
 
 def _is_retryable_error(error_msg: str) -> bool:
-    """判断错误是否可重试（429 限流类）"""
+    """判断错误是否可重试（429 限流 / 500 内部错误 / 502~504 / 网络断连，排除明文安全拦截）"""
     lower = (error_msg or "").lower()
+    if any(k in lower for k in ("prohibited_content", "block_reason", "blockreason", "image_safety", "blocklist")):
+        return False
     return any(kw in lower for kw in RETRYABLE_KEYWORDS)
+
+
+class CookieAttemptError(Exception):
+    """单次 Cookie 尝试失败异常，供外层跨通道重试器捕获判断。"""
+    def __init__(self, status_code: int, message: str, is_retryable: bool = False, is_auth_or_billing: bool = False):
+        super().__init__(message)
+        self.code = status_code
+        self.status_code = status_code
+        self.message = message
+        self.is_retryable = is_retryable
+        self.is_auth_or_billing = is_auth_or_billing
 
 
 # ========== requestContext 模板 ==========
@@ -312,8 +341,6 @@ def _build_thinking_config(model_name: str, request: OpenAIRequest,
     t = mc.resolve_thinking(model_name, request, settings, prefill_active=prefill_active)
     if t.get("mode") == "level":
         return {"thinkingLevel": t["level"].upper(), "includeThoughts": t.get("include_thoughts", True)}
-    if t.get("mode") == "budget":
-        return {"thinkingBudget": t["budget"], "includeThoughts": t.get("include_thoughts", True)}
     return None
 
 
@@ -1038,6 +1065,18 @@ def _map_usage(usage_meta: dict | None) -> dict:
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
 
 
+def _record_studio_usage(usage_meta: dict | None) -> dict:
+    """将 Studio(Cookie) 通道返回的 usageMetadata 计入全局算力统计（无 token 时仅计成功次数）。"""
+    usage = _map_usage(usage_meta)
+    p_tk, c_tk, t_tk = usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
+    if p_tk > 0 or c_tk > 0:
+        stats.add_tokens(p_tk, c_tk)
+        print(f"💰 [Studio 算力统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+    else:
+        stats.add_success()
+    return usage
+
+
 # ========== OpenAI SSE 格式化 ==========
 
 def _make_openai_chunk(
@@ -1154,7 +1193,7 @@ async def _execute_stream_request_generator_once(
                 if _native_tool_error(clean_msg):
                     yield "native_tool_unsupported", formatted_err
                     return
-                is_retryable = response.status_code in (429, 503, 500) or _is_retryable_error(clean_msg)
+                is_retryable = response.status_code in (429, 500, 502, 503, 504) or _is_retryable_error(clean_msg)
                 yield "retryable_error" if is_retryable else "fatal_error", formatted_err
                 return
 
@@ -1192,7 +1231,11 @@ async def _execute_stream_request_generator_once(
 
     except Exception as e:
         err_msg = f"{type(e).__name__}: {e}"
-        is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
+        is_retryable = (
+            isinstance(e, (httpx.TransportError, httpx.TimeoutException, TimeoutError, ConnectionError))
+            or _is_retryable_error(err_msg)
+            or "timeout" in err_msg.lower()
+        )
         if not has_content:
             yield "retryable_error" if is_retryable else "fatal_error", err_msg
         else:
@@ -1226,220 +1269,167 @@ async def _execute_stream_request_generator(
         return
 
 
-async def _collect_full_response(project_id, base_model_name, request_obj, headers, client_kwargs,
-                                 retry_max, backoff_sec, fastapi_request,
-                                 prefill_active: bool = False,
-                                 force_search: bool = False,
-                                 strip_thoughts: bool = False) -> dict:
-    """完整取回一次 batchGraphql 响应（供生图假流式与 Cookie 模式假流式共用）。"""
-    for attempt in range(retry_max + 1):
-        if await fastapi_request.is_disconnected():
-            return {"kind": "cancelled", "message": "客户端已断开连接。"}
-        try:
-            body = await build_batch_graphql_body_async(
-                project_id, base_model_name, request_obj,
-                prefill_active=prefill_active, force_search=force_search)
-            req_headers = build_headers(_get_cookie_string()) or headers
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
+async def _collect_full_response_once(
+    project_id, base_model_name, request_obj, headers, client_kwargs,
+    fastapi_request, prefill_active: bool = False,
+    force_search: bool = False, strip_thoughts: bool = False
+) -> dict:
+    """单次取回 batchGraphql 完整响应（供假流式与生图使用，重试交由外层统一调度器）。"""
+    if await fastapi_request.is_disconnected():
+        return {"kind": "cancelled", "message": "客户端已断开连接。"}
+    try:
+        body = await build_batch_graphql_body_async(
+            project_id, base_model_name, request_obj,
+            prefill_active=prefill_active, force_search=force_search)
+        req_headers = build_headers(_get_cookie_string()) or headers
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
 
-            if response.status_code in (429, 503, 500) and attempt < retry_max:
-                if await fastapi_request.is_disconnected():
-                    return {"kind": "cancelled", "message": "客户端已断开连接。"}
-                stats.add_retry()
-                clean_http_err = _extract_clean_error_message(response.text)
-                print(f"⚠️ [Studio 假流式重试] 模型={base_model_name} | HTTP {response.status_code} | "
-                      f"第 {attempt+1}/{retry_max} 次重试，等待 {backoff_sec}s | 原因: {clean_http_err[:2000]}")
-                waited = 0.0
-                while waited < backoff_sec:
-                    step = min(0.5, backoff_sec - waited)
-                    await asyncio.sleep(step)
-                    waited += step
-                    if await fastapi_request.is_disconnected():
-                        return {"kind": "cancelled", "message": "客户端已断开连接。"}
-                continue
-
-            if response.status_code != 200:
-                clean_msg = _extract_clean_error_message(response.text)
-                diag = _diagnose_studio_error(clean_msg, response.status_code)
-                hint = ""
-                if (
-                    response.status_code in (401, 403)
-                    or _is_cookie_expired_error(clean_msg)
-                    or _is_project_error(clean_msg)
-                ):
-                    hint = _get_auth_or_project_hint(clean_msg, response.status_code)
-                return {
-                    "kind": "error",
-                    "message": f"HTTP {response.status_code}（{diag}）：{clean_msg}{hint}",
-                }
-
-            full_text, reasoning_text, retry_error, fatal_error, usage_meta = "", "", None, None, None
-            finish_raw, blocked_msg = None, None
-            safety_html = ""
-            sampler = _RawSampler()
-
-            class _F:
-                def __init__(self, t):
-                    self._t = t
-                async def aiter_text(self):
-                    yield self._t
-
-            async for obj in _iter_json_objects(_F(response.text)):
-                sampler.add(obj)
-                for et, data in _extract_from_results(obj):
-                    if et == "text":
-                        full_text += data
-                    elif et == "thought":
-                        reasoning_text += data
-                    elif et == "image":
-                        full_text += data
-                    elif et == "finish":
-                        finish_raw = data
-                    elif et == "safety":
-                        safety_html = _safety_html_if_enabled(data)
-                    elif et == "blocked":
-                        blocked_msg = data
-                    elif et == "usage":
-                        usage_meta = data
-                    elif et == "error":
-                        clean_em = _extract_clean_error_message(data)
-                        diag = _diagnose_studio_error(clean_em, 200)
-                        if _is_retryable_error(clean_em) and attempt < retry_max and not full_text.strip():
-                            retry_error = f"{diag} — {clean_em}"
-                            break
-                        hint = ""
-                        if _is_cookie_expired_error(clean_em) or _is_project_error(clean_em):
-                            hint = _get_auth_or_project_hint(clean_em, 200)
-                        fatal_error = f"{diag} — {clean_em}{hint}"
-
-            if retry_error and attempt < retry_max:
-                if await fastapi_request.is_disconnected():
-                    return {"kind": "cancelled", "message": "客户端已断开连接。"}
-                stats.add_retry()
-                print(f"⚠️ [Studio 假流式限流重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                      f"等待 {backoff_sec}s | 详情: {retry_error[:2000]}")
-                waited = 0.0
-                while waited < backoff_sec:
-                    step = min(0.5, backoff_sec - waited)
-                    await asyncio.sleep(step)
-                    waited += step
-                    if await fastapi_request.is_disconnected():
-                        return {"kind": "cancelled", "message": "客户端已断开连接。"}
-                continue
-
-            if fatal_error and not full_text.strip():
-                return {"kind": "error", "message": fatal_error}
-
-            if not full_text.strip():
-                detail = f"finishReason={finish_raw or '无'}"
-                if blocked_msg:
-                    detail += f"；promptFeedback 拦截：{blocked_msg}"
-                print(f"🔎 [Studio 诊断] 模型={base_model_name} 假流式无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
-                return {"kind": "error", "message": f"上游未返回图片或正文（{detail}）。已在运行日志记录原始响应样本。"}
-
-            if fatal_error:
-                full_text += f"\n\n[Studio 中途报错] {fatal_error}"
-
+        if response.status_code != 200:
+            clean_msg = _extract_clean_error_message(response.text)
+            diag = _diagnose_studio_error(clean_msg, response.status_code)
+            is_auth = (
+                response.status_code in (401, 403)
+                or _is_cookie_expired_error(clean_msg)
+                or _is_project_error(clean_msg)
+            )
+            hint = _get_auth_or_project_hint(clean_msg, response.status_code) if is_auth else ""
+            is_ret = (not is_auth) and (
+                response.status_code in (429, 500, 502, 503, 504) or _is_retryable_error(clean_msg)
+            )
             return {
-                "kind": "ok",
-                "full_text": full_text + safety_html,
-                "reasoning_text": "" if strip_thoughts else reasoning_text,
-                "finish_reason": _map_finish_reason(finish_raw),
-                "usage_meta": usage_meta,
+                "kind": "cookie_error" if is_auth else ("retryable_error" if is_ret else "fatal_error"),
+                "status_code": response.status_code,
+                "message": f"HTTP {response.status_code}（{diag}）：{clean_msg}{hint}",
             }
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            em = f"{type(e).__name__}: {e}"
-            if (_is_retryable_error(em) or "timeout" in em.lower()) and attempt < retry_max:
-                if await fastapi_request.is_disconnected():
-                    return {"kind": "cancelled", "message": "客户端已断开连接。"}
-                stats.add_retry()
-                print(f"⚠️ [Studio 假流式异常重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                      f"等待 {backoff_sec}s | 异常: {em[:2000]}")
-                waited = 0.0
-                while waited < backoff_sec:
-                    step = min(0.5, backoff_sec - waited)
-                    await asyncio.sleep(step)
-                    waited += step
-                    if await fastapi_request.is_disconnected():
-                        return {"kind": "cancelled", "message": "客户端已断开连接。"}
-                continue
-            return {"kind": "error", "message": f"Studio 代理请求异常（{em}）"}
-    return {"kind": "error", "message": f"模型 {base_model_name} 重试 {retry_max} 次后仍失败，请检查配额或网络。"}
 
+        full_text, reasoning_text, retry_error, fatal_error, auth_error, usage_meta = "", "", None, None, None, None
+        finish_raw, blocked_msg = None, None
+        safety_html = ""
+        sampler = _RawSampler()
 
-# ========== 主代理类 ==========
+        class _F:
+            def __init__(self, t):
+                self._t = t
+            async def aiter_text(self):
+                yield self._t
+
+        async for obj in _iter_json_objects(_F(response.text)):
+            sampler.add(obj)
+            for et, data in _extract_from_results(obj):
+                if et == "text":
+                    full_text += data
+                elif et == "thought":
+                    reasoning_text += data
+                elif et == "image":
+                    full_text += data
+                elif et == "finish":
+                    finish_raw = data
+                elif et == "safety":
+                    safety_html = _safety_html_if_enabled(data)
+                elif et == "blocked":
+                    blocked_msg = data
+                elif et == "usage":
+                    usage_meta = data
+                elif et == "error":
+                    clean_em = _extract_clean_error_message(data)
+                    diag = _diagnose_studio_error(clean_em, 200)
+                    if (_is_cookie_expired_error(clean_em) or _is_project_error(clean_em)) and not full_text.strip():
+                        hint = _get_auth_or_project_hint(clean_em, 200)
+                        auth_error = f"{diag} — {clean_em}{hint}"
+                        break
+                    if _is_retryable_error(clean_em) and not full_text.strip():
+                        retry_error = f"{diag} — {clean_em}"
+                        break
+                    fatal_error = f"{diag} — {clean_em}"
+
+        if auth_error and not full_text.strip():
+            return {"kind": "cookie_error", "status_code": 403, "message": auth_error}
+        if retry_error and not full_text.strip():
+            return {"kind": "retryable_error", "status_code": 503, "message": retry_error}
+        if fatal_error and not full_text.strip():
+            return {"kind": "fatal_error", "status_code": 400, "message": fatal_error}
+
+        if not full_text.strip():
+            detail = f"finishReason={finish_raw or '无'}"
+            if blocked_msg:
+                detail += f"；promptFeedback 拦截：{blocked_msg}"
+            print(f"🔎 [Studio 诊断] 模型={base_model_name} 假流式无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
+            return {
+                "kind": "empty_or_blocked",
+                "status_code": 400 if blocked_msg else 502,
+                "message": f"上游未返回图片或正文（{detail}，不可重试）。已在运行日志记录原始响应样本。",
+            }
+
+        if fatal_error:
+            full_text += f"\n\n[Studio 中途报错] {fatal_error}"
+
+        return {
+            "kind": "ok",
+            "full_text": full_text + safety_html,
+            "reasoning_text": "" if strip_thoughts else reasoning_text,
+            "finish_reason": _map_finish_reason(finish_raw),
+            "usage_meta": usage_meta,
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        em = f"{type(e).__name__}: {e}"
+        is_ret = (
+            isinstance(e, (httpx.TransportError, httpx.TimeoutException, TimeoutError, ConnectionError))
+            or _is_retryable_error(em)
+            or "timeout" in em.lower()
+        )
+        return {
+            "kind": "retryable_error" if is_ret else "fatal_error",
+            "status_code": 502 if is_ret else 500,
+            "message": f"Studio 代理请求异常（{em}）",
+        }
+
 
 class CookieProxyUpstream(BaseUpstream):
-    """
-    batchGraphql 直连代理
-    使用 Cookie + SAPISIDHASH 鉴权调用 batchGraphql 端点。
-    """
+    """batchGraphql 直连代理（支持与 Express API Key 跨通道互备轮询）。"""
 
-    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
-        try:
-            validate_request_schemas(request_obj)
-        except SchemaValidationError as exc:
-            print(f"❌ [Studio 参数校验失败] 模型={request_obj.model} | JSON Schema 不合法: {exc}")
-            return JSONResponse(status_code=400, content={
-                "error": {"message": str(exc), "type": "invalid_request_error", "code": 400}
-            })
-
-        # ===== 1. 验证认证 =====
+    def check_cookie_ready(self) -> tuple[bool, str, str, Optional[dict], int, str]:
+        """检查 Cookie 与 Project ID 是否已配置且包含 SAPISID。"""
         cookie_str = _get_cookie_string()
         if not cookie_str:
-            err_text = (
+            return False, "", "", None, 401, (
                 "未配置 Google Cookie。请在大盘「通道与凭证」页粘贴 Cookie 和 Project ID，"
                 "或设置环境变量 GOOGLE_COOKIE 和 GOOGLE_PROJECT_ID。"
             )
-            print(f"❌ [Studio 鉴权失败] 模型={request_obj.model} | {err_text}")
-            return JSONResponse(status_code=401, content={"error": {"message": err_text, "type": "auth_error"}})
-
         project_id = _get_project_id()
         if not project_id:
-            err_text = (
+            return False, cookie_str, "", None, 400, (
                 "未配置 Google Cloud Project ID。请在大盘「通道与凭证」页填写，"
                 "或直接粘贴含 ?project=xxx 的控制台 URL 自动提取。"
             )
-            print(f"❌ [Studio 配置缺失] 模型={request_obj.model} | {err_text}")
-            return JSONResponse(status_code=400, content={"error": {"message": err_text, "type": "config_error"}})
-
-        # ===== 2. 构建请求头 =====
         headers = build_headers(cookie_str)
         if not headers:
-            err_text = (
+            return False, cookie_str, project_id, None, 401, (
                 "当前配置的 Cookie 中缺少 SAPISID / __Secure-3PAPISID 字段，无法计算 SAPISIDHASH 认证头。"
                 "请确保从已登录的 console.cloud.google.com 复制完整 Request Cookie 头。"
             )
-            print(f"❌ [Studio 鉴权失败] 模型={request_obj.model} | {err_text}")
-            return JSONResponse(status_code=401, content={"error": {"message": err_text, "type": "auth_error"}})
+        return True, cookie_str, project_id, headers, 200, ""
 
-        # ===== 2.5 工具流量处理：原生函数调用 =====
+    async def execute_once(self, orig_request_obj: OpenAIRequest, fastapi_request: Request):
+        """执行单次 Cookie 通道请求（失败抛出 CookieAttemptError 交由外层统一调度器决定重试或切换 Key）。"""
+        validate_request_schemas(orig_request_obj)
+
+        ready, cookie_str, project_id, headers, err_code, err_text = self.check_cookie_ready()
+        if not ready:
+            raise CookieAttemptError(err_code, err_text, is_retryable=False, is_auth_or_billing=True)
+
+        request_obj = orig_request_obj.model_copy(deep=True)
         _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
         force_builtin_search = bool(_tool_info["builtin_search"])
         _choice_name = _normalized_tool_name(request_obj.tool_choice) if isinstance(request_obj.tool_choice, dict) else ""
         _forced_search = bool(_choice_name and _is_builtin_search_name(_choice_name))
         native_custom_tools = bool(_tool_info["custom_names"] or _tool_info["history"])
-        if force_builtin_search and _tool_info["custom_names"]:
-            if _forced_search:
-                print("🔎 [Studio] batchGraphql 不支持内建搜索与自定义函数混用；本轮按强制选择仅启用 googleSearch。")
-            else:
-                print("⚠️ [Studio] batchGraphql 不支持内建搜索与自定义函数混用；本轮优先启用自定义函数，忽略搜索声明。")
-        elif force_builtin_search:
-            print("🔎 [Studio] 请求声明了搜索类工具，已映射为 Studio 内建 googleSearch。")
-        if _tool_info["custom_names"] and not _forced_search:
-            print(f"🛠️ [Studio] 原生函数调用：{'、'.join(_tool_info['custom_names'][:5])}"
-                  f"{' 等' if len(_tool_info['custom_names']) > 5 else ''}。")
 
-        # ===== 3. 解析模型名 =====
         model_display = request_obj.model
-        base_model_name = model_display
-        if base_model_name.endswith("-search"):
-            base_model_name = base_model_name[:-len("-search")]
+        base_model_name = model_display[:-len("-search")] if model_display.endswith("-search") else model_display
 
-        # ===== 3.5 预填充智能兼容（支持按模型专属覆盖）=====
         _profile = mc.get_profile(base_model_name)
         prefill_text = ""
         prefill_active = False
@@ -1467,25 +1457,13 @@ class CookieProxyUpstream(BaseUpstream):
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})
-                print(_prefill_log(_prefill_mode, prefill_text))
-            elif prefill_text:
-                print(f"🩹 [预填充兼容] 该模型支持 model 结尾，预填充原生透传（{len(prefill_text)} 字），模型将直接续写。")
-            else:
-                print("ℹ️ [预填充兼容] 未检测到预填充（请求最后一条不是 assistant 消息）。"
-                      "预设里的思维链指令属于 system/user 条目，不是预填充；"
-                      "若要用预设思维链顶掉原生思考，需在预设末尾放一条 assistant 条目（通常是思考块的开标签）。")
-            if prefill_active and _inj_settings.get("prefill_suppress_thinking", True):
-                print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
-        # ===== 4. HTTP 客户端配置（read 600s，适配 gemini-4-argon 长思考）=====
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0),
             "follow_redirects": True,
         }
         if app_config.PROXY_URL:
             client_kwargs["proxy"] = app_config.PROXY_URL
-
-        retry_max, backoff_sec = get_retry_settings()
 
         is_stream = request_obj.stream
         response_id = f"chatcmpl-studio-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -1497,25 +1475,15 @@ class CookieProxyUpstream(BaseUpstream):
         _eff_settings = app_state.get_effective_settings(base_model_name)
         _tk = mc.resolve_thinking(base_model_name, request_obj, _eff_settings, prefill_active=prefill_active)
         strip_thoughts = bool(_tk.get("mode") and not _tk.get("include_thoughts", True))
-        if strip_thoughts and cookie_debug:
-            print("🔎 [Studio 调试] 已启用响应侧思考剥离（batchGraphql 不支持 includeThoughts=false）。")
-
-        msg_count = len(request_obj.messages)
-        print(f"→ [Studio] {base_model_name} (项目={project_id}) | {msg_count} 条消息 | {'流式' if is_stream else '非流式'}")
 
         is_image = _profile["is_image"]
         fake_stream_enabled = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
 
-        # ========== 生图流式 或 显式开启假流式（且无原生工具调用需求） ==========
+        # ---------- 1. 假流式（生图或开启假流式） ----------
         if is_stream and (is_image or (fake_stream_enabled and not native_custom_tools)):
-            async def studio_fake_stream():
+            async def studio_fake_stream_once():
                 if await fastapi_request.is_disconnected():
                     return
-                if is_image:
-                    print(f"🖼️ [生图保护] 图片模型 {base_model_name} 已自动切换为假流式输出（Cookie 通道），等待期间持续发送心跳。")
-                else:
-                    print(f"🌊 [Studio 假流式] 模型 {base_model_name} 已启用假流式保活模式，等待上游流式汇总期间持续发送心跳。")
-
                 try:
                     hb_interval = float(app_state.get_setting(
                         "fake_streaming_interval", app_config.FAKE_STREAMING_INTERVAL_SECONDS) or 1.0)
@@ -1524,22 +1492,18 @@ class CookieProxyUpstream(BaseUpstream):
                 hb_interval = max(0.5, hb_interval)
 
                 collect_task = asyncio.create_task(
-                    _collect_full_response(
+                    _collect_full_response_once(
                         project_id, base_model_name, request_obj, headers, client_kwargs,
-                        retry_max, backoff_sec, fastapi_request,
-                        prefill_active=prefill_active,
-                        force_search=force_builtin_search,
-                        strip_thoughts=strip_thoughts,
+                        fastapi_request, prefill_active=prefill_active,
+                        force_search=force_builtin_search, strip_thoughts=strip_thoughts,
                     )
                 )
-
                 try:
                     elapsed_hb = 0.0
                     while not collect_task.done():
                         await asyncio.sleep(0.5)
                         elapsed_hb += 0.5
                         if await fastapi_request.is_disconnected():
-                            print(f"ℹ️ [Studio] 假流式等待期间客户端已断开，正在取消 {base_model_name} 上游任务。")
                             collect_task.cancel()
                             try:
                                 await collect_task
@@ -1556,602 +1520,465 @@ class CookieProxyUpstream(BaseUpstream):
                                 "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": None}],
                             }
                             yield f"data: {json.dumps(keep_alive_data, ensure_ascii=False)}\n\n"
-
                     res = await collect_task
                 except asyncio.CancelledError:
                     if not collect_task.done():
                         collect_task.cancel()
                     raise
 
-                if res.get("kind") == "cancelled":
+                kind = res.get("kind")
+                if kind == "cancelled":
                     return
+                if kind != "ok":
+                    raise CookieAttemptError(
+                        res.get("status_code", 500),
+                        res.get("message", "生成失败"),
+                        is_retryable=(kind == "retryable_error"),
+                        is_auth_or_billing=(kind == "cookie_error"),
+                    )
 
                 yield _make_openai_chunk(response_id, model_display, role="assistant")
-                if res.get("kind") != "ok":
-                    stats.add_error()
-                    err_detail = res.get("message", "生成失败")
-                    print(f"❌ [Studio 假流式报错] 模型={base_model_name} (项目={project_id}) | 详情: {err_detail[:2000]}")
-                    yield _make_openai_chunk(response_id, model_display, content=f"[Studio 错误] {err_detail}")
-                    yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
-                    yield "data: [DONE]\n\n"
-                    return
-
                 full_text = res.get("full_text") or ""
                 if prefill_text:
                     full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
                 if res.get("reasoning_text"):
                     yield _make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
                 yield _make_openai_chunk(response_id, model_display, content=full_text or " ")
-                stats.add_success()
-                usage = _map_usage(res.get("usage_meta"))
+                usage = _record_studio_usage(res.get("usage_meta"))
                 if want_usage:
                     yield _make_usage_chunk(response_id, model_display, usage)
                 yield _make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
                 yield "data: [DONE]\n\n"
                 print(f"✅ [Studio] {base_model_name} | 假流式完成")
-            return StreamingResponse(studio_fake_stream(), media_type="text/event-stream")
 
-        # ========== 真流式处理 ==========
+            return StreamingResponse(studio_fake_stream_once(), media_type="text/event-stream")
+
+        # ---------- 2. 真流式 ----------
         if is_stream:
-            async def stream_generator():
-                nonlocal start_time
-
-                yield _sse_heartbeat()
+            async def stream_generator_once():
                 last_hb_ts = time.time()
                 native_fallback_state = {"latched": False}
 
-                for attempt in range(retry_max + 1):
-                    if await fastapi_request.is_disconnected():
-                        print("ℹ️ [Studio] 客户端已断开连接，停止流式重试。")
-                        return
-
-                    use_native_tools = not native_fallback_state["latched"]
-                    if use_native_tools:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search)
-                    else:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search, native_tools=False)
-                    fallback_body = None
-                    if native_custom_tools and use_native_tools:
-                        async def fallback_body():
-                            native_fallback_state["latched"] = True
-                            return await build_batch_graphql_body_async(
-                                project_id, base_model_name, request_obj,
-                                prefill_active=prefill_active,
-                                force_search=force_builtin_search, native_tools=False)
-                    req_headers = build_headers(_get_cookie_string()) or headers
-                    if cookie_debug:
-                        print(f"🔎 [Studio 调试] 出站 generationConfig: "
-                              f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
-
-                    async with httpx.AsyncClient(**client_kwargs) as client:
-                        has_yielded_to_client = False
-                        prefill_emitted = not bool(prefill_text)
-                        got_text = False
-                        got_thought = False
-                        got_tool_call = False
-                        tool_call_index = 0
-                        stream_ordinary_metadata = []
-                        stream_part_order = []
-                        should_retry = False
-                        error_to_raise = None
-                        usage_meta = None
-                        finish_raw = None
-                        blocked_msg = None
-                        sampler = _RawSampler()
-                        deduper = PrefillDeduper(prefill_text)
-                        fc_assembler = FunctionCallStreamAssembler()
-
-                        async for status, data in _execute_stream_request_generator(
-                            client, req_headers, body, sampler=sampler,
-                            fallback_body=fallback_body,
-                        ):
-                            if not has_yielded_to_client and await fastapi_request.is_disconnected():
-                                print("ℹ️ [Studio] 首包产出前客户端已断开，立即终止流式请求。")
-                                return
-
-                            if status == "thought":
-                                got_thought = True
-                                if strip_thoughts:
-                                    now_ts = time.time()
-                                    if now_ts - last_hb_ts >= 2.0:
-                                        last_hb_ts = now_ts
-                                        yield _sse_heartbeat()
-                                    continue
-
-                            if status == "function_call":
-                                completed_calls = fc_assembler.feed(
-                                    data,
-                                    thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
-                                )
-                                for c_item in completed_calls:
-                                    if not has_yielded_to_client:
-                                        print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
-                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                        has_yielded_to_client = True
-                                    tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
-                                    tool_payload["index"] = tool_call_index
-                                    stream_part_order.append({"type": "tool_call", "index": tool_call_index})
-                                    yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
-                                    tool_call_index += 1
-                                    got_tool_call = True
-
-                            elif status == "thought_signature":
-                                signature = _signature_bytes_from_wire(data.get("value"))
-                                extra = thought_signature_extra(signature, data.get("part_kind"))
-                                if extra:
-                                    if stream_ordinary_metadata:
-                                        stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(signature)
-                                    elif data.get("part_kind") == "signature_only":
-                                        stream_part_order.append({"type": "ordinary", "index": 0})
-                                        stream_ordinary_metadata.append(
-                                            ordinary_part_metadata("signature_only", "", signature))
-                                    google = extra.setdefault("google", {})
-                                    if stream_ordinary_metadata:
-                                        google["ordinary_parts"] = list(stream_ordinary_metadata)
-                                    if got_tool_call:
-                                        google["part_order"] = list(stream_part_order)
-                                    if not has_yielded_to_client:
-                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                        has_yielded_to_client = True
-                                    yield _make_openai_chunk(response_id, model_display, extra_content=extra)
-
-                            elif status in ("text", "thought", "image", "api_error_text"):
-                                if not has_yielded_to_client:
-                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
-                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                    has_yielded_to_client = True
-
-                                if status == "thought":
-                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                    stream_ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
-                                    yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
-                                elif status == "api_error_text":
-                                    print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:2000]}")
-                                    yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
-                                elif status == "image":
-                                    if prefill_text and not prefill_emitted:
-                                        prefill_emitted = True
-                                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                                    got_text = True
-                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                    stream_ordinary_metadata.append(ordinary_part_metadata("text", data, None))
-                                    yield _make_openai_chunk(response_id, model_display, content=data)
-                                else:
-                                    if prefill_text and not prefill_emitted:
-                                        prefill_emitted = True
-                                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                                    got_text = True
-                                    out = deduper.feed(data)
-                                    if out:
-                                        stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                        stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
-                                        yield _make_openai_chunk(response_id, model_display, content=out)
-
-                            elif status == "finish":
-                                finish_raw = data
-                            elif status == "safety":
-                                _sh = _safety_html_if_enabled(data)
-                                if _sh:
-                                    yield _make_openai_chunk(response_id, model_display, content=_sh)
-                            elif status == "usage":
-                                usage_meta = data
-                            elif status == "blocked":
-                                blocked_msg = data
-
-                            elif status == "cookie_error":
-                                if not has_yielded_to_client:
-                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                stats.add_error()
-                                print(f"❌ [Studio 鉴权/项目错误] 模型={base_model_name} (项目={project_id}) | {data[:2000]}")
-                                yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
-                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
-                                yield "data: [DONE]\n\n"
-                                return
-
-                            elif status in ("retryable_error", "fatal_error"):
-                                if not has_yielded_to_client and status == "retryable_error" and attempt < retry_max:
-                                    should_retry = True
-                                    error_to_raise = data
-                                    break
-                                else:
-                                    if not has_yielded_to_client:
-                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
-
-                                    err_prefix = "不可重试错误" if status == "fatal_error" else f"重试 {retry_max} 次后仍失败"
-                                    stats.add_error()
-                                    print(f"❌ [Studio {err_prefix}] 模型={base_model_name} (项目={project_id}) | {data[:2000]}")
-                                    yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
-                                    yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
-                                    yield "data: [DONE]\n\n"
-                                    return
-
-                        if should_retry:
-                            if await fastapi_request.is_disconnected():
-                                print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
-                                return
-                            wait_sec = backoff_sec
-                            stats.add_retry()
-                            print(f"⚠️ [Studio 限流退避] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                                  f"等待 {wait_sec}s | 原因: {error_to_raise[:2000]}")
-                            async for _hb in _sleep_with_heartbeat(wait_sec):
-                                if await fastapi_request.is_disconnected():
-                                    print("ℹ️ [Studio] 客户端已断开连接，取消后续重试。")
-                                    return
-                                yield _hb
-                            start_time = time.time()
-                            continue
-
-                        if not has_yielded_to_client:
-                            yield _make_openai_chunk(response_id, model_display, role="assistant")
-                            has_yielded_to_client = True
-                        if prefill_text and not prefill_emitted:
-                            prefill_emitted = True
-                            yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                        tail = deduper.flush()
-                        if tail:
-                            stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                            stream_ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
-                            yield _make_openai_chunk(response_id, model_display, content=tail)
-
-                        for c_item in fc_assembler.flush():
-                            tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
-                            tool_payload["index"] = tool_call_index
-                            stream_part_order.append({"type": "tool_call", "index": tool_call_index})
-                            yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
-                            tool_call_index += 1
-                            got_tool_call = True
-
-                        if got_text or got_tool_call:
-                            stats.add_success()
-                            if got_tool_call and stream_ordinary_metadata:
-                                google = {
-                                    "ordinary_parts": list(stream_ordinary_metadata),
-                                    "part_order": list(stream_part_order),
-                                }
-                                last_signed = next((item for item in reversed(stream_ordinary_metadata)
-                                                    if item.get("thought_signature")), None)
-                                if last_signed:
-                                    google["thought_signature"] = last_signed["thought_signature"]
-                                    google["thought_signature_part"] = last_signed["kind"]
-                                yield _make_openai_chunk(
-                                    response_id, model_display, extra_content={"google": google})
-                            yield _make_openai_chunk(
-                                response_id, model_display,
-                                finish_reason="tool_calls" if got_tool_call else _map_finish_reason(finish_raw))
-                        else:
-                            detail = f"finishReason={finish_raw or '无'}"
-                            if blocked_msg:
-                                detail += f"；promptFeedback 拦截：{blocked_msg}"
-                            desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
-                            hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
-                            stats.add_error()
-                            print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
-                            print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                            yield _make_openai_chunk(
-                                response_id, model_display,
-                                content=f"\n[Studio 提示] 上游{desc}（{detail}）。{hint}")
-                            filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
-                            yield _make_openai_chunk(response_id, model_display,
-                                                     finish_reason="content_filter" if filtered else "stop")
-
-                        usage = _map_usage(usage_meta)
-                        if want_usage:
-                            yield _make_usage_chunk(response_id, model_display, usage)
-
-                        yield "data: [DONE]\n\n"
-
-                        elapsed = time.time() - start_time
-                        if got_text or got_tool_call:
-                            print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
-                        return
-
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
-
-        # ========== 非流式处理 ==========
-        else:
-            native_fallback_state = {"latched": False}
-            for attempt in range(retry_max + 1):
                 if await fastapi_request.is_disconnected():
-                    print("ℹ️ [Studio] 客户端已断开连接，停止非流式重试。")
-                    return JSONResponse(status_code=499, content={
-                        "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                    })
-                try:
-                    use_native_tools = not native_fallback_state["latched"]
-                    if use_native_tools:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search)
-                    else:
-                        body = await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj, prefill_active=prefill_active,
-                            force_search=force_builtin_search, native_tools=False)
-                    fallback_body = None
-                    if native_custom_tools and use_native_tools:
-                        async def fallback_body():
-                            native_fallback_state["latched"] = True
-                            return await build_batch_graphql_body_async(
-                                project_id, base_model_name, request_obj,
-                                prefill_active=prefill_active,
-                                force_search=force_builtin_search, native_tools=False)
-                    req_headers = build_headers(_get_cookie_string()) or headers
-                    if cookie_debug:
-                        print(f"🔎 [Studio 调试] 出站 generationConfig: "
-                              f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
+                    return
 
-                    async with httpx.AsyncClient(**client_kwargs) as client:
-                        post_task = asyncio.create_task(
-                            client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
+                body = await build_batch_graphql_body_async(
+                    project_id, base_model_name, request_obj,
+                    prefill_active=prefill_active, force_search=force_builtin_search, native_tools=True,
+                )
+                fallback_body = None
+                if native_custom_tools:
+                    async def fallback_body():
+                        native_fallback_state["latched"] = True
+                        return await build_batch_graphql_body_async(
+                            project_id, base_model_name, request_obj,
+                            prefill_active=prefill_active, force_search=force_builtin_search, native_tools=False,
                         )
-                        while not post_task.done():
-                            await asyncio.sleep(0.5)
-                            if await fastapi_request.is_disconnected():
-                                print("ℹ️ [Studio] 非流式等待期间客户端已断开，取消上游请求。")
-                                post_task.cancel()
-                                try:
-                                    await post_task
-                                except (asyncio.CancelledError, Exception):
-                                    pass
-                                return JSONResponse(status_code=499, content={
-                                    "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                                })
-                        response = await post_task
+                req_headers = build_headers(_get_cookie_string()) or headers
+                if cookie_debug:
+                    print(f"🔎 [Studio 调试] 出站 generationConfig: "
+                          f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
 
-                        if fallback_body is not None and _native_tool_error_response(
-                                response.status_code, response.text):
-                            native_fallback_state["latched"] = True
-                            resolved_fallback = fallback_body()
-                            if hasattr(resolved_fallback, "__await__"):
-                                resolved_fallback = await resolved_fallback
-                            print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
-                            response = await client.post(
-                                BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback
-                            )
-                            fallback_body = None
-
-                    if response.status_code in (429, 503, 500):
-                        if attempt < retry_max:
-                            if await fastapi_request.is_disconnected():
-                                return JSONResponse(status_code=499, content={
-                                    "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                                })
-                            wait_sec = backoff_sec
-                            stats.add_retry()
-                            clean_http_err = _extract_clean_error_message(response.text)
-                            print(f"⚠️ [Studio 非流式重试] 模型={base_model_name} | HTTP {response.status_code} | "
-                                  f"第 {attempt+1}/{retry_max} 次重试，等待 {wait_sec}s | 原因: {clean_http_err[:2000]}")
-                            waited = 0.0
-                            while waited < wait_sec:
-                                step = min(0.5, wait_sec - waited)
-                                await asyncio.sleep(step)
-                                waited += step
-                                if await fastapi_request.is_disconnected():
-                                    print("ℹ️ [Studio] 非流式退避等待期间客户端已断开，停止重试。")
-                                    return JSONResponse(status_code=499, content={
-                                        "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                                    })
-                            continue
-
-                    if response.status_code != 200:
-                        elapsed = time.time() - start_time
-                        clean_msg = _extract_clean_error_message(response.text)
-                        diag = _diagnose_studio_error(clean_msg, response.status_code)
-                        hint = ""
-                        if (
-                            response.status_code in (401, 403)
-                            or _is_cookie_expired_error(clean_msg)
-                            or _is_project_error(clean_msg)
-                        ):
-                            hint = _get_auth_or_project_hint(clean_msg, response.status_code)
-                        full_err_msg = f"HTTP {response.status_code}（{diag}）：{clean_msg}{hint}"
-                        print(f"❌ [Studio 非流式报错] 模型={base_model_name} (项目={project_id}) | 耗时 {elapsed:.1f}s | {full_err_msg[:2000]}")
-                        return JSONResponse(status_code=response.status_code, content={
-                            "error": {"message": full_err_msg, "type": "upstream_error", "code": response.status_code}
-                        })
-
-                    full_text = ""
-                    reasoning_text = ""
-                    safety_html = ""
-                    tool_calls = []
-                    ordinary_metadata = []
-                    part_order = []
-                    message_extra = None
-                    retry_error = None
-                    fatal_error = None
+                async with httpx.AsyncClient(**client_kwargs) as client:
+                    has_yielded_to_client = False
+                    prefill_emitted = not bool(prefill_text)
+                    got_text = False
+                    got_thought = False
+                    got_tool_call = False
+                    tool_call_index = 0
+                    stream_ordinary_metadata = []
+                    stream_part_order = []
                     usage_meta = None
                     finish_raw = None
                     blocked_msg = None
                     sampler = _RawSampler()
+                    deduper = PrefillDeduper(prefill_text)
                     fc_assembler = FunctionCallStreamAssembler()
 
-                    class _FakeResponse:
-                        def __init__(self, text):
-                            self._text = text
-                        async def aiter_text(self):
-                            yield self._text
+                    async for status, data in _execute_stream_request_generator(
+                        client, req_headers, body, sampler=sampler, fallback_body=fallback_body,
+                    ):
+                        if not has_yielded_to_client and await fastapi_request.is_disconnected():
+                            return
 
-                    fake_resp = _FakeResponse(response.text)
-                    async for obj in _iter_json_objects(fake_resp):
-                        sampler.add(obj)
-                        for event_type, data in _extract_from_results(obj):
-                            if event_type == "text":
-                                full_text += data
-                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                ordinary_metadata.append(ordinary_part_metadata("text", data, None))
-                            elif event_type == "thought":
-                                reasoning_text += data
-                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
-                            elif event_type == "image":
-                                full_text += data
-                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                ordinary_metadata.append(ordinary_part_metadata("text", data, None))
-                            elif event_type == "function_call":
-                                for c_item in fc_assembler.feed(
-                                    data,
-                                    thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
-                                ):
-                                    part_order.append({"type": "tool_call", "index": len(tool_calls)})
-                                    tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
-                            elif event_type == "thought_signature":
-                                sig = _signature_bytes_from_wire(data.get("value"))
-                                if sig:
-                                    message_extra = thought_signature_extra(sig, data.get("part_kind"))
-                                    if ordinary_metadata:
-                                        ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(sig)
-                                    elif data.get("part_kind") == "signature_only":
-                                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                        ordinary_metadata.append(ordinary_part_metadata("signature_only", "", sig))
-                            elif event_type == "finish":
-                                finish_raw = data
-                            elif event_type == "safety":
-                                safety_html = _safety_html_if_enabled(data)
-                            elif event_type == "blocked":
-                                blocked_msg = data
-                            elif event_type == "usage":
-                                usage_meta = data
-                            elif event_type == "error":
-                                clean_em = _extract_clean_error_message(data)
-                                diag = _diagnose_studio_error(clean_em, 200)
-                                if _is_retryable_error(clean_em) and attempt < retry_max and not full_text.strip() and not tool_calls:
-                                    retry_error = f"{diag} — {clean_em}"
-                                    break
-                                hint = ""
-                                if _is_cookie_expired_error(clean_em) or _is_project_error(clean_em):
-                                    hint = _get_auth_or_project_hint(clean_em, 200)
-                                fatal_error = f"{diag} — {clean_em}{hint}"
+                        if status == "thought":
+                            got_thought = True
+                            if strip_thoughts:
+                                now_ts = time.time()
+                                if now_ts - last_hb_ts >= 2.0:
+                                    last_hb_ts = now_ts
+                                    yield _sse_heartbeat()
+                                continue
+
+                        if status == "function_call":
+                            completed_calls = fc_assembler.feed(
+                                data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
+                            )
+                            for c_item in completed_calls:
+                                if not has_yielded_to_client:
+                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
+                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                    has_yielded_to_client = True
+                                tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
+                                tool_payload["index"] = tool_call_index
+                                stream_part_order.append({"type": "tool_call", "index": tool_call_index})
+                                yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
+                                tool_call_index += 1
+                                got_tool_call = True
+
+                        elif status == "thought_signature":
+                            signature = _signature_bytes_from_wire(data.get("value"))
+                            extra = thought_signature_extra(signature, data.get("part_kind"))
+                            if extra:
+                                if stream_ordinary_metadata:
+                                    stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(signature)
+                                elif data.get("part_kind") == "signature_only":
+                                    stream_part_order.append({"type": "ordinary", "index": 0})
+                                    stream_ordinary_metadata.append(
+                                        ordinary_part_metadata("signature_only", "", signature))
+                                google = extra.setdefault("google", {})
+                                if stream_ordinary_metadata:
+                                    google["ordinary_parts"] = list(stream_ordinary_metadata)
+                                if got_tool_call:
+                                    google["part_order"] = list(stream_part_order)
+                                if not has_yielded_to_client:
+                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                    has_yielded_to_client = True
+                                yield _make_openai_chunk(response_id, model_display, extra_content=extra)
+
+                        elif status in ("text", "thought", "image", "api_error_text"):
+                            if not has_yielded_to_client:
+                                print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
+                                yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                has_yielded_to_client = True
+
+                            if status == "thought":
+                                stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                stream_ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
+                                yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
+                            elif status == "api_error_text":
+                                print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:2000]}")
+                                yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
+                            elif status == "image":
+                                if prefill_text and not prefill_emitted:
+                                    prefill_emitted = True
+                                    yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                                got_text = True
+                                stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                stream_ordinary_metadata.append(ordinary_part_metadata("text", data, None))
+                                yield _make_openai_chunk(response_id, model_display, content=data)
+                            else:
+                                if prefill_text and not prefill_emitted:
+                                    prefill_emitted = True
+                                    yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                                got_text = True
+                                out = deduper.feed(data)
+                                if out:
+                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                    stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
+                                    yield _make_openai_chunk(response_id, model_display, content=out)
+
+                        elif status == "finish":
+                            finish_raw = data
+                        elif status == "safety":
+                            _sh = _safety_html_if_enabled(data)
+                            if _sh:
+                                yield _make_openai_chunk(response_id, model_display, content=_sh)
+                        elif status == "usage":
+                            usage_meta = data
+                        elif status == "blocked":
+                            blocked_msg = data
+
+                        elif status == "cookie_error":
+                            if not has_yielded_to_client:
+                                raise CookieAttemptError(403, str(data), is_retryable=False, is_auth_or_billing=True)
+                            stats.add_error()
+                            yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
+                            yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                            yield "data: [DONE]\n\n"
+                            return
+
+                        elif status in ("retryable_error", "fatal_error"):
+                            if not has_yielded_to_client:
+                                raise CookieAttemptError(
+                                    503 if status == "retryable_error" else 400,
+                                    str(data),
+                                    is_retryable=(status == "retryable_error"),
+                                    is_auth_or_billing=False,
+                                )
+                            stats.add_error()
+                            yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
+                            yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                            yield "data: [DONE]\n\n"
+                            return
 
                     for c_item in fc_assembler.flush():
-                        part_order.append({"type": "tool_call", "index": len(tool_calls)})
-                        tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
+                        if not has_yielded_to_client:
+                            yield _make_openai_chunk(response_id, model_display, role="assistant")
+                            has_yielded_to_client = True
+                        tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
+                        tool_payload["index"] = tool_call_index
+                        stream_part_order.append({"type": "tool_call", "index": tool_call_index})
+                        yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
+                        tool_call_index += 1
+                        got_tool_call = True
 
-                    if retry_error and attempt < retry_max:
-                        if await fastapi_request.is_disconnected():
-                            return JSONResponse(status_code=499, content={
-                                "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                            })
-                        wait_sec = backoff_sec
-                        stats.add_retry()
-                        print(f"⚠️ [Studio 非流式限流重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                              f"等待 {wait_sec}s | 详情: {retry_error[:2000]}")
-                        waited = 0.0
-                        while waited < wait_sec:
-                            step = min(0.5, wait_sec - waited)
-                            await asyncio.sleep(step)
-                            waited += step
-                            if await fastapi_request.is_disconnected():
-                                print("ℹ️ [Studio] 非流式退避等待期间客户端已断开，停止重试。")
-                                return JSONResponse(status_code=499, content={
-                                    "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                                })
-                        continue
-
-                    got_text = bool(full_text.strip())
-                    got_output = got_text or bool(tool_calls)
-                    elapsed = time.time() - start_time
-
-                    if not got_output and fatal_error:
-                        err_status = 403 if (_is_cookie_expired_error(fatal_error) or _is_project_error(fatal_error)) else (
-                            429 if _is_retryable_error(fatal_error) else 400
-                        )
-                        print(f"❌ [Studio 非流式报错] 模型={base_model_name} (项目={project_id}) | HTTP {err_status} | "
-                              f"耗时 {elapsed:.1f}s | {fatal_error[:2000]}")
-                        return JSONResponse(status_code=err_status, content={
-                            "error": {"message": fatal_error, "type": "upstream_error", "code": err_status}
-                        })
-
-                    if got_output:
-                        if fatal_error:
-                            full_text += f"\n\n[Studio 中途报错] {fatal_error}"
-                        if prefill_text and got_text:
-                            full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
-                        finish_reason = "tool_calls" if tool_calls else _map_finish_reason(finish_raw)
-                        stats.add_success()
-                        print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
-                    else:
+                    if not got_text and not got_tool_call:
                         detail = f"finishReason={finish_raw or '无'}"
                         if blocked_msg:
                             detail += f"；promptFeedback 拦截：{blocked_msg}"
-                        desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
-                        hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
-                        stats.add_error()
-                        print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 耗时 {elapsed:.1f}s | 建议：{hint}")
+                        desc = "只返回了思考、未返回正文" if got_thought else "未返回任何内容"
+                        hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
+                        print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                        full_text = f"[Studio 提示] 上游{desc}（{detail}）。{hint}"
-                        filtered = bool(blocked_msg) or ((finish_raw or "").upper() in _FINISH_FILTERED)
-                        finish_reason = "content_filter" if filtered else "stop"
+                        raise CookieAttemptError(
+                            400 if blocked_msg else 502,
+                            f"上游{desc}（{detail}，不可重试）。{hint}",
+                            is_retryable=False,
+                            is_auth_or_billing=False,
+                        )
 
-                    usage = _map_usage(usage_meta)
+                    if prefill_text and not prefill_emitted:
+                        prefill_emitted = True
+                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                    tail = deduper.flush()
+                    if tail:
+                        stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                        stream_ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
+                        yield _make_openai_chunk(response_id, model_display, content=tail)
 
-                    content_value = full_text + safety_html
-                    message_obj = {"role": "assistant", "content": content_value if content_value else None}
-                    if reasoning_text and not strip_thoughts:
-                        message_obj["reasoning_content"] = reasoning_text
-                    if tool_calls:
-                        message_obj["tool_calls"] = tool_calls
-                    if ordinary_metadata:
-                        if message_extra is None:
-                            message_extra = {"google": {}}
-                        google = message_extra.setdefault("google", {})
-                        google["ordinary_parts"] = ordinary_metadata
-                        if tool_calls:
-                            google["part_order"] = part_order
-                    if message_extra:
-                        message_obj["extra_content"] = message_extra
+                    if got_tool_call and stream_ordinary_metadata:
+                        google = {
+                            "ordinary_parts": list(stream_ordinary_metadata),
+                            "part_order": list(stream_part_order),
+                        }
+                        last_signed = next((item for item in reversed(stream_ordinary_metadata)
+                                            if item.get("thought_signature")), None)
+                        if last_signed:
+                            google["thought_signature"] = last_signed["thought_signature"]
+                            google["thought_signature_part"] = last_signed["kind"]
+                        yield _make_openai_chunk(
+                            response_id, model_display, extra_content={"google": google})
+                    yield _make_openai_chunk(
+                        response_id, model_display,
+                        finish_reason="tool_calls" if got_tool_call else _map_finish_reason(finish_raw))
 
-                    return JSONResponse(content={
-                        "id": response_id,
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model_display,
-                        "choices": [{
-                            "index": 0,
-                            "message": message_obj,
-                            "finish_reason": finish_reason,
-                        }],
-                        "usage": usage,
-                    })
+                    usage = _record_studio_usage(usage_meta)
+                    if want_usage:
+                        yield _make_usage_chunk(response_id, model_display, usage)
 
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    err_msg = f"{type(e).__name__}: {e}"
-                    is_retryable = _is_retryable_error(err_msg) or "timeout" in err_msg.lower()
-
-                    if is_retryable and attempt < retry_max:
-                        if await fastapi_request.is_disconnected():
-                            return JSONResponse(status_code=499, content={
-                                "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                            })
-                        wait_sec = backoff_sec
-                        stats.add_retry()
-                        print(f"⚠️ [Studio 非流式异常重试] 模型={base_model_name} | 第 {attempt+1}/{retry_max} 次重试，"
-                              f"等待 {wait_sec}s | 异常: {err_msg[:2000]}")
-                        waited = 0.0
-                        while waited < wait_sec:
-                            step = min(0.5, wait_sec - waited)
-                            await asyncio.sleep(step)
-                            waited += step
-                            if await fastapi_request.is_disconnected():
-                                print("ℹ️ [Studio] 非流式退避等待期间客户端已断开，停止重试。")
-                                return JSONResponse(status_code=499, content={
-                                    "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
-                                })
-                        continue
-
+                    yield "data: [DONE]\n\n"
                     elapsed = time.time() - start_time
-                    print(f"❌ [Studio 非流式异常] 模型={base_model_name} (项目={project_id}) | 耗时 {elapsed:.1f}s | {err_msg[:2000]}")
-                    print(traceback.format_exc())
-                    return JSONResponse(status_code=500, content={
-                        "error": {"message": f"Studio 代理异常: {err_msg}", "type": "proxy_error"}
-                    })
+                    print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
 
+            return StreamingResponse(stream_generator_once(), media_type="text/event-stream")
+
+        # ---------- 3. 非流式 ----------
+        try:
+            body = await build_batch_graphql_body_async(
+                project_id, base_model_name, request_obj,
+                prefill_active=prefill_active, force_search=force_builtin_search, native_tools=True,
+            )
+            req_headers = build_headers(_get_cookie_string()) or headers
+            if cookie_debug:
+                print(f"🔎 [Studio 调试] 出站 generationConfig: "
+                      f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
+
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                post_task = asyncio.create_task(
+                    client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
+                )
+                while not post_task.done():
+                    await asyncio.sleep(0.5)
+                    if await fastapi_request.is_disconnected():
+                        post_task.cancel()
+                        try:
+                            await post_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        return JSONResponse(status_code=499, content={
+                            "error": {"message": "客户端已断开连接，请求已取消。", "type": "client_closed_request"}
+                        })
+                response = await post_task
+
+                if native_custom_tools and _native_tool_error_response(response.status_code, response.text):
+                    resolved_fallback = await build_batch_graphql_body_async(
+                        project_id, base_model_name, request_obj,
+                        prefill_active=prefill_active, force_search=force_builtin_search, native_tools=False,
+                    )
+                    print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；已自动降级为文本工具观测。")
+                    response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback)
+
+            if response.status_code != 200:
+                clean_msg = _extract_clean_error_message(response.text)
+                diag = _diagnose_studio_error(clean_msg, response.status_code)
+                is_auth = (
+                    response.status_code in (401, 403)
+                    or _is_cookie_expired_error(clean_msg)
+                    or _is_project_error(clean_msg)
+                )
+                hint = _get_auth_or_project_hint(clean_msg, response.status_code) if is_auth else ""
+                is_ret = (not is_auth) and (
+                    response.status_code in (429, 500, 502, 503, 504) or _is_retryable_error(clean_msg)
+                )
+                raise CookieAttemptError(
+                    response.status_code,
+                    f"HTTP {response.status_code}（{diag}）：{clean_msg}{hint}",
+                    is_retryable=is_ret,
+                    is_auth_or_billing=is_auth,
+                )
+
+            full_text, reasoning_text, safety_html = "", "", ""
+            tool_calls, ordinary_metadata, part_order = [], [], []
+            message_extra, retry_error, fatal_error, auth_error = None, None, None, None
+            usage_meta, finish_raw, blocked_msg = None, None, None
+            sampler = _RawSampler()
+            fc_assembler = FunctionCallStreamAssembler()
+
+            class _FakeResponse:
+                def __init__(self, text):
+                    self._text = text
+                async def aiter_text(self):
+                    yield self._text
+
+            async for obj in _iter_json_objects(_FakeResponse(response.text)):
+                sampler.add(obj)
+                for event_type, data in _extract_from_results(obj):
+                    if event_type == "text":
+                        full_text += data
+                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                        ordinary_metadata.append(ordinary_part_metadata("text", data, None))
+                    elif event_type == "thought":
+                        reasoning_text += data
+                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                        ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
+                    elif event_type == "image":
+                        full_text += data
+                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                        ordinary_metadata.append(ordinary_part_metadata("text", data, None))
+                    elif event_type == "function_call":
+                        for c_item in fc_assembler.feed(
+                            data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
+                        ):
+                            part_order.append({"type": "tool_call", "index": len(tool_calls)})
+                            tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
+                    elif event_type == "thought_signature":
+                        sig = _signature_bytes_from_wire(data.get("value"))
+                        if sig:
+                            message_extra = thought_signature_extra(sig, data.get("part_kind"))
+                            if ordinary_metadata:
+                                ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(sig)
+                            elif data.get("part_kind") == "signature_only":
+                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                                ordinary_metadata.append(ordinary_part_metadata("signature_only", "", sig))
+                    elif event_type == "finish":
+                        finish_raw = data
+                    elif event_type == "safety":
+                        safety_html = _safety_html_if_enabled(data)
+                    elif event_type == "blocked":
+                        blocked_msg = data
+                    elif event_type == "usage":
+                        usage_meta = data
+                    elif event_type == "error":
+                        clean_em = _extract_clean_error_message(data)
+                        diag = _diagnose_studio_error(clean_em, 200)
+                        if (_is_cookie_expired_error(clean_em) or _is_project_error(clean_em)) and not full_text.strip() and not tool_calls:
+                            hint = _get_auth_or_project_hint(clean_em, 200)
+                            auth_error = f"{diag} — {clean_em}{hint}"
+                            break
+                        if _is_retryable_error(clean_em) and not full_text.strip() and not tool_calls:
+                            retry_error = f"{diag} — {clean_em}"
+                            break
+                        fatal_error = f"{diag} — {clean_em}"
+
+            for c_item in fc_assembler.flush():
+                part_order.append({"type": "tool_call", "index": len(tool_calls)})
+                tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
+
+            got_text = bool(full_text.strip())
+            got_output = got_text or bool(tool_calls)
+
+            if not got_output:
+                if auth_error:
+                    raise CookieAttemptError(403, auth_error, is_retryable=False, is_auth_or_billing=True)
+                if retry_error:
+                    raise CookieAttemptError(503, retry_error, is_retryable=True, is_auth_or_billing=False)
+                if fatal_error:
+                    raise CookieAttemptError(400, fatal_error, is_retryable=False, is_auth_or_billing=False)
+
+                detail = f"finishReason={finish_raw or '无'}"
+                if blocked_msg:
+                    detail += f"；promptFeedback 拦截：{blocked_msg}"
+                desc = "只返回了思考、未返回正文" if reasoning_text else "未返回任何内容"
+                hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
+                print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
+                print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
+                raise CookieAttemptError(
+                    400 if blocked_msg else 502,
+                    f"上游{desc}（{detail}，不可重试）。{hint}",
+                    is_retryable=False,
+                    is_auth_or_billing=False,
+                )
+
+            if fatal_error:
+                full_text += f"\n\n[Studio 中途报错] {fatal_error}"
+            if prefill_text and got_text:
+                full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
+            finish_reason = "tool_calls" if tool_calls else _map_finish_reason(finish_raw)
             elapsed = time.time() - start_time
-            print(f"❌ [Studio 重试耗尽] 模型={base_model_name} (项目={project_id}) | 重试 {retry_max} 次后仍被限流 | 耗时 {elapsed:.1f}s")
-            return JSONResponse(status_code=429, content={
-                "error": {"message": f"模型 {base_model_name} 请求被限流（429），已重试 {retry_max} 次仍失败，请稍后再试。", "type": "rate_limit_error"}
+            print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
+
+            usage = _record_studio_usage(usage_meta)
+            content_value = full_text + safety_html
+            message_obj = {"role": "assistant", "content": content_value if content_value else None}
+            if reasoning_text and not strip_thoughts:
+                message_obj["reasoning_content"] = reasoning_text
+            if tool_calls:
+                message_obj["tool_calls"] = tool_calls
+            if ordinary_metadata:
+                if message_extra is None:
+                    message_extra = {"google": {}}
+                google = message_extra.setdefault("google", {})
+                google["ordinary_parts"] = ordinary_metadata
+                if tool_calls:
+                    google["part_order"] = part_order
+            if message_extra:
+                message_obj["extra_content"] = message_extra
+
+            return JSONResponse(content={
+                "id": response_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model_display,
+                "choices": [{
+                    "index": 0,
+                    "message": message_obj,
+                    "finish_reason": finish_reason,
+                }],
+                "usage": usage,
             })
+
+        except ( asyncio.CancelledError, CookieAttemptError ):
+            raise
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            is_ret = (
+                isinstance(e, (httpx.TransportError, httpx.TimeoutException, TimeoutError, ConnectionError))
+                or _is_retryable_error(err_msg)
+                or "timeout" in err_msg.lower()
+            )
+            raise CookieAttemptError(
+                502 if is_ret else 500,
+                f"Studio 代理异常: {err_msg}",
+                is_retryable=is_ret,
+                is_auth_or_billing=False,
+            )
+
+    async def chat_completions(self, request_obj: OpenAIRequest, fastapi_request: Request):
+        from api_helpers import execute_unified_completion
+        return await execute_unified_completion(
+            request_obj=request_obj,
+            fastapi_request=fastapi_request,
+            primary_channel="cookie",
+            cookie_upstream=self,
+        )
