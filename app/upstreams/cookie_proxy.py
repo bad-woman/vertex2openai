@@ -46,6 +46,13 @@ from logger import stats
 from api_helpers import get_retry_settings
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
+from synthetic_wrapper import (
+    SyntheticSandboxSpec,
+    build_emit_tool_declaration,
+    create_sandbox_spec,
+    extract_synthetic_content,
+    make_bad_woman_response_id,
+)
 
 from cookie_auth import (
     build_headers,
@@ -609,7 +616,12 @@ def _attach_message_signature(parts: list[dict], message: Any) -> None:
     target["thoughtSignature"] = encoded
 
 
-def _convert_messages_to_contents(messages: list, model_name: str = "", native_tools: bool = True) -> tuple:
+def _convert_messages_to_contents(
+    messages: list,
+    model_name: str = "",
+    native_tools: bool = True,
+    sandbox_spec: Optional[SyntheticSandboxSpec] = None,
+) -> tuple:
     contents = []
     system_parts = []
     require_sig = _requires_signature(model_name)
@@ -624,7 +636,6 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
     for msg in messages:
         role = msg.role
         content = msg.content
-
         if role == "system":
             if isinstance(content, str):
                 system_parts.append(content)
@@ -738,13 +749,25 @@ def _convert_messages_to_contents(messages: list, model_name: str = "", native_t
     return merged, system_text
 
 
-async def build_batch_graphql_body_async(project_id: str, model_name: str,
-                                         request: OpenAIRequest,
-                                         prefill_active: bool = False,
-                                         force_search: bool = False,
-                                         native_tools: bool = True) -> dict:
-    return await asyncio.to_thread(_build_batch_graphql_body, project_id, model_name,
-                                   request, prefill_active, force_search, native_tools)
+async def build_batch_graphql_body_async(
+    project_id: str,
+    model_name: str,
+    request: OpenAIRequest,
+    prefill_active: bool = False,
+    force_search: bool = False,
+    native_tools: bool = True,
+    sandbox_spec: Optional[SyntheticSandboxSpec] = None,
+) -> dict:
+    return await asyncio.to_thread(
+        _build_batch_graphql_body,
+        project_id,
+        model_name,
+        request,
+        prefill_active,
+        force_search,
+        native_tools,
+        sandbox_spec,
+    )
 
 
 def _build_batch_graphql_body(
@@ -754,9 +777,11 @@ def _build_batch_graphql_body(
     prefill_active: bool = False,
     force_search: bool = False,
     native_tools: bool = True,
+    sandbox_spec: Optional[SyntheticSandboxSpec] = None,
 ) -> dict:
     contents, system_text = _convert_messages_to_contents(
-        request.messages, model_name=model_name, native_tools=native_tools)
+        request.messages, model_name=model_name, native_tools=native_tools, sandbox_spec=sandbox_spec
+    )
     model_path = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
 
     settings = app_state.get_effective_settings(model_name)
@@ -795,6 +820,14 @@ def _build_batch_graphql_body(
             if mv is None:
                 mv = settings.get("default_max_tokens")
             if mv is not None:
+                if "gemini-4-argon" in (model_name or "").lower():
+                    _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
+                    _is_real_stream = bool(request.stream and not _fake_on and not profile["is_image"])
+                    _argon_cap = 65536 if _is_real_stream else 32768
+                    try:
+                        mv = min(int(mv), _argon_cap)
+                    except (TypeError, ValueError):
+                        pass
                 gen_config["maxOutputTokens"] = mv
 
         thinking_config = _build_thinking_config(model_name, request, prefill_active=prefill_active)
@@ -851,7 +884,27 @@ def _build_batch_graphql_body(
         elif _wants_search and profile["supports_search"]:
             use_google_search = True
 
-    if selected_declarations:
+    active_sandbox = bool(native_tools and sandbox_spec and sandbox_spec.enabled and not profile["is_image"])
+    if active_sandbox:
+        base_decls = [] if sandbox_spec.strip_client_tools else list(declarations)
+        s_decl = build_emit_tool_declaration(
+            sandbox_spec.emit_tool_name,
+            prefill_text=sandbox_spec.prefill_text,
+            has_prefill=sandbox_spec.has_prefill,
+        )
+        base_decls.append({
+            "name": s_decl["name"],
+            "description": s_decl["description"],
+            "parameters": _cookie_ui_schema(s_decl["parameters"]),
+        })
+        fc_cfg: Dict[str, Any] = {"mode": "ANY"}
+        if not sandbox_spec.real_tool_names:
+            fc_cfg["allowedFunctionNames"] = [sandbox_spec.emit_tool_name]
+        variables["tools"] = [{"functionDeclarations": base_decls}]
+        variables["toolConfig"] = {
+            "functionCallingConfig": fc_cfg,
+        }
+    elif selected_declarations:
         variables["tools"] = [{"functionDeclarations": selected_declarations}]
         function_names = [item["name"] for item in selected_declarations]
         variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names)
@@ -1272,7 +1325,8 @@ async def _execute_stream_request_generator(
 async def _collect_full_response_once(
     project_id, base_model_name, request_obj, headers, client_kwargs,
     fastapi_request, prefill_active: bool = False,
-    force_search: bool = False, strip_thoughts: bool = False
+    force_search: bool = False, strip_thoughts: bool = False,
+    sandbox_spec: Optional[SyntheticSandboxSpec] = None,
 ) -> dict:
     """单次取回 batchGraphql 完整响应（供假流式与生图使用，重试交由外层统一调度器）。"""
     if await fastapi_request.is_disconnected():
@@ -1280,7 +1334,9 @@ async def _collect_full_response_once(
     try:
         body = await build_batch_graphql_body_async(
             project_id, base_model_name, request_obj,
-            prefill_active=prefill_active, force_search=force_search)
+            prefill_active=prefill_active, force_search=force_search,
+            sandbox_spec=sandbox_spec,
+        )
         req_headers = build_headers(_get_cookie_string()) or headers
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
@@ -1307,6 +1363,9 @@ async def _collect_full_response_once(
         finish_raw, blocked_msg = None, None
         safety_html = ""
         sampler = _RawSampler()
+        synth_tool_name = sandbox_spec.emit_tool_name if (sandbox_spec and sandbox_spec.enabled) else ""
+        fc_assembler = FunctionCallStreamAssembler(synthetic_tool_name=synth_tool_name)
+        synth_text = ""
 
         class _F:
             def __init__(self, t):
@@ -1323,6 +1382,10 @@ async def _collect_full_response_once(
                     reasoning_text += data
                 elif et == "image":
                     full_text += data
+                elif et == "function_call":
+                    _, s_delta, _ = fc_assembler.feed_with_synthetic(data)
+                    if s_delta:
+                        synth_text += s_delta
                 elif et == "finish":
                     finish_raw = data
                 elif et == "safety":
@@ -1343,6 +1406,12 @@ async def _collect_full_response_once(
                         break
                     fatal_error = f"{diag} — {clean_em}"
 
+        for c_item in fc_assembler.flush():
+            if synth_tool_name and c_item.get("name") == synth_tool_name:
+                synth_text += extract_synthetic_content(c_item.get("args"))
+        if synth_text:
+            full_text = synth_text
+
         if auth_error and not full_text.strip():
             return {"kind": "cookie_error", "status_code": 403, "message": auth_error}
         if retry_error and not full_text.strip():
@@ -1355,10 +1424,11 @@ async def _collect_full_response_once(
             if blocked_msg:
                 detail += f"；promptFeedback 拦截：{blocked_msg}"
             print(f"🔎 [Studio 诊断] 模型={base_model_name} 假流式无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
+            is_synth_retry = bool(synth_tool_name and not blocked_msg)
             return {
-                "kind": "empty_or_blocked",
+                "kind": "retryable_error" if is_synth_retry else "empty_or_blocked",
                 "status_code": 400 if blocked_msg else 502,
-                "message": f"上游未返回图片或正文（{detail}，不可重试）。已在运行日志记录原始响应样本。",
+                "message": f"上游未返回图片或正文（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。已在运行日志记录原始响应样本。",
             }
 
         if fatal_error:
@@ -1447,16 +1517,29 @@ class CookieProxyUpstream(BaseUpstream):
         if _injected is not request_obj.messages:
             request_obj = request_obj.model_copy(update={"messages": _injected})
 
+        sandbox_spec = create_sandbox_spec(base_model_name, request_obj, _inj_settings)
+        synth_tool_name = sandbox_spec.emit_tool_name if sandbox_spec.enabled else ""
+
         _prefill_mode = _inj_settings.get("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
-        if _prefill_mode != "off":
+        if _prefill_mode != "off" or synth_tool_name:
             _new_msgs, prefill_text, prefill_active = apply_prefill_compat(
-                request_obj.messages, _prefill_mode,
+                request_obj.messages,
+                _prefill_mode,
                 allow_model_last=not _profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
                 cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not _profile["is_image"],
+                synthetic_tool_name=synth_tool_name,
+                has_callable_client_tools=bool(sandbox_spec.real_tool_names),
             )
             if _new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": _new_msgs})
+
+        sandbox_spec.prefill_text = prefill_text or ""
+        sandbox_spec.has_prefill = bool(prefill_active)
+        if sandbox_spec.enabled:
+            print(
+                f"🛡️ [抗截断] Studio(Cookie) 通道已启用工具传输 | 工具={sandbox_spec.emit_tool_name}"
+            )
 
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0),
@@ -1466,11 +1549,13 @@ class CookieProxyUpstream(BaseUpstream):
             client_kwargs["proxy"] = app_config.PROXY_URL
 
         is_stream = request_obj.stream
-        response_id = f"chatcmpl-studio-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        response_id = make_bad_woman_response_id(
+            default_prefix="chatcmpl-studio",
+            sandbox_enabled=sandbox_spec.enabled,
+        )
         start_time = time.time()
         want_usage = _wants_usage(request_obj)
-        cookie_debug = bool(app_state.get_setting("debug_outbound", False)
-                            or app_state.get_setting("cookie_debug", False))
+        debug_outbound = bool(app_state.get_setting("debug_outbound", False))
 
         _eff_settings = app_state.get_effective_settings(base_model_name)
         _tk = mc.resolve_thinking(base_model_name, request_obj, _eff_settings, prefill_active=prefill_active)
@@ -1496,6 +1581,7 @@ class CookieProxyUpstream(BaseUpstream):
                         project_id, base_model_name, request_obj, headers, client_kwargs,
                         fastapi_request, prefill_active=prefill_active,
                         force_search=force_builtin_search, strip_thoughts=strip_thoughts,
+                        sandbox_spec=sandbox_spec,
                     )
                 )
                 try:
@@ -1564,20 +1650,34 @@ class CookieProxyUpstream(BaseUpstream):
 
                 body = await build_batch_graphql_body_async(
                     project_id, base_model_name, request_obj,
-                    prefill_active=prefill_active, force_search=force_builtin_search, native_tools=True,
+                    prefill_active=prefill_active, force_search=force_builtin_search,
+                    native_tools=True, sandbox_spec=sandbox_spec,
                 )
                 fallback_body = None
-                if native_custom_tools:
+                if native_custom_tools or sandbox_spec.enabled:
                     async def fallback_body():
                         native_fallback_state["latched"] = True
                         return await build_batch_graphql_body_async(
                             project_id, base_model_name, request_obj,
-                            prefill_active=prefill_active, force_search=force_builtin_search, native_tools=False,
+                            prefill_active=prefill_active, force_search=force_builtin_search,
+                            native_tools=False, sandbox_spec=None,
                         )
                 req_headers = build_headers(_get_cookie_string()) or headers
-                if cookie_debug:
-                    print(f"🔎 [Studio 调试] 出站 generationConfig: "
-                          f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
+                if debug_outbound:
+                    from api_helpers import print_outbound_debug_report
+                    outbound_cfg = dict(body["variables"].get("generationConfig", {}))
+                    if "tools" in body["variables"]:
+                        outbound_cfg["tools"] = body["variables"]["tools"]
+                    if "toolConfig" in body["variables"]:
+                        outbound_cfg["toolConfig"] = body["variables"]["toolConfig"]
+                    print_outbound_debug_report(
+                        channel="Studio(Cookie)",
+                        model_name=base_model_name,
+                        gen_config_dict=outbound_cfg,
+                        messages=request_obj.messages,
+                        prefill_text=prefill_text,
+                        sandbox_spec=sandbox_spec,
+                    )
 
                 async with httpx.AsyncClient(**client_kwargs) as client:
                     has_yielded_to_client = False
@@ -1593,7 +1693,7 @@ class CookieProxyUpstream(BaseUpstream):
                     blocked_msg = None
                     sampler = _RawSampler()
                     deduper = PrefillDeduper(prefill_text)
-                    fc_assembler = FunctionCallStreamAssembler()
+                    fc_assembler = FunctionCallStreamAssembler(synthetic_tool_name=synth_tool_name)
 
                     async for status, data in _execute_stream_request_generator(
                         client, req_headers, body, sampler=sampler, fallback_body=fallback_body,
@@ -1611,9 +1711,25 @@ class CookieProxyUpstream(BaseUpstream):
                                 continue
 
                         if status == "function_call":
-                            completed_calls = fc_assembler.feed(
+                            completed_calls, synth_delta, synth_sig = fc_assembler.feed_with_synthetic(
                                 data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
                             )
+                            if synth_delta:
+                                if not has_yielded_to_client:
+                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
+                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                    has_yielded_to_client = True
+                                if prefill_text and not prefill_emitted:
+                                    prefill_emitted = True
+                                    yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                                got_text = True
+                                out = deduper.feed(synth_delta)
+                                if out:
+                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                                    stream_ordinary_metadata.append(ordinary_part_metadata("text", out, synth_sig))
+                                    yield _make_openai_chunk(response_id, model_display, content=out)
+                            elif synth_sig and stream_ordinary_metadata:
+                                stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(synth_sig)
                             for c_item in completed_calls:
                                 if not has_yielded_to_client:
                                     print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
@@ -1647,6 +1763,8 @@ class CookieProxyUpstream(BaseUpstream):
                                 yield _make_openai_chunk(response_id, model_display, extra_content=extra)
 
                         elif status in ("text", "thought", "image", "api_error_text"):
+                            if status == "text" and fc_assembler.synthetic_hit:
+                                continue
                             if not has_yielded_to_client:
                                 print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
                                 yield _make_openai_chunk(response_id, model_display, role="assistant")
@@ -1731,10 +1849,11 @@ class CookieProxyUpstream(BaseUpstream):
                         hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
                         print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
+                        is_synth_retry = bool(synth_tool_name and not blocked_msg)
                         raise CookieAttemptError(
                             400 if blocked_msg else 502,
-                            f"上游{desc}（{detail}，不可重试）。{hint}",
-                            is_retryable=False,
+                            f"上游{desc}（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。{hint}",
+                            is_retryable=is_synth_retry,
                             is_auth_or_billing=False,
                         )
 
@@ -1769,7 +1888,7 @@ class CookieProxyUpstream(BaseUpstream):
 
                     yield "data: [DONE]\n\n"
                     elapsed = time.time() - start_time
-                    if cookie_debug:
+                    if debug_outbound:
                         print(f"🔎 [Studio 尾包原始结构] {sampler.dump()}")
                     print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
 
@@ -1779,12 +1898,25 @@ class CookieProxyUpstream(BaseUpstream):
         try:
             body = await build_batch_graphql_body_async(
                 project_id, base_model_name, request_obj,
-                prefill_active=prefill_active, force_search=force_builtin_search, native_tools=True,
+                prefill_active=prefill_active, force_search=force_builtin_search,
+                native_tools=True, sandbox_spec=sandbox_spec,
             )
             req_headers = build_headers(_get_cookie_string()) or headers
-            if cookie_debug:
-                print(f"🔎 [Studio 调试] 出站 generationConfig: "
-                      f"{json.dumps(body['variables'].get('generationConfig', {}), ensure_ascii=False)}")
+            if debug_outbound:
+                from api_helpers import print_outbound_debug_report
+                outbound_cfg = dict(body["variables"].get("generationConfig", {}))
+                if "tools" in body["variables"]:
+                    outbound_cfg["tools"] = body["variables"]["tools"]
+                if "toolConfig" in body["variables"]:
+                    outbound_cfg["toolConfig"] = body["variables"]["toolConfig"]
+                print_outbound_debug_report(
+                    channel="Studio(Cookie)",
+                    model_name=base_model_name,
+                    gen_config_dict=outbound_cfg,
+                    messages=request_obj.messages,
+                    prefill_text=prefill_text,
+                    sandbox_spec=sandbox_spec,
+                )
 
             async with httpx.AsyncClient(**client_kwargs) as client:
                 post_task = asyncio.create_task(
@@ -1803,10 +1935,12 @@ class CookieProxyUpstream(BaseUpstream):
                         })
                 response = await post_task
 
-                if native_custom_tools and _native_tool_error_response(response.status_code, response.text):
+                if (native_custom_tools or sandbox_spec.enabled) and _native_tool_error_response(response.status_code, response.text):
+                    synth_tool_name = ""
                     resolved_fallback = await build_batch_graphql_body_async(
                         project_id, base_model_name, request_obj,
-                        prefill_active=prefill_active, force_search=force_builtin_search, native_tools=False,
+                        prefill_active=prefill_active, force_search=force_builtin_search,
+                        native_tools=False, sandbox_spec=None,
                     )
                     print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；已自动降级为文本工具观测。")
                     response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback)
@@ -1835,7 +1969,8 @@ class CookieProxyUpstream(BaseUpstream):
             message_extra, retry_error, fatal_error, auth_error = None, None, None, None
             usage_meta, finish_raw, blocked_msg = None, None, None
             sampler = _RawSampler()
-            fc_assembler = FunctionCallStreamAssembler()
+            fc_assembler = FunctionCallStreamAssembler(synthetic_tool_name=synth_tool_name)
+            synth_text = ""
 
             class _FakeResponse:
                 def __init__(self, text):
@@ -1847,6 +1982,8 @@ class CookieProxyUpstream(BaseUpstream):
                 sampler.add(obj)
                 for event_type, data in _extract_from_results(obj):
                     if event_type == "text":
+                        if fc_assembler.synthetic_hit:
+                            continue
                         full_text += data
                         part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
                         ordinary_metadata.append(ordinary_part_metadata("text", data, None))
@@ -1859,9 +1996,16 @@ class CookieProxyUpstream(BaseUpstream):
                         part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
                         ordinary_metadata.append(ordinary_part_metadata("text", data, None))
                     elif event_type == "function_call":
-                        for c_item in fc_assembler.feed(
+                        completed_calls, s_delta, s_sig = fc_assembler.feed_with_synthetic(
                             data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
-                        ):
+                        )
+                        if s_delta:
+                            synth_text += s_delta
+                            part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                            ordinary_metadata.append(ordinary_part_metadata("text", s_delta, s_sig))
+                            if s_sig:
+                                message_extra = thought_signature_extra(s_sig, "text")
+                        for c_item in completed_calls:
                             part_order.append({"type": "tool_call", "index": len(tool_calls)})
                             tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
                     elif event_type == "thought_signature":
@@ -1884,18 +2028,23 @@ class CookieProxyUpstream(BaseUpstream):
                     elif event_type == "error":
                         clean_em = _extract_clean_error_message(data)
                         diag = _diagnose_studio_error(clean_em, 200)
-                        if (_is_cookie_expired_error(clean_em) or _is_project_error(clean_em)) and not full_text.strip() and not tool_calls:
+                        if (_is_cookie_expired_error(clean_em) or _is_project_error(clean_em)) and not full_text.strip() and not synth_text.strip() and not tool_calls:
                             hint = _get_auth_or_project_hint(clean_em, 200)
                             auth_error = f"{diag} — {clean_em}{hint}"
                             break
-                        if _is_retryable_error(clean_em) and not full_text.strip() and not tool_calls:
+                        if _is_retryable_error(clean_em) and not full_text.strip() and not synth_text.strip() and not tool_calls:
                             retry_error = f"{diag} — {clean_em}"
                             break
                         fatal_error = f"{diag} — {clean_em}"
 
             for c_item in fc_assembler.flush():
+                if synth_tool_name and c_item.get("name") == synth_tool_name:
+                    synth_text += extract_synthetic_content(c_item.get("args"))
+                    continue
                 part_order.append({"type": "tool_call", "index": len(tool_calls)})
                 tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
+            if synth_text:
+                full_text = synth_text
 
             got_text = bool(full_text.strip())
             got_output = got_text or bool(tool_calls)
@@ -1915,10 +2064,11 @@ class CookieProxyUpstream(BaseUpstream):
                 hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
                 print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
                 print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
+                is_synth_retry = bool(synth_tool_name and not blocked_msg)
                 raise CookieAttemptError(
                     400 if blocked_msg else 502,
-                    f"上游{desc}（{detail}，不可重试）。{hint}",
-                    is_retryable=False,
+                    f"上游{desc}（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。{hint}",
+                    is_retryable=is_synth_retry,
                     is_auth_or_billing=False,
                 )
 
