@@ -22,6 +22,7 @@ from synthetic_wrapper import (
     extract_synthetic_content,
     is_content_json_path,
     make_bad_woman_response_id,
+    sanitize_synthetic_tail,
 )
 
 from google.genai import types
@@ -797,18 +798,35 @@ def _set_json_path_value(root: Dict[str, Any], tokens: List[Any], value: Any, ap
 
 class FunctionCallStreamAssembler:
     """将 Gemini streamFunctionCallArguments 的分片 FunctionCall (partialArgs / willContinue)
-    安全聚合成完整的函数调用事件，同时支持合成传输工具 (router_emit) 的实时流式直通拆包。"""
+    安全聚合成完整的函数调用事件，同时支持合成传输工具 (router_emit) 的实时流式直通拆包与防闭合溢出熔断。"""
+
+    _TAIL_HOLD_CHARS = 96
 
     def __init__(self, synthetic_tool_name: str = ""):
         self._pending: Optional[Dict[str, Any]] = None
         self.synthetic_tool_name: str = (synthetic_tool_name or "").strip()
         self.synthetic_hit: bool = False
+        self.synthetic_halted: bool = False
         self._pending_is_synthetic: bool = False
         self._last_synth_path: str = ""
         self._synth_signature: Optional[bytes] = None
+        self._synth_tail_buf: str = ""
 
     def has_pending(self) -> bool:
         return self._pending is not None
+
+    def flush_synthetic_tail(self) -> str:
+        """冲刷合成工具滑动尾窗中剩余的文本（流结束时调用）。"""
+        if not self._synth_tail_buf:
+            return ""
+        raw = self._synth_tail_buf
+        self._synth_tail_buf = ""
+        if self.synthetic_halted:
+            return ""
+        clean, halted = sanitize_synthetic_tail(raw, emit_tool_name=self.synthetic_tool_name)
+        if halted:
+            self.synthetic_halted = True
+        return clean
 
     def feed_with_synthetic(
         self, fc: Any, thought_signature: Optional[bytes] = None
@@ -840,6 +858,9 @@ class FunctionCallStreamAssembler:
                 is_synth = True
 
         if is_synth:
+            if self.synthetic_halted:
+                return [], "", None
+
             ready_real: List[Dict[str, Any]] = []
             if self._pending is not None:
                 ready_real.append(self._finalize_pending())
@@ -869,19 +890,42 @@ class FunctionCallStreamAssembler:
                         if is_content_json_path(tokens, path_str) or not tokens:
                             synth_deltas.append(val)
             elif has_args:
-                extracted = extract_synthetic_content(fc_args)
+                extracted = extract_synthetic_content(fc_args, emit_tool_name=self.synthetic_tool_name)
                 if extracted:
                     synth_deltas.append(extracted)
 
-            if not fc_will_continue:
-                self._last_synth_path = ""
+            incoming_text = "".join(synth_deltas)
+            if incoming_text:
+                self._synth_tail_buf += incoming_text
 
-            synth_text = "".join(synth_deltas)
-            sig_to_emit: Optional[bytes] = None
-            if synth_text or not fc_will_continue:
+            clean_buf, halted = sanitize_synthetic_tail(
+                self._synth_tail_buf, emit_tool_name=self.synthetic_tool_name
+            )
+            if halted:
+                self.synthetic_halted = True
+                self._pending_is_synthetic = False
+                self._last_synth_path = ""
+                self._synth_tail_buf = ""
                 sig_to_emit = self._synth_signature
                 self._synth_signature = None
-            return ready_real, synth_text, sig_to_emit
+                return ready_real, clean_buf, sig_to_emit
+
+            if not fc_will_continue:
+                self._last_synth_path = ""
+                out_text = self._synth_tail_buf
+                self._synth_tail_buf = ""
+            elif len(self._synth_tail_buf) > self._TAIL_HOLD_CHARS:
+                cut = len(self._synth_tail_buf) - self._TAIL_HOLD_CHARS
+                out_text = self._synth_tail_buf[:cut]
+                self._synth_tail_buf = self._synth_tail_buf[cut:]
+            else:
+                out_text = ""
+
+            sig_to_emit: Optional[bytes] = None
+            if out_text or not fc_will_continue:
+                sig_to_emit = self._synth_signature
+                self._synth_signature = None
+            return ready_real, out_text, sig_to_emit
 
         # 若此前处于合成工具分片但本块切换到了真实工具名，复位合成挂起状态
         if fc_name and self.synthetic_tool_name and fc_name != self.synthetic_tool_name:
