@@ -21,6 +21,10 @@ import model_capabilities as mc
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, validate_request_schemas
 from logger import stats
+from synthetic_wrapper import (
+    extract_synthetic_content,
+    make_bad_woman_response_id,
+)
 
 
 def _safety_score_enabled() -> bool:
@@ -194,6 +198,12 @@ def _describe_empty_gemini_response(response_obj: Any, model_to_call: str) -> st
     fr = getattr(cand, "finish_reason", None)
     fr_str = getattr(fr, "name", None) or str(fr or "未知")
     finish_msg = getattr(cand, "finish_message", None) or ""
+
+    if "MALFORMED_FUNCTION_CALL" in fr_str.upper():
+        return (
+            f"模型 {model_to_call} 触发了格式错误的合成/真实函数调用"
+            f"（finish_reason={fr_str} {finish_msg}）。"
+        )
 
     parts = getattr(getattr(cand, "content", None), "parts", None) or []
     thought_chars = 0
@@ -424,6 +434,16 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
 
     mc.sanitize_sampling(config, profile)
 
+    if "gemini-4-argon" in (request.model or "").lower() and config.get("max_output_tokens"):
+        _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
+        _is_real_stream = bool(request.stream and not _fake_on and not is_image_model)
+        _argon_cap = 65536 if _is_real_stream else 32768
+        try:
+            if int(config["max_output_tokens"]) > _argon_cap:
+                config["max_output_tokens"] = _argon_cap
+        except (TypeError, ValueError):
+            pass
+
     if tools_list:
         config["tools"] = tools_list
 
@@ -455,6 +475,235 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         config["tool_config"] = tool_config
 
     return config
+
+
+def _summ_obj(obj: Any, width: int = 2000) -> str:
+    try:
+        s = json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        s = str(obj)
+    s = re.sub(r'"(data|thoughtSignature|thought_signature)":\s*"[A-Za-z0-9+/=_-]{40,}"', r'"\1": "<长Base64已省略>"', s)
+    return s[:width] + ("…" if len(s) > width else "")
+
+
+class _RawSampler:
+    def __init__(self, keep: int = 2):
+        self.keep = keep
+        self.head: list = []
+        self.tail: list = []
+        self.count = 0
+
+    def add(self, obj: Any):
+        if not obj:
+            return
+        self.count += 1
+        if len(self.head) < self.keep:
+            self.head.append(_summ_obj(obj))
+        else:
+            self.tail.append(_summ_obj(obj))
+            if len(self.tail) > self.keep:
+                self.tail.pop(0)
+
+    def dump(self) -> str:
+        if self.count == 0:
+            return "（上游未返回任何可解析的 JSON/候选对象）"
+        lines = [f"共 {self.count} 个对象；首尾样本："]
+        lines += [f"  ▸ {s}" for s in self.head]
+        if self.tail:
+            lines.append("  …")
+            lines += [f"  ▸ {s}" for s in self.tail]
+        return "\n".join(lines)
+
+
+def extract_gemini_chunk_debug_dict(chunk: Any) -> dict:
+    """提取 Google GenAI SDK 返回对象（GenerateContentResponse/Chunk）的关键诊断字典。"""
+    if chunk is None:
+        return {}
+    if isinstance(chunk, dict):
+        return chunk
+    if hasattr(chunk, "model_dump"):
+        try:
+            return chunk.model_dump(exclude_none=True, mode="json")
+        except Exception:
+            pass
+    if hasattr(chunk, "to_json_dict"):
+        try:
+            return chunk.to_json_dict()
+        except Exception:
+            pass
+
+    out: Dict[str, Any] = {}
+    candidates = getattr(chunk, "candidates", None)
+    if candidates and isinstance(candidates, (list, tuple)):
+        cand_list = []
+        for cand in candidates:
+            c_dict: Dict[str, Any] = {
+                "index": getattr(cand, "index", 0),
+                "finishReason": str(getattr(cand, "finish_reason", "") or ""),
+            }
+            content = getattr(cand, "content", None)
+            if content:
+                c_dict["role"] = getattr(content, "role", "model")
+                parts = getattr(content, "parts", None) or []
+                part_list = []
+                for p in parts:
+                    p_dict: Dict[str, Any] = {}
+                    if getattr(p, "thought", None) is True:
+                        p_dict["thought"] = True
+                    text_v = getattr(p, "text", None)
+                    if text_v is not None:
+                        p_dict["text"] = str(text_v)
+                    fc = getattr(p, "function_call", None)
+                    if fc is not None:
+                        fc_args = getattr(fc, "args", {}) or {}
+                        if hasattr(fc_args, "model_dump"):
+                            try:
+                                fc_args = fc_args.model_dump()
+                            except Exception:
+                                pass
+                        p_dict["functionCall"] = {
+                            "name": getattr(fc, "name", ""),
+                            "args": fc_args,
+                        }
+                    sig = getattr(p, "thought_signature", None)
+                    if sig:
+                        p_dict["thoughtSignature"] = "<长Base64已省略>" if len(str(sig)) > 30 else str(sig)
+                    inline = getattr(p, "inline_data", None)
+                    if inline:
+                        p_dict["inlineData"] = {"mimeType": getattr(inline, "mime_type", "")}
+                    part_list.append(p_dict)
+                c_dict["parts"] = part_list
+            sr = getattr(cand, "safety_ratings", None)
+            if sr:
+                c_dict["safetyRatings"] = [str(r) for r in sr]
+            cand_list.append(c_dict)
+        out["candidates"] = cand_list
+
+    pf = getattr(chunk, "prompt_feedback", None)
+    if pf:
+        br = getattr(pf, "block_reason", None)
+        if br:
+            out["promptFeedback"] = {"blockReason": str(br)}
+
+    um = getattr(chunk, "usage_metadata", None)
+    if um:
+        out["usageMetadata"] = {
+            "promptTokenCount": getattr(um, "prompt_token_count", 0),
+            "candidatesTokenCount": getattr(um, "candidates_token_count", 0),
+            "totalTokenCount": getattr(um, "total_token_count", 0),
+        }
+    return out
+
+
+def _format_preview(text: str, max_chars: int = 150) -> str:
+    s = (text or "").replace("\r\n", "\\n").replace("\n", "\\n").replace("\t", "\\t")
+    if len(s) <= max_chars:
+        return s
+    half = max(10, (max_chars - 3) // 2)
+    return s[:half] + "..." + s[-half:]
+
+
+def _plain_text_preview(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for p in content:
+            if isinstance(p, str):
+                out.append(p)
+            elif isinstance(p, dict):
+                if p.get("type") == "text":
+                    out.append(p.get("text", ""))
+            elif hasattr(p, "text"):
+                out.append(getattr(p, "text", "") or "")
+        return "\n".join(out)
+    return str(content)
+
+
+def print_outbound_debug_report(
+    channel: str,
+    model_name: str,
+    gen_config_dict: dict,
+    messages: list,
+    prefill_text: str = "",
+    sandbox_spec: Any = None,
+) -> None:
+    """输出详尽、结构化的出站参数与提示词断点诊断日志。"""
+    if not app_state.get_setting("debug_outbound", False):
+        return
+
+    num_msgs = len(messages) if messages else 0
+    lines = [f"🔎 [出站调试 - {channel}] 模型={model_name} | 上下文消息共 {num_msgs} 轮"]
+
+    # 1. 采样与生成核心参数
+    cfg_items = []
+    for k in ("temperature", "top_p", "top_k", "max_output_tokens", "candidate_count", "seed"):
+        v = gen_config_dict.get(k)
+        if v is not None:
+            cfg_items.append(f"{k}={v}")
+    tk = gen_config_dict.get("thinking_config")
+    if tk:
+        if isinstance(tk, dict):
+            cfg_items.append(f"thinking_config={json.dumps(tk, ensure_ascii=False)}")
+        else:
+            cfg_items.append(f"thinking_config={tk}")
+    if cfg_items:
+        lines.append(f"  ⚙️ 生成配置: {', '.join(cfg_items)}")
+
+    # 2. 工具与受限解码
+    tools = gen_config_dict.get("tools") or []
+    tool_decls = []
+    for tg in tools:
+        if isinstance(tg, dict):
+            f_decls = tg.get("function_declarations") or tg.get("functionDeclarations") or []
+            tool_decls.extend(f_decls)
+        elif hasattr(tg, "function_declarations"):
+            tool_decls.extend(getattr(tg, "function_declarations") or [])
+
+    tc = gen_config_dict.get("tool_config") or gen_config_dict.get("toolConfig")
+    tc_desc = ""
+    if tc:
+        fc_cfg = tc.get("function_calling_config") or tc.get("functionCallingConfig") or {}
+        mode = fc_cfg.get("mode")
+        allowed = fc_cfg.get("allowed_function_names") or fc_cfg.get("allowedFunctionNames")
+        tc_desc = f"mode={mode}" + (f", allowed={allowed}" if allowed else "")
+
+    if tool_decls or tc_desc:
+        lines.append(f"  🛠️ 工具状态: 注入 {len(tool_decls)} 个工具" + (f" | 🔒 受限解码: {tc_desc}" if tc_desc else ""))
+        for d in tool_decls:
+            name = d.get("name") if isinstance(d, dict) else getattr(d, "name", "")
+            params = d.get("parameters") if isinstance(d, dict) else getattr(d, "parameters", {})
+            props = params.get("properties") if isinstance(params, dict) else {}
+            if isinstance(props, list):
+                prop_keys = [item.get("key") for item in props if isinstance(item, dict) and item.get("key")]
+            elif isinstance(props, dict):
+                prop_keys = list(props.keys())
+            else:
+                prop_keys = []
+
+            p_summary = f"params=[{', '.join(prop_keys)}]"
+            lines.append(f"    ▸ [函数声明] {name} | {p_summary}")
+
+    # 3. 预填充与末尾断点分析
+    if prefill_text:
+        lines.append(f"  🩹 预填充 prefill: 共 {len(prefill_text)} 字 | 断点尾部=\"{_format_preview(prefill_text, 100)}\"")
+
+    # 4. 消息末尾切片预览
+    if messages:
+        first = messages[0]
+        f_role = getattr(first, "role", "") if hasattr(first, "role") else (first.get("role") if isinstance(first, dict) else "")
+        if f_role == "system":
+            f_content = _plain_text_preview(getattr(first, "content", "") if hasattr(first, "content") else first.get("content"))
+            lines.append(f"  📜 [第 1 轮 system]: \"{_format_preview(f_content, 120)}\"")
+
+        last = messages[-1]
+        l_role = getattr(last, "role", "unknown") if hasattr(last, "role") else (last.get("role", "unknown") if isinstance(last, dict) else "unknown")
+        l_content = _plain_text_preview(getattr(last, "content", "") if hasattr(last, "content") else last.get("content", ""))
+        lines.append(f"  📨 [末尾出站轮次 #{num_msgs} {l_role} | {len(l_content)} 字]: \"{_format_preview(l_content, 160)}\"")
+
+    print("\n".join(lines))
 
 
 def _extract_usage(resp: Any) -> tuple[int, int, int]:
@@ -498,7 +747,7 @@ def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-def is_gemini_response_valid(response: Any) -> bool:
+def is_gemini_response_valid(response: Any, synthetic_tool_name: str = "") -> bool:
     if response is None:
         return False
     if hasattr(response, "text") and isinstance(response.text, str) and response.text.strip():
@@ -509,19 +758,27 @@ def is_gemini_response_valid(response: Any) -> bool:
                 return True
             if hasattr(cand, "content") and hasattr(cand.content, "parts") and cand.content.parts:
                 for part in cand.content.parts:
-                    if getattr(part, "function_call", None) is not None:
+                    fc = getattr(part, "function_call", None)
+                    if fc is not None:
+                        if synthetic_tool_name and getattr(fc, "name", "") == synthetic_tool_name:
+                            if extract_synthetic_content(getattr(fc, "args", None)).strip():
+                                return True
+                            continue
                         return True
                     if getattr(part, "inline_data", None) is not None:
                         return True
                     if hasattr(part, "text") and isinstance(getattr(part, "text", None), str) and getattr(part, "text", "").strip():
+                        if getattr(part, "thought", None) is True:
+                            continue
                         return True
     return False
 
 
 class ToolCallIndexer:
-    """一次流式响应内，为 tool_calls 分配稳定递增的 index，并聚合分片函数参数（streamFunctionCallArguments）。"""
+    """一次流式响应内，为 tool_calls 分配稳定递增的 index，聚合分片函数参数，并实时拆包合成传输工具。"""
 
-    def __init__(self):
+    def __init__(self, synthetic_tool_name: str = ""):
+        self.synthetic_tool_name: str = (synthetic_tool_name or "").strip()
         self._next: Dict[int, int] = {}
         self._seen_tool_calls: set[int] = set()
         self._ordinary_parts: Dict[int, list] = {}
@@ -532,12 +789,21 @@ class ToolCallIndexer:
         from message_processing import FunctionCallStreamAssembler
         asm = self._assemblers.get(candidate_index)
         if asm is None:
-            asm = FunctionCallStreamAssembler()
+            asm = FunctionCallStreamAssembler(synthetic_tool_name=self.synthetic_tool_name)
             self._assemblers[candidate_index] = asm
         return asm
 
     def feed_function_call(self, candidate_index: int, fc: Any, sig: Optional[bytes]) -> List[Dict[str, Any]]:
         return self._assembler(candidate_index).feed(fc, thought_signature=sig)
+
+    def feed_function_call_ex(
+        self, candidate_index: int, fc: Any, sig: Optional[bytes]
+    ) -> tuple[List[Dict[str, Any]], str, Optional[bytes]]:
+        return self._assembler(candidate_index).feed_with_synthetic(fc, thought_signature=sig)
+
+    def has_synthetic_hit(self, candidate_index: int = 0) -> bool:
+        asm = self._assemblers.get(candidate_index)
+        return bool(asm and asm.synthetic_hit)
 
     def flush_function_calls(self, candidate_index: int = 0) -> List[Dict[str, Any]]:
         asm = self._assemblers.get(candidate_index)
@@ -612,6 +878,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         part_order = []
         ordinary_signature = None
         ordinary_signature_kind = None
+        synthetic_text_deltas: List[str] = []
 
         def _emit_assembled_call(call_dict: Dict[str, Any]) -> None:
             tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
@@ -649,6 +916,15 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 fc = getattr(part, "function_call", None)
                 sig = _signature_bytes(part, fc)
                 if fc is None:
+                    is_thought = getattr(part, "thought", None) is True
+                    if (indexer and indexer.has_synthetic_hit(candidate_index)
+                            and not is_thought
+                            and getattr(part, "inline_data", None) is None
+                            and getattr(part, "file_data", None) is None):
+                        if sig:
+                            ordinary_signature = sig
+                            ordinary_signature_kind = "text"
+                        continue
                     text_value = getattr(part, "text", None)
                     if text_value is None and getattr(part, "inline_data", None) is not None:
                         inline = part.inline_data
@@ -656,7 +932,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     elif text_value is None and getattr(part, "file_data", None) is not None:
                         text_value = f"![Image]({part.file_data.file_uri})"
                     text_value = "" if text_value is None else str(text_value)
-                    if getattr(part, "thought", None) is True:
+                    if is_thought:
                         kind = "thought"
                     elif text_value == "" and sig:
                         kind = "signature_only"
@@ -675,9 +951,19 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     continue
 
                 if indexer is not None:
-                    completed_calls = indexer.feed_function_call(candidate_index, fc, sig)
+                    completed_calls, synth_delta, synth_sig = indexer.feed_function_call_ex(candidate_index, fc, sig)
                     for c_item in completed_calls:
                         _emit_assembled_call(c_item)
+                    if synth_delta or synth_sig:
+                        if synth_delta:
+                            synthetic_text_deltas.append(synth_delta)
+                        metadata = ordinary_part_metadata("text", synth_delta, synth_sig)
+                        ordinary_index = indexer.record_ordinary_part(candidate_index, metadata)
+                        part_order.append({"type": "ordinary", "index": ordinary_index})
+                        ordinary_metadata.append(metadata)
+                        if synth_sig:
+                            ordinary_signature = synth_sig
+                            ordinary_signature_kind = "text"
                 else:
                     _emit_assembled_call({
                         "id": getattr(fc, "id", None),
@@ -690,7 +976,10 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             for c_item in indexer.flush_function_calls(candidate_index):
                 _emit_assembled_call(c_item)
 
-        if (openai_finish_reason == "stop" and indexer
+        if indexer and indexer.has_synthetic_hit(candidate_index) and not indexer.has_tool_calls(candidate_index):
+            if openai_finish_reason == "tool_calls":
+                openai_finish_reason = "stop"
+        elif (openai_finish_reason == "stop" and indexer
                 and indexer.has_tool_calls(candidate_index)):
             openai_finish_reason = "tool_calls"
 
@@ -698,6 +987,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
             delta_payload["tool_calls"] = tool_call_deltas
 
         reasoning_text, normal_text = parse_gemini_response_for_reasoning_and_content(candidate)
+        if indexer and indexer.has_synthetic_hit(candidate_index):
+            normal_text = "".join(synthetic_text_deltas)
 
         if (openai_finish_reason and _safety_score_enabled()
                 and hasattr(candidate, "safety_ratings") and candidate.safety_ratings):
@@ -1107,6 +1398,7 @@ async def execute_unified_completion(
                     gen_config_dict = ctx["gen_config_dict"]
                     prefill_text = ctx["prefill_text"]
                     exp_req_obj = ctx["request_obj"]
+                    synth_tool_name = ctx.get("synthetic_tool_name", "")
 
                     print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用 {model_to_call}（请求模型={request_obj.model}）。")
 
@@ -1114,6 +1406,7 @@ async def execute_unified_completion(
                         if is_image_request and attempt == 0:
                             print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出。")
                         api_call_task: Optional[asyncio.Task] = None
+                        sampler = _RawSampler()
 
                         async def _cancel_task():
                             nonlocal api_call_task
@@ -1146,6 +1439,7 @@ async def execute_unified_completion(
                                         yield _make_keepalive_chunk()
                                 try:
                                     raw_gemini_response = await api_call_task
+                                    sampler.add(extract_gemini_chunk_debug_dict(raw_gemini_response))
                                     break
                                 except Exception as e_pin:
                                     if (
@@ -1165,18 +1459,27 @@ async def execute_unified_completion(
                             if hasattr(raw_gemini_response, "prompt_feedback") and \
                                hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
                                raw_gemini_response.prompt_feedback.block_reason:
+                                print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
                                 raise ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
 
-                            if not is_gemini_response_valid(raw_gemini_response):
-                                raise ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
+                            if not is_gemini_response_valid(raw_gemini_response, synthetic_tool_name=synth_tool_name):
+                                print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
+                                err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
+                                if synth_tool_name:
+                                    err_v.is_retryable = True
+                                raise err_v
 
                             _record_usage(raw_gemini_response)
-                            openai_response_dict = convert_to_openai_format(raw_gemini_response, exp_req_obj.model)
+                            openai_response_dict = convert_to_openai_format(
+                                raw_gemini_response, exp_req_obj.model, synthetic_tool_name=synth_tool_name
+                            )
                             _prepend_prefill(openai_response_dict, prefill_text)
 
                             async for chunk_sse in _chunk_openai_response_dict_for_sse(openai_response_dict=openai_response_dict):
                                 has_yielded_output = True
                                 yield chunk_sse
+                            if app_state.get_setting("debug_outbound", False):
+                                print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
                             print(f"✅ [Express] {request_obj.model} | 假流式传输完成")
                             return
 
@@ -1191,8 +1494,11 @@ async def execute_unified_completion(
 
                     else:
                         # Express 真流式
-                        response_id_for_stream = f"chatcmpl-realstream-{int(time.time())}"
+                        response_id_for_stream = make_bad_woman_response_id(
+                            "chatcmpl-realstream", sandbox_enabled=bool(synth_tool_name)
+                        )
                         stream_start_ts = time.time()
+                        sampler = _RawSampler()
                         try:
                             for _pin_try in range(2):
                                 try:
@@ -1201,17 +1507,19 @@ async def execute_unified_completion(
                                         contents=actual_prompt,
                                         config=gen_config_dict,
                                     )
-                                    tool_indexer = ToolCallIndexer()
+                                    tool_indexer = ToolCallIndexer(synthetic_tool_name=synth_tool_name)
                                     deduper = PrefillDeduper(prefill_text) if (prefill_text and (exp_req_obj.n or 1) == 1) else None
                                     prefill_emitted = not bool(prefill_text)
                                     final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
 
                                     async for chunk_item_call in stream_gen_obj:
+                                        sampler.add(extract_gemini_chunk_debug_dict(chunk_item_call))
                                         if getattr(chunk_item_call, "usage_metadata", None):
                                             final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
 
                                         pf = getattr(chunk_item_call, "prompt_feedback", None)
                                         if pf and getattr(pf, "block_reason", None) and not has_yielded_output:
+                                            print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
                                             raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
 
                                         num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
@@ -1228,6 +1536,10 @@ async def execute_unified_completion(
                                             if is_real_chunk and not has_yielded_output:
                                                 has_yielded_output = True
                                                 print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                            elif synth_tool_name and not has_yielded_output:
+                                                if '"finish_reason": "content_filter"' in sse_chunk:
+                                                    raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
+                                                continue
 
                                             if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
                                                 prefill_emitted = True
@@ -1244,6 +1556,14 @@ async def execute_unified_completion(
                                                 if sse_chunk is None:
                                                     continue
                                             yield sse_chunk
+
+                                    if synth_tool_name and not has_yielded_output:
+                                        print(f"🔎 [Express 诊断] 模型={model_to_call} 沙箱模式未产出正文。原始响应样本：\n{sampler.dump()}")
+                                        err_empty_s = ValueError(
+                                            f"模型 {model_to_call} 在沙箱模式下未产出任何有效正文（可能触发 MALFORMED_FUNCTION_CALL 或空回）。"
+                                        )
+                                        err_empty_s.is_retryable = True
+                                        raise err_empty_s
 
                                     if not prefill_emitted:
                                         prefill_emitted = True
@@ -1286,6 +1606,8 @@ async def execute_unified_completion(
 
                                     yield "data: [DONE]\n\n"
                                     elapsed = time.time() - stream_start_ts
+                                    if app_state.get_setting("debug_outbound", False):
+                                        print(f"🔎 [Express 尾包原始结构] {sampler.dump()}")
                                     print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                                     return
                                 except Exception as e_pin_stream:
@@ -1433,11 +1755,13 @@ async def execute_unified_completion(
             gen_config_dict = ctx["gen_config_dict"]
             prefill_text = ctx["prefill_text"]
             exp_req_obj = ctx["request_obj"]
+            synth_tool_name = ctx.get("synthetic_tool_name", "")
 
             print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用 {model_to_call}（请求模型={request_obj.model}）。")
 
             try:
                 response_obj_call = None
+                sampler = _RawSampler()
                 for _pin_try in range(2):
                     call_task = asyncio.create_task(
                         current_client.aio.models.generate_content(
@@ -1461,6 +1785,7 @@ async def execute_unified_completion(
                                     content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
                                 )
                         response_obj_call = await call_task
+                        sampler.add(extract_gemini_chunk_debug_dict(response_obj_call))
                         break
                     except asyncio.CancelledError:
                         if not call_task.done():
@@ -1484,14 +1809,23 @@ async def execute_unified_completion(
                 if hasattr(response_obj_call, "prompt_feedback") and \
                    hasattr(response_obj_call.prompt_feedback, "block_reason") and \
                    response_obj_call.prompt_feedback.block_reason:
+                    print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
                     raise ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
 
-                if not is_gemini_response_valid(response_obj_call):
-                    raise ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
+                if not is_gemini_response_valid(response_obj_call, synthetic_tool_name=synth_tool_name):
+                    print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
+                    err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
+                    if synth_tool_name:
+                        err_v.is_retryable = True
+                    raise err_v
 
                 _record_usage(response_obj_call)
-                openai_response_content = convert_to_openai_format(response_obj_call, exp_req_obj.model)
+                openai_response_content = convert_to_openai_format(
+                    response_obj_call, exp_req_obj.model, synthetic_tool_name=synth_tool_name
+                )
                 _prepend_prefill(openai_response_content, prefill_text)
+                if app_state.get_setting("debug_outbound", False):
+                    print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
                 print(f"✅ [Express] {request_obj.model} | 非流式响应完成")
                 return JSONResponse(content=openai_response_content)
 
