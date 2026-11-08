@@ -780,6 +780,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="text-sm font-semibold mb-3">预填充兼容与注入 <span class="text-xs font-normal text-[#9a90ab]">（支持按模型单独配置）</span></div>
         <div class="space-y-3">
           <div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm font-semibold" style="color:var(--accent)">🛡️ Function Call 抗截断传输（router_emit）<span class="helpq" onclick="hlp(this,'h_sbox')">?</span></span><label class="switch"><input type="checkbox" id="synthetic_sandbox_enabled"><span class="slider"></span></label></div>
+            <div id="h_sbox" class="helpbox">
+              <b>原生 Function Call 抗截断传输模式</b>（支持按模型单独保存 ★）：<br>
+              • 使用固定工具名 <code>router_emit</code> 与 <code>mode: ANY</code> 受限解码传输正文，保持 Vertex 隐式前缀缓存命中；<br>
+              • 自动识别普通回复与预填充续写（continuation）语义，声明函数仅传输文本、不执行外部操作，不注入任何伪造轮次、不干扰酒馆预设破限与末尾预填充断点；<br>
+              • 网关层在真流式（<code>streamFunctionCallArguments</code>）、假流式、非流式下自动透明拆包为标准文本（响应 ID 带 <code>bad_woman</code> 标识），生图与 <code>-search</code> 联网搜索请求自动旁路。
+            </div>
+          </div>
+          <div>
             <div class="flex items-center justify-between gap-3"><span class="text-sm">预填充兼容模式<span class="helpq" onclick="hlp(this,'h_pfm')">?</span></span>
               <select id="prefill_mode" class="inp" style="width:155px"><option value="smart">智能（默认）</option><option value="keep_turn">保留模型轮次</option><option value="minimal">最小</option><option value="off">关闭</option></select>
             </div>
@@ -926,12 +935,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div id="h_ss" class="helpbox">在回复末尾附加可折叠的安全分类评分块。</div>
           </div>
           <div>
-            <div class="flex items-center justify-between gap-2"><span class="text-sm">出站参数调试日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
-            <div id="h_dbg" class="helpbox">在运行日志里打印实际发出的思考档位与采样参数。</div>
-          </div>
-          <div>
-            <div class="flex items-center justify-between gap-2"><span class="text-sm">Cookie 通道额外诊断<span class="helpq" onclick="hlp(this,'h_ckd')">?</span></span><label class="switch"><input type="checkbox" id="cookie_debug"><span class="slider"></span></label></div>
-            <div id="h_ckd" class="helpbox">仅对 Cookie 直连通道生效，打印出站 <code>generationConfig</code>。</div>
+            <div class="flex items-center justify-between gap-2"><span class="text-sm">出站调试与原始诊断日志<span class="helpq" onclick="hlp(this,'h_dbg')">?</span></span><label class="switch"><input type="checkbox" id="debug_outbound"><span class="slider"></span></label></div>
+            <div id="h_dbg" class="helpbox">在运行日志里打印发给 Google 的完整出站结构（生成参数、思考档位、工具 Schema 与受限解码、出站末尾消息断点），并在流式结束或遇到异常时输出首尾候选包原始结构（Express 与 Cookie 双通道均自动支持）。</div>
           </div>
         </div>
       </div>
@@ -968,7 +973,8 @@ var PER_MODEL_KEYS = [
   'default_temperature','default_top_p','default_max_tokens',
   'inject_system_instruction','inject_prefill','prefill_instruction',
   'image_system_instruction','inject_prefill_for_image','sampling_policy',
-  'prefill_cot_guard','prefill_mode','prefill_suppress_thinking'
+  'prefill_cot_guard','prefill_mode','prefill_suppress_thinking',
+  'synthetic_sandbox_enabled'
 ];
 var COMMON_ARS = ["1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1","9:21"];
 
@@ -1335,9 +1341,9 @@ async function loadParams(){
     ].forEach(function(k){setV(k,s[k]);});
     [
       'img_compress_enabled','fake_streaming','roundrobin','safety_score',
-      'cookie_debug','debug_outbound','prefill_suppress_thinking',
+      'debug_outbound','prefill_suppress_thinking',
       'image_system_instruction','inject_prefill_for_image','prefill_cot_guard','resumable_enabled',
-      'cross_channel_fallback'
+      'cross_channel_fallback','synthetic_sandbox_enabled'
     ].forEach(function(k){setV(k,s[k]);});
   }catch(e){}
   try{
@@ -1386,6 +1392,7 @@ function collectSectionOnePatch(){
     prefill_cot_guard:$('prefill_cot_guard').checked,
     prefill_mode:$('prefill_mode').value,
     prefill_suppress_thinking:$('prefill_suppress_thinking').checked,
+    synthetic_sandbox_enabled:$('synthetic_sandbox_enabled').checked,
   };
 }
 
@@ -1514,7 +1521,6 @@ async function saveSettings(){
     roundrobin:$('roundrobin').checked,
     safety_score:$('safety_score').checked,
     debug_outbound:$('debug_outbound').checked,
-    cookie_debug:$('cookie_debug').checked,
   };
   try{
     var r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
