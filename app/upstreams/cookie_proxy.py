@@ -48,6 +48,7 @@ from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
 from synthetic_wrapper import (
     SyntheticSandboxSpec,
+    build_anti_truncation_stop_sequences,
     build_emit_tool_declaration,
     create_sandbox_spec,
     extract_synthetic_content,
@@ -891,6 +892,7 @@ def _build_batch_graphql_body(
             sandbox_spec.emit_tool_name,
             prefill_text=sandbox_spec.prefill_text,
             has_prefill=sandbox_spec.has_prefill,
+            for_cookie=True,
         )
         base_decls.append({
             "name": s_decl["name"],
@@ -904,6 +906,9 @@ def _build_batch_graphql_body(
         variables["toolConfig"] = {
             "functionCallingConfig": fc_cfg,
         }
+        gen_config["stopSequences"] = build_anti_truncation_stop_sequences(
+            gen_config.get("stopSequences")
+        )
     elif selected_declarations:
         variables["tools"] = [{"functionDeclarations": selected_declarations}]
         function_names = [item["name"] for item in selected_declarations]
@@ -1406,9 +1411,12 @@ async def _collect_full_response_once(
                         break
                     fatal_error = f"{diag} — {clean_em}"
 
+        tail_text = fc_assembler.flush_synthetic_tail()
+        if tail_text:
+            synth_text += tail_text
         for c_item in fc_assembler.flush():
             if synth_tool_name and c_item.get("name") == synth_tool_name:
-                synth_text += extract_synthetic_content(c_item.get("args"))
+                synth_text += extract_synthetic_content(c_item.get("args"), emit_tool_name=synth_tool_name)
         if synth_text:
             full_text = synth_text
 
@@ -1517,6 +1525,7 @@ class CookieProxyUpstream(BaseUpstream):
         if _injected is not request_obj.messages:
             request_obj = request_obj.model_copy(update={"messages": _injected})
 
+        orig_clean_msgs = request_obj.messages
         sandbox_spec = create_sandbox_spec(base_model_name, request_obj, _inj_settings)
         synth_tool_name = sandbox_spec.emit_tool_name if sandbox_spec.enabled else ""
 
@@ -1657,8 +1666,23 @@ class CookieProxyUpstream(BaseUpstream):
                 if native_custom_tools or sandbox_spec.enabled:
                     async def fallback_body():
                         native_fallback_state["latched"] = True
+                        fb_req = request_obj
+                        if sandbox_spec.enabled and orig_clean_msgs is not None:
+                            fb_msgs = orig_clean_msgs
+                            if _prefill_mode != "off":
+                                _clean_fb_msgs, _, _ = apply_prefill_compat(
+                                    orig_clean_msgs,
+                                    _prefill_mode,
+                                    allow_model_last=not _profile["requires_user_last_turn"],
+                                    instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
+                                    cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not _profile["is_image"],
+                                    synthetic_tool_name="",
+                                    has_callable_client_tools=False,
+                                )
+                                fb_msgs = _clean_fb_msgs
+                            fb_req = request_obj.model_copy(update={"messages": fb_msgs})
                         return await build_batch_graphql_body_async(
-                            project_id, base_model_name, request_obj,
+                            project_id, base_model_name, fb_req,
                             prefill_active=prefill_active, force_search=force_builtin_search,
                             native_tools=False, sandbox_spec=None,
                         )
@@ -1741,6 +1765,9 @@ class CookieProxyUpstream(BaseUpstream):
                                 yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
                                 tool_call_index += 1
                                 got_tool_call = True
+                            if fc_assembler.synthetic_halted:
+                                print(f"🛑 [Studio 抗截断保护] 检测到 {base_model_name} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
+                                break
 
                         elif status == "thought_signature":
                             signature = _signature_bytes_from_wire(data.get("value"))
@@ -1829,6 +1856,18 @@ class CookieProxyUpstream(BaseUpstream):
                             yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
                             yield "data: [DONE]\n\n"
                             return
+
+                    rem_synth = fc_assembler.flush_synthetic_tail()
+                    if rem_synth:
+                        out = deduper.feed(rem_synth) if deduper else rem_synth
+                        if out:
+                            got_text = True
+                            if not has_yielded_to_client:
+                                yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                has_yielded_to_client = True
+                            stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
+                            stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
+                            yield _make_openai_chunk(response_id, model_display, content=out)
 
                     for c_item in fc_assembler.flush():
                         if not has_yielded_to_client:
