@@ -674,7 +674,11 @@ def print_outbound_debug_report(
         lines.append(f"  🛠️ 工具状态: 注入 {len(tool_decls)} 个工具" + (f" | 🔒 受限解码: {tc_desc}" if tc_desc else ""))
         for d in tool_decls:
             name = d.get("name") if isinstance(d, dict) else getattr(d, "name", "")
-            params = d.get("parameters") if isinstance(d, dict) else getattr(d, "parameters", {})
+            params = (
+                (d.get("parameters") or d.get("parameters_json_schema") or {})
+                if isinstance(d, dict)
+                else (getattr(d, "parameters", None) or getattr(d, "parameters_json_schema", None) or {})
+            )
             props = params.get("properties") if isinstance(params, dict) else {}
             if isinstance(props, list):
                 prop_keys = [item.get("key") for item in props if isinstance(item, dict) and item.get("key")]
@@ -804,6 +808,14 @@ class ToolCallIndexer:
     def has_synthetic_hit(self, candidate_index: int = 0) -> bool:
         asm = self._assemblers.get(candidate_index)
         return bool(asm and asm.synthetic_hit)
+
+    def has_synthetic_halted(self, candidate_index: int = 0) -> bool:
+        asm = self._assemblers.get(candidate_index)
+        return bool(asm and asm.synthetic_halted)
+
+    def flush_synthetic_tail(self, candidate_index: int = 0) -> str:
+        asm = self._assemblers.get(candidate_index)
+        return asm.flush_synthetic_tail() if asm else ""
 
     def flush_function_calls(self, candidate_index: int = 0) -> List[Dict[str, Any]]:
         asm = self._assemblers.get(candidate_index)
@@ -975,6 +987,17 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         if openai_finish_reason and indexer is not None and indexer.has_pending_function_call(candidate_index):
             for c_item in indexer.flush_function_calls(candidate_index):
                 _emit_assembled_call(c_item)
+
+        if indexer is not None and (openai_finish_reason or indexer.has_synthetic_halted(candidate_index)):
+            tail_synth = indexer.flush_synthetic_tail(candidate_index)
+            if tail_synth:
+                synthetic_text_deltas.append(tail_synth)
+                metadata = ordinary_part_metadata("text", tail_synth, None)
+                ordinary_index = indexer.record_ordinary_part(candidate_index, metadata)
+                part_order.append({"type": "ordinary", "index": ordinary_index})
+                ordinary_metadata.append(metadata)
+            if indexer.has_synthetic_halted(candidate_index) and not indexer.has_tool_calls(candidate_index):
+                openai_finish_reason = "stop"
 
         if indexer and indexer.has_synthetic_hit(candidate_index) and not indexer.has_tool_calls(candidate_index):
             if openai_finish_reason == "tool_calls":
@@ -1556,6 +1579,24 @@ async def execute_unified_completion(
                                                 if sse_chunk is None:
                                                     continue
                                             yield sse_chunk
+                                        if tool_indexer.has_synthetic_halted(0):
+                                            print(f"🛑 [抗截断保护] 检测到 {model_to_call} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
+                                            break
+
+                                    rem_synth = tool_indexer.flush_synthetic_tail(0)
+                                    if rem_synth:
+                                        if deduper is not None:
+                                            rem_synth = deduper.feed(rem_synth)
+                                        if rem_synth:
+                                            has_yielded_output = True
+                                            _rem_chunk = {
+                                                "id": response_id_for_stream,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": exp_req_obj.model,
+                                                "choices": [{"index": 0, "delta": {"content": rem_synth}, "finish_reason": None}],
+                                            }
+                                            yield f"data: {json.dumps(_rem_chunk, ensure_ascii=False)}\n\n"
 
                                     if synth_tool_name and not has_yielded_output:
                                         print(f"🔎 [Express 诊断] 模型={model_to_call} 沙箱模式未产出正文。原始响应样本：\n{sampler.dump()}")
