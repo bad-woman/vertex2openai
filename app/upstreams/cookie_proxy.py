@@ -48,7 +48,6 @@ from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
 from synthetic_wrapper import (
     SyntheticSandboxSpec,
-    build_anti_truncation_stop_sequences,
     build_emit_tool_declaration,
     create_sandbox_spec,
     extract_synthetic_content,
@@ -906,9 +905,6 @@ def _build_batch_graphql_body(
         variables["toolConfig"] = {
             "functionCallingConfig": fc_cfg,
         }
-        gen_config["stopSequences"] = build_anti_truncation_stop_sequences(
-            gen_config.get("stopSequences")
-        )
     elif selected_declarations:
         variables["tools"] = [{"functionDeclarations": selected_declarations}]
         function_names = [item["name"] for item in selected_declarations]
