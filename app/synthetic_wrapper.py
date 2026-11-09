@@ -175,21 +175,12 @@ def build_emit_tool_declaration(
     for_cookie: bool = False,
 ) -> Dict[str, Any]:
     """构建通用单字段 content 传输工具声明：
-    1. 明确绑定生命周期终止条件 (; end the call when the requested content is complete.)；
+    1. 全局固定官方标准描述，保证命中 Vertex 隐式前缀缓存并明确生命周期终止条件；
     2. Express 模式使用 parameters_json_schema + additionalProperties: False；
     3. Cookie 模式使用标准 parameters（不含 additionalProperties，防止 batchGraphql 校验拒绝）。
     """
-    is_cont = bool(has_prefill or (prefill_text and prefill_text.strip()))
-    desc = (
-        "Deliver only the new continuation text to append to the existing message; end the call when the requested content is complete."
-        if is_cont
-        else "Deliver the complete user-visible reply as text; end the call when the requested content is complete."
-    )
-    content_desc = (
-        "The new continuation text itself, preserving its language, sections, formatting and markup."
-        if is_cont
-        else "The requested reply itself, preserving its language, sections, formatting and markup."
-    )
+    desc = "Deliver the complete user-visible reply as text; end the call when the requested content is complete."
+    content_desc = "The requested reply itself, preserving its language, sections, formatting and markup."
     base_schema: Dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -261,16 +252,11 @@ def build_sandbox_control_instruction(
 def build_anti_truncation_stop_sequences(
     existing_stops: Optional[List[str]],
 ) -> List[str]:
-    """构建服务端原生 stop_sequences（最多 5 个），包含纯结构闭合特征符作为硬件安全气囊。"""
+    """服务端 stop_sequences 透传函数：严格保持与原版一致，不注入任何自定义结构停止词以保护受限解码状态机。"""
     stops: List[str] = []
     for s in (existing_stops or []):
         if isinstance(s, str) and s and s not in stops:
             stops.append(s)
-    for guard in ("}]})", "]})}", "}]})}"):
-        if len(stops) >= 5:
-            break
-        if guard not in stops:
-            stops.append(guard)
     return stops[:5]
 
 
@@ -279,7 +265,7 @@ def inject_express_gen_config(
     spec: Optional[SyntheticSandboxSpec],
     enable_stream_fc_args: bool = False,
 ) -> None:
-    """向 Express SDK 的 generation_config 字典注入 router_emit 声明、tool_config 与原生 stop_sequences。"""
+    """向 Express SDK 的 generation_config 字典注入 router_emit 声明与 tool_config（不注入 stop_sequences）。"""
     if not spec or not spec.enabled:
         return
 
@@ -306,12 +292,10 @@ def inject_express_gen_config(
             fc_cfg["stream_function_call_arguments"] = True
 
     gen_config_dict["tool_config"] = {"function_calling_config": fc_cfg}
-    gen_config_dict["stop_sequences"] = build_anti_truncation_stop_sequences(
-        gen_config_dict.get("stop_sequences")
-    )
 
 
 _TAIL_OVERFLOW_RE = re.compile(
+    r"(?:"
     r"(?:[!?\s]*\}(?![^\n]*\{)[^\n]{0,60}?)?"
     r"(?:"
     r"Let's\s+(?:check|finalize|make\s+sure|verify)\b[^\n]{0,100}?(?:router_emit|tool\s*call|Done!|[}\])]{2,})"
@@ -319,9 +303,41 @@ _TAIL_OVERFLOW_RE = re.compile(
     r"|\]\}\)\}"
     r"|\]\}\)\)"
     r"|\]\}\)"
+    r"|\}\]\)\}"
+    r")"
+    r"|"
+    r"(?:[!?\s]*\}(?![^\n]*\{)[^\n]{0,30}?)?(?:endasi|end_assistant|исповедь)"
+    r"|"
+    r"[!?\s]*\}\s*(?:endasi|end_assistant|router_emit)"
     r")",
     re.IGNORECASE,
 )
+
+_STRUCTURAL_SYMBOLS = set("{}[]()<>|_\\/`")
+_KNOWN_LEAK_WORDS = ("endasi", "end_assistant", "исповедь", "router_emit", "let's", "done!")
+
+
+def find_tail_repetition(s: str, min_unit_len: int = 3, max_unit_len: int = 40) -> Optional[Tuple[int, str, int]]:
+    """检测字符串尾部是否存在连续周期性短串退化死循环。
+    若单元包含结构字符或已知泄漏词，连续重复 >= 2 次即触发截停（确保在 96 字符尾窗内 0 泄漏）；
+    若为纯自然语言，连续重复 >= 4 次才判定为病态自回归退化。
+    """
+    n = len(s)
+    best = None
+    for ulen in range(min_unit_len, min(max_unit_len, n // 2) + 1):
+        unit = s[-ulen:]
+        repeats = 1
+        curr = n - ulen
+        while curr >= ulen and s[curr - ulen : curr] == unit:
+            repeats += 1
+            curr -= ulen
+
+        is_suspicious = any(c in _STRUCTURAL_SYMBOLS for c in unit) or any(w in unit.lower() for w in _KNOWN_LEAK_WORDS)
+        threshold = 2 if is_suspicious else 4
+        if repeats >= threshold:
+            if best is None or curr < best[0]:
+                best = (curr, unit, repeats)
+    return best
 
 
 def sanitize_synthetic_tail(text: str, emit_tool_name: str = "") -> Tuple[str, bool]:
@@ -330,9 +346,12 @@ def sanitize_synthetic_tail(text: str, emit_tool_name: str = "") -> Tuple[str, b
     """
     if not text:
         return "", False
+
+    # 1. 优先即时拦截明确的单发自检/闭合括号特征
     m = _TAIL_OVERFLOW_RE.search(text)
     if m:
         return text[: m.start()], True
+
     if emit_tool_name and emit_tool_name in text:
         pattern = (
             r"(?:[!?\s]*\}(?![^\n]*\{)[^\n]{0,40}?)?Let\'s\s+[^\n]{0,60}?"
@@ -342,6 +361,12 @@ def sanitize_synthetic_tail(text: str, emit_tool_name: str = "") -> Tuple[str, b
         m_tool = re.search(pattern, text, re.IGNORECASE)
         if m_tool:
             return text[: m_tool.start()], True
+
+    # 2. 通用周期性退化死循环熔断（兜底任何未知重复 token）
+    rep = find_tail_repetition(text)
+    if rep is not None:
+        return text[: rep[0]], True
+
     return text, False
 
 
