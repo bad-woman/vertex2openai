@@ -1,10 +1,10 @@
 """
-Function Call 通用抗截断传输模块 (Router Emit Anti-Truncation Wrapper)
+Function Call 通用抗截断传输模块 (Compose Reply Anti-Truncation Wrapper)
 
 核心机制：
-1. 固定合成工具名 `router_emit`（仅在客户端工具同名冲突时生成随机后缀），保证 Vertex 隐式前缀缓存命中；
+1. 固定合成工具名 `compose_reply`（仅在客户端工具同名冲突时生成随机后缀），保证 Vertex 隐式前缀缓存命中；
 2. 零侵入消息历史，与所有客户端及预填充模式正交解耦；
-3. 服务端规范约束 (; end the call...) + 服务端原生 stop_sequences (["}]})", "]})}"]) + 网关滑动尾窗熔断三重防线；
+3. 服务端规范约束 (; end the call...) + 网关双轨滑动尾窗熔断（单发自检即时切除 + 周期退化通用截断）；
 4. 支持 Express SDK 与 Studio Cookie 双通道的真流式 (partialArgs)、假流式与非流式透明拆包。
 """
 import json
@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from google.genai import types
 import model_capabilities as mc
 
-DEFAULT_SYNTHETIC_TOOL_NAME = "router_emit"
+DEFAULT_SYNTHETIC_TOOL_NAME = "compose_reply"
 DOWNSTREAM_ID_PREFIX = "chatcmpl-bad_woman"
 
 CONTENT_KEYS = (
@@ -131,7 +131,7 @@ def should_enable_sandbox(model_name: str, request_obj: Any, settings: Optional[
 
 
 def create_sandbox_spec(model_name: str, request_obj: Any, settings: Optional[dict]) -> SyntheticSandboxSpec:
-    """为单次请求构建抗截断工具规格（默认使用固定名 router_emit 以命中 Vertex 隐式缓存）。"""
+    """为单次请求构建抗截断工具规格（默认使用固定名 compose_reply 以命中 Vertex 隐式缓存）。"""
     settings = settings or {}
     ok, reason = should_enable_sandbox(model_name, request_obj, settings)
     if not ok:
@@ -153,9 +153,9 @@ def create_sandbox_spec(model_name: str, request_obj: Any, settings: Optional[di
     real_names = [] if strip_client else list(all_client_names)
 
     if any(n.startswith(DEFAULT_SYNTHETIC_TOOL_NAME) for n in all_client_names):
-        emit_name = f"router_{uuid.uuid4().hex[:24]}"
+        emit_name = f"compose_{uuid.uuid4().hex[:24]}"
         while emit_name in all_client_names:
-            emit_name = f"router_{uuid.uuid4().hex[:24]}"
+            emit_name = f"compose_{uuid.uuid4().hex[:24]}"
     else:
         emit_name = DEFAULT_SYNTHETIC_TOOL_NAME
 
@@ -265,7 +265,7 @@ def inject_express_gen_config(
     spec: Optional[SyntheticSandboxSpec],
     enable_stream_fc_args: bool = False,
 ) -> None:
-    """向 Express SDK 的 generation_config 字典注入 router_emit 声明与 tool_config（不注入 stop_sequences）。"""
+    """向 Express SDK 的 generation_config 字典注入 compose_reply 声明与 tool_config（不注入 stop_sequences）。"""
     if not spec or not spec.enabled:
         return
 
@@ -298,7 +298,7 @@ _TAIL_OVERFLOW_RE = re.compile(
     r"(?:"
     r"(?:[!?\s]*\}(?![^\n]*\{)[^\n]{0,60}?)?"
     r"(?:"
-    r"Let's\s+(?:check|finalize|make\s+sure|verify)\b[^\n]{0,100}?(?:router_emit|tool\s*call|Done!|[}\])]{2,})"
+    r"Let's\s+(?:check|finalize|make\s+sure|verify)\b[^\n]{0,100}?(?:compose_reply|router_emit|tool\s*call|Done!|[}\])]{2,})"
     r"|Done!\s*[}\])\s]{2,}"
     r"|\]\}\)\}"
     r"|\]\}\)\)"
@@ -308,13 +308,13 @@ _TAIL_OVERFLOW_RE = re.compile(
     r"|"
     r"(?:[!?\s]*\}(?![^\n]*\{)[^\n]{0,30}?)?(?:endasi|end_assistant|исповедь)"
     r"|"
-    r"[!?\s]*\}\s*(?:endasi|end_assistant|router_emit)"
+    r"[!?\s]*\}\s*(?:endasi|end_assistant|compose_reply|router_emit)"
     r")",
     re.IGNORECASE,
 )
 
 _STRUCTURAL_SYMBOLS = set("{}[]()<>|_\\/`")
-_KNOWN_LEAK_WORDS = ("endasi", "end_assistant", "исповедь", "router_emit", "let's", "done!")
+_KNOWN_LEAK_WORDS = ("endasi", "end_assistant", "исповедь", "compose_reply", "router_emit", "let's", "done!")
 
 
 def find_tail_repetition(s: str, min_unit_len: int = 3, max_unit_len: int = 40) -> Optional[Tuple[int, str, int]]:
