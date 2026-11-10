@@ -24,6 +24,7 @@ import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
+from synthetic_wrapper import create_sandbox_spec, inject_express_gen_config
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool]:
@@ -84,18 +85,33 @@ def _prefill_log(mode: str, prefill_text: str) -> str:
 _ENDPOINT_LOGGED = False
 
 
+def create_express_genai_client(api_key: str, http_options: Any = None) -> Any:
+    """按 Google 官方 Gemini Enterprise Agent Platform (Express Mode) 规范初始化 genai.Client。
+    优先使用官方最新参数 enterprise=True，若运行环境为较旧版 google-genai SDK 则自动回退至等价的 vertexai=True。
+    """
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if http_options is not None:
+        kwargs["http_options"] = http_options
+    try:
+        return genai.Client(enterprise=True, **kwargs)
+    except TypeError:
+        return genai.Client(vertexai=True, **kwargs)
+
+
 def _log_resolved_endpoint(client: Any) -> None:
     global _ENDPOINT_LOGGED
     if _ENDPOINT_LOGGED:
         return
     _ENDPOINT_LOGGED = True
     try:
+        is_vertex = getattr(client, "vertexai", None)
         api = client._api_client
         base_url = getattr(api._http_options, "base_url", None)
         api_version = getattr(api._http_options, "api_version", None)
         scope = "全局端点（URL 无 location 段）" if base_url == "https://aiplatform.googleapis.com/" \
             else "自定义/区域端点"
-        print(f"🌐 [上游端点] 标准模式解析结果：base_url={base_url} api_version={api_version} "
+        mode_tag = "Enterprise/Vertex AI" if is_vertex else "Developer API"
+        print(f"🌐 [上游端点] 标准模式解析结果（{mode_tag}）：base_url={base_url} api_version={api_version} "
               f"project={api.project} location={api.location} → {scope}。")
     except Exception as e:
         print(f"⚠️ [上游端点] 读取端点解析结果失败（不影响调用）：{e}")
@@ -152,17 +168,24 @@ class ExpressSDKUpstream(BaseUpstream):
         if _injected is not request_obj.messages:
             request_obj = request_obj.model_copy(update={"messages": _injected})
 
+        sandbox_spec = create_sandbox_spec(base_model_name, request_obj, _inj_settings)
+        synth_tool_name = sandbox_spec.emit_tool_name if sandbox_spec.enabled else ""
+
         _prefill_mode = _inj_settings.get("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
-        if _prefill_mode != "off":
+        if _prefill_mode != "off" or synth_tool_name:
             new_msgs, prefill_text, prefill_active = apply_prefill_compat(
-                request_obj.messages, _prefill_mode,
+                request_obj.messages,
+                _prefill_mode,
                 allow_model_last=not profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), is_image_model),
-                cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not is_image_model,
+                cot_guard=not is_image_model,
+                synthetic_tool_name=synth_tool_name,
+                has_callable_client_tools=bool(sandbox_spec.real_tool_names),
             )
             if new_msgs is not request_obj.messages:
                 request_obj = request_obj.model_copy(update={"messages": new_msgs})
-                print(_prefill_log(_prefill_mode, prefill_text))
+                if prefill_active:
+                    print(_prefill_log(_prefill_mode, prefill_text))
             if prefill_active and _inj_settings.get("prefill_suppress_thinking", True):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
@@ -182,14 +205,32 @@ class ExpressSDKUpstream(BaseUpstream):
                 gen_config_dict["tools"] = [search_tool]
             print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
 
-        prompt_func = partial(create_gemini_prompt, model_name=base_model_name)
+        sandbox_spec.prefill_text = prefill_text or ""
+        sandbox_spec.has_prefill = bool(prefill_active)
+        if sandbox_spec.enabled:
+            _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
+            _real_stream = bool(request_obj.stream and not _fake_on and not is_image_model)
+            inject_express_gen_config(gen_config_dict, sandbox_spec, enable_stream_fc_args=_real_stream)
+            print(
+                f"🛡️ [抗截断] Express 通道已启用工具传输 | 工具={sandbox_spec.emit_tool_name}"
+                + (" | 流式参数分片=已启用" if _real_stream else "")
+            )
 
-        if app_state.get_setting("debug_outbound", False):
-            _dbg = {k: v for k, v in gen_config_dict.items()
-                    if k in ("temperature", "top_p", "top_k", "candidate_count",
-                             "max_output_tokens", "stop_sequences", "thinking_config",
-                             "response_modalities", "image_config")}
-            print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
+        prompt_func = partial(
+            create_gemini_prompt,
+            model_name=base_model_name,
+            sandbox_spec=sandbox_spec,
+        )
+
+        from api_helpers import print_outbound_debug_report
+        print_outbound_debug_report(
+            channel="Express",
+            model_name=base_model_name,
+            gen_config_dict=gen_config_dict,
+            messages=request_obj.messages,
+            prefill_text=prefill_text,
+            sandbox_spec=sandbox_spec,
+        )
 
         return {
             "request_obj": request_obj,
@@ -199,6 +240,8 @@ class ExpressSDKUpstream(BaseUpstream):
             "prompt_func": prompt_func,
             "prefill_text": prefill_text,
             "is_image_model": is_image_model,
+            "sandbox_spec": sandbox_spec,
+            "synthetic_tool_name": sandbox_spec.emit_tool_name if sandbox_spec.enabled else "",
         }, None
 
     def build_key_call_spec(self, ctx: dict, key_record: dict) -> dict:
@@ -208,8 +251,7 @@ class ExpressSDKUpstream(BaseUpstream):
         model_to_call = resolve_express_model_path(
             base_model_name, ctx["inj_settings"], key_project_id=key_record.get("project_id", "")
         )
-        client_to_use = genai.Client(
-            vertexai=True,
+        client_to_use = create_express_genai_client(
             api_key=express_api_key,
             http_options=get_http_options(),
         )
@@ -222,8 +264,7 @@ class ExpressSDKUpstream(BaseUpstream):
             "model_to_call": model_to_call,
             "fallback_model": (base_model_name if model_to_call != base_model_name else None),
             "fallback_client_factory": (
-                lambda: genai.Client(
-                    vertexai=True,
+                lambda: create_express_genai_client(
                     api_key=express_api_key,
                     http_options=get_http_options(),
                 )
