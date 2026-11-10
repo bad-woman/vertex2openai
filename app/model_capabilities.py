@@ -132,6 +132,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     major = int(m.group(1)) if m else 3
     minor = int(m.group(2)) if (m and m.group(2)) else 0
     is_pro = "pro" in name
+    family = f"g{major}"
 
     levels = {"low", "medium", "high"}
     if _supports_minimal(major, minor, is_pro):
@@ -150,7 +151,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     if temp_dep:
         allowed -= {"temperature", "top_p", "top_k"}
     return {
-        "family": "g3",
+        "family": family,
         "is_image": False,
         "thinking_kind": "level",
         "thinking_levels": levels,
