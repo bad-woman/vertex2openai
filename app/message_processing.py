@@ -12,9 +12,18 @@ import model_capabilities as mc
 from runtime_state import app_state
 from signature_store import (
     signature_store,
+    image_signature_store,
     SKIP_VALIDATOR_SENTINEL,
     SignatureRecord,
     SignatureState,
+)
+from synthetic_wrapper import (
+    SyntheticSandboxSpec,
+    build_sandbox_control_instruction,
+    extract_synthetic_content,
+    is_content_json_path,
+    make_bad_woman_response_id,
+    sanitize_synthetic_tail,
 )
 
 from google.genai import types
@@ -89,11 +98,20 @@ SUPPORTED_ROLES = ["user", "model", "function"]
 LEGACY_THOUGHT_SEP = "__thought__"
 
 
-def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
+def _signature_bytes(part: Any, fc: Any = None) -> Optional[bytes]:
     """从 part / function_call 上取出思考签名，统一成 bytes。"""
-    sig = getattr(part, "thought_signature", None)
+    sig = None
+    if isinstance(part, dict):
+        sig = part.get("thoughtSignature") or part.get("thought_signature")
+    elif part is not None:
+        sig = getattr(part, "thought_signature", None)
+
     if sig is None:
-        sig = getattr(fc, "thought_signature", None)
+        if isinstance(fc, dict):
+            sig = fc.get("thoughtSignature") or fc.get("thought_signature")
+        elif fc is not None:
+            sig = getattr(fc, "thought_signature", None)
+
     if isinstance(sig, bytes):
         return sig or None
     if isinstance(sig, str) and sig:
@@ -227,11 +245,14 @@ def resolve_tool_call_signature(tool_call_id: str,
 
 
 def _requires_signature(model_name: str) -> bool:
-    """该模型是否强校验思考签名（仅 Gemini 3.x / 4.x 家族）。"""
+    """该模型是否强校验思考签名（Gemini 3.x / 4.x 家族及生图模型）。"""
     if not model_name:
         return False
     try:
-        return mc.get_profile(model_name)["family"] == "g3"
+        prof = mc.get_profile(model_name)
+        if prof.get("is_image"):
+            return True
+        return prof.get("family") in ("g3", "g4")
     except Exception:
         return False
 
@@ -253,7 +274,14 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
             try:
                 raw_bytes = base64.b64decode(b64_data)
                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                sig = image_signature_store.get(raw_bytes) or image_signature_store.get(opt_bytes)
+                part = types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime)
+                if sig:
+                    try:
+                        part = part.model_copy(update={"thought_signature": sig})
+                    except Exception:
+                        setattr(part, "thought_signature", sig)
+                parts.append(part)
                 start, end = match.span()
                 remaining_text = remaining_text[:start] + remaining_text[end:]
             except Exception as e:
@@ -370,29 +398,63 @@ def apply_console_injection(
     return new_msgs, notes
 
 
-_TAG_OPEN_RE = re.compile(r"<([A-Za-z][A-Za-z0-9_\-~.:]*)\s*>")
+_VOID_HTML_TAGS = {
+    "br", "hr", "img", "input", "meta", "link", "area", "base",
+    "col", "embed", "param", "source", "track", "wbr",
+}
+
+_TAG_OPEN_RE = re.compile(
+    r"<([A-Za-z\u4e00-\u9fff\u3040-\u30ff][A-Za-z0-9_\-~.:\u4e00-\u9fff\u3040-\u30ff]{0,48})"
+    r"(?:\s+[^<>]*?)?>"
+)
 
 
 def detect_unclosed_tag(text: str) -> Optional[str]:
-    """找出文本里"开了但没闭合"的最后一个标签名，没有则返回 None。"""
+    """找出文本里"开了但没闭合"的最后一个标签名（支持英文、中文及带属性标签），没有则返回 None。"""
     if not text:
         return None
     last: Optional[str] = None
     for m in _TAG_OPEN_RE.finditer(text):
+        full_tag = m.group(0)
+        if full_tag.rstrip().endswith("/>"):
+            continue
         name = m.group(1)
-        if re.search(rf"</\s*{re.escape(name)}\s*>", text[m.end():]):
+        low_name = name.lower()
+        if low_name in _VOID_HTML_TAGS or low_name.startswith(("http:", "https:", "mailto:", "ftp:")):
+            continue
+        if re.search(rf"</\s*{re.escape(name)}\s*>", text[m.end():], re.IGNORECASE):
             continue
         last = name
     return last
 
 
-def build_cot_guard(tag: str) -> str:
-    """生成"必须先写完思维链再写正文"的强化要求（思维链守卫）。"""
+def build_cot_guard(tag: str, is_keep_turn: bool = False) -> str:
+    """生成"必须先写完思维链再写正文"的硬性格式要求（思维链守卫）。"""
+    pos_ref = "上一条回复已写好的开头" if is_keep_turn else "下方已写好的开头"
     return (
-        f"（格式硬性要求：下方已写好的开头正停在未闭合的 <{tag}> 标签内部；"
-        f"请直接从断点处继续写出 <{tag}> 内的全部思考内容，写完后用 </{tag}> 闭合，然后才开始写正文；"
-        f"严禁再次重复输出 <{tag}> 开标签，严禁跳过思考直接写正文，也不允许只写一个空标签。）"
+        f"（格式硬性要求：{pos_ref}正停在未闭合的 <{tag}> 标签内部；"
+        f"请直接从断点处继续写出 <{tag}> 内的完整思考内容，写完后用 </{tag}> 闭合，然后才开始写正文；"
+        f"不要再次重复输出 <{tag}> 开标签，不要跳过思考直接写正文，也不允许只写一个空标签。）"
     )
+
+
+def _append_control_to_last_user(messages: List[OpenAIMessage], control_text: str) -> List[OpenAIMessage]:
+    """当请求无 prefill 时，将合成工具传输指令追加到最后一条 user 消息末尾（若仅含 system 消息则补一条 user）。"""
+    if not control_text or not messages:
+        return messages
+    new_msgs = list(messages)
+    sep = "\n\n"
+    for i in range(len(new_msgs) - 1, -1, -1):
+        if new_msgs[i].role == "user":
+            prev_u = new_msgs[i]
+            if isinstance(prev_u.content, str):
+                new_msgs[i] = prev_u.model_copy(update={"content": prev_u.content + sep + control_text.strip()})
+            elif isinstance(prev_u.content, list):
+                merged_list = list(prev_u.content) + [{"type": "text", "text": sep + control_text.strip()}]
+                new_msgs[i] = prev_u.model_copy(update={"content": merged_list})
+            return new_msgs
+    new_msgs.append(OpenAIMessage(role="user", content=control_text.strip()))
+    return new_msgs
 
 
 def apply_prefill_compat(
@@ -400,70 +462,168 @@ def apply_prefill_compat(
     mode: str = "smart",
     allow_model_last: bool = False,
     instruction_template: str = "",
-    cot_guard: bool = False,
+    cot_guard: bool = True,
+    synthetic_tool_name: str = "",
+    has_callable_client_tools: bool = False,
 ) -> Tuple[List[OpenAIMessage], str, bool]:
     """
     预填充(prefill)兼容：Gemini 3.x / 4.x 拒绝以 assistant/model 结尾的请求（400）。
+    自动穿透末尾或中间夹杂的 system 消息识别真实的最后一条对话轮次，并保留全部 system 消息。
     返回 (处理后的消息列表, 需拼回输出开头的预填充文本, 是否检测到预填充)。
     """
-    if not messages or mode == "off":
+    if not messages:
         return messages, "", False
 
+    if mode == "off":
+        if synthetic_tool_name:
+            ctrl = build_sandbox_control_instruction(
+                synthetic_tool_name,
+                has_prefill=False,
+                has_callable_client_tools=has_callable_client_tools,
+            )
+            return _append_control_to_last_user(messages, ctrl), "", False
+        return messages, "", False
+
+    # 倒序寻找最后一条非空且非 system 的实际对话消息（因为 system 会被抽入 system_instruction，不进入 contents）
     idx = len(messages) - 1
-    while idx >= 0 and _is_empty_message(messages[idx]):
+    while idx >= 0 and (_is_empty_message(messages[idx]) or messages[idx].role == "system"):
         idx -= 1
     if idx < 0:
+        if synthetic_tool_name:
+            ctrl = build_sandbox_control_instruction(
+                synthetic_tool_name,
+                has_prefill=False,
+                has_callable_client_tools=has_callable_client_tools,
+            )
+            return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
     last = messages[idx]
     if last.role != "assistant" or getattr(last, "tool_calls", None):
+        if synthetic_tool_name:
+            ctrl = build_sandbox_control_instruction(
+                synthetic_tool_name,
+                has_prefill=False,
+                has_callable_client_tools=has_callable_client_tools,
+            )
+            return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
-    raw_prefill = _message_text(last.content)
+    # 向上收集末尾所有连续的 assistant 预填充消息（穿透中间夹杂的空消息或 system 消息）
+    start_idx = idx
+    while start_idx > 0:
+        prev_m = messages[start_idx - 1]
+        if _is_empty_message(prev_m) or prev_m.role == "system":
+            start_idx -= 1
+            continue
+        if prev_m.role == "assistant" and not getattr(prev_m, "tool_calls", None):
+            start_idx -= 1
+            continue
+        break
+    # 将 start_idx 向前收紧到第一条实际的 assistant 预填充处（其前面的 system 留在 prefix_msgs 中）
+    while start_idx < idx and (messages[start_idx].role == "system" or _is_empty_message(messages[start_idx])):
+        start_idx += 1
+
+    prefill_segments: List[str] = []
+    trailing_system_msgs: List[OpenAIMessage] = []
+    for k in range(start_idx, len(messages)):
+        m_item = messages[k]
+        if m_item.role == "system":
+            if not _is_empty_message(m_item):
+                trailing_system_msgs.append(m_item)
+        elif not _is_empty_message(m_item) and m_item.role == "assistant":
+            seg_text = _message_text(m_item.content)
+            if seg_text and seg_text.strip():
+                prefill_segments.append(seg_text.lstrip("\r\n").rstrip(" \t\r"))
+
+    raw_prefill = "\n\n".join(prefill_segments)
     if not raw_prefill or not raw_prefill.strip():
+        if synthetic_tool_name:
+            ctrl = build_sandbox_control_instruction(
+                synthetic_tool_name,
+                has_prefill=False,
+                has_callable_client_tools=has_callable_client_tools,
+            )
+            return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
     prefill = raw_prefill.lstrip("\r\n").rstrip(" \t\r")
     if prefill.endswith("\n\n"):
         prefill = prefill.rstrip("\n") + "\n"
 
+    prefix_msgs = list(messages[:start_idx])
+    merged_assistant_msg = OpenAIMessage(role="assistant", content=prefill)
+
     if mode == "minimal":
-        new_msgs = list(messages[:idx + 1])
-        new_msgs.append(OpenAIMessage(role="user", content="(请继续)"))
+        new_msgs = prefix_msgs + trailing_system_msgs + [merged_assistant_msg]
+        tail_text = "(请继续)"
+        if synthetic_tool_name:
+            unclosed_min = detect_unclosed_tag(prefill) if cot_guard else None
+            tail_text += "\n" + build_sandbox_control_instruction(
+                synthetic_tool_name,
+                has_prefill=True,
+                unclosed_tag=unclosed_min,
+                has_callable_client_tools=has_callable_client_tools,
+            )
+        new_msgs.append(OpenAIMessage(role="user", content=tail_text))
         return new_msgs, "", True
 
-    if allow_model_last:
-        return messages, prefill, True
+    if allow_model_last and not synthetic_tool_name:
+        return prefix_msgs + trailing_system_msgs + [merged_assistant_msg], prefill, True
 
     unclosed_tag = detect_unclosed_tag(prefill) if cot_guard else None
 
     if mode == "keep_turn":
-        new_msgs = list(messages[:idx + 1])
+        new_msgs = prefix_msgs + trailing_system_msgs + [merged_assistant_msg]
         nudge = (instruction_template or "").strip() or DEFAULT_KEEP_TURN_NUDGE
-        if unclosed_tag:
-            nudge = nudge + "\n\n" + build_cot_guard(unclosed_tag)
+        if synthetic_tool_name:
+            nudge = nudge + "\n" + build_sandbox_control_instruction(
+                synthetic_tool_name,
+                has_prefill=True,
+                unclosed_tag=unclosed_tag,
+                is_keep_turn=True,
+                has_callable_client_tools=has_callable_client_tools,
+            )
+        elif unclosed_tag:
+            nudge = nudge + "\n\n" + build_cot_guard(unclosed_tag, is_keep_turn=True)
         new_msgs.append(OpenAIMessage(role="user", content=nudge))
         return new_msgs, prefill, True
 
-    # smart 模式：将 cot_guard 放在 intro 与 prefill 之间，确保整条消息严格以 prefill 原文断点收尾
-    new_msgs = list(messages[:idx])
+    # smart 模式：将合成工具传输指令与标签守卫置于 intro 内（位于 prefill 原文之前），
+    # 并穿透末尾 system 找到最后一条真实 user 消息进行无损合并，确保最终对话严格以 prefill 原文收尾！
     intro = (instruction_template or "").strip() or DEFAULT_PREFILL_INSTRUCTION
-    if unclosed_tag:
-        intro = intro + "\n" + build_cot_guard(unclosed_tag)
+    if synthetic_tool_name:
+        intro = intro + "\n" + build_sandbox_control_instruction(
+            synthetic_tool_name,
+            has_prefill=True,
+            unclosed_tag=unclosed_tag,
+            is_keep_turn=False,
+            has_callable_client_tools=has_callable_client_tools,
+        )
+    elif unclosed_tag:
+        intro = intro + "\n" + build_cot_guard(unclosed_tag, is_keep_turn=False)
     instruction = intro + "\n\n" + prefill
+    join_sep = "\n\n"
 
-    if new_msgs and new_msgs[-1].role == "user":
-        prev_user = new_msgs[-1]
+    # 在 prefix_msgs 中倒序查找最后一条非 system 的对话消息，若为 user 则直接合并
+    last_non_sys_idx = len(prefix_msgs) - 1
+    while last_non_sys_idx >= 0 and prefix_msgs[last_non_sys_idx].role == "system":
+        last_non_sys_idx -= 1
+
+    new_msgs = list(prefix_msgs) + trailing_system_msgs
+    if last_non_sys_idx >= 0 and new_msgs[last_non_sys_idx].role == "user":
+        prev_user = new_msgs.pop(last_non_sys_idx)
         if isinstance(prev_user.content, str):
-            merged = prev_user.content + "\n\n" + instruction
-            new_msgs[-1] = prev_user.model_copy(update={"content": merged})
+            merged_u = prev_user.model_copy(update={"content": prev_user.content + join_sep + instruction})
         elif isinstance(prev_user.content, list):
-            merged_list = list(prev_user.content) + [{"type": "text", "text": "\n\n" + instruction}]
-            new_msgs[-1] = prev_user.model_copy(update={"content": merged_list})
+            merged_list = list(prev_user.content) + [{"type": "text", "text": join_sep + instruction}]
+            merged_u = prev_user.model_copy(update={"content": merged_list})
         else:
-            new_msgs.append(OpenAIMessage(role="user", content=instruction))
+            merged_u = OpenAIMessage(role="user", content=instruction)
+        new_msgs.append(merged_u)
     else:
         new_msgs.append(OpenAIMessage(role="user", content=instruction))
+
     return new_msgs, prefill, True
 
 
@@ -498,7 +658,10 @@ def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 4) -> st
 
     unclosed_tag = detect_unclosed_tag(prefill)
     if unclosed_tag:
-        tag_pattern = re.compile(rf"<\s*{re.escape(unclosed_tag)}\s*>", re.IGNORECASE)
+        tag_pattern = re.compile(
+            rf"<\s*{re.escape(unclosed_tag)}(?:\s+[^<>]*?)?\s*>",
+            re.IGNORECASE,
+        )
         last_tag_match = None
         for m in tag_pattern.finditer(pre_clean):
             last_tag_match = m
@@ -531,7 +694,7 @@ def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 4) -> st
 class PrefillDeduper:
     """流式版预填充去重器。"""
 
-    def __init__(self, prefill: str, window_cap: int = 600):
+    def __init__(self, prefill: str, window_cap: int = 65536):
         self.prefill = prefill or ""
         self.window = min(len(self.prefill) + 48, window_cap) if self.prefill else 0
         self.buffer = ""
@@ -695,16 +858,144 @@ def _set_json_path_value(root: Dict[str, Any], tokens: List[Any], value: Any, ap
 
 class FunctionCallStreamAssembler:
     """将 Gemini streamFunctionCallArguments 的分片 FunctionCall (partialArgs / willContinue)
-    安全聚合成完整的函数调用事件，同时 100% 兼容普通单块 FunctionCall。"""
+    安全聚合成完整的函数调用事件，同时支持合成传输工具 (compose_reply) 的实时流式直通拆包与防闭合溢出熔断。"""
 
-    def __init__(self):
+    _TAIL_HOLD_CHARS = 96
+
+    def __init__(self, synthetic_tool_name: str = ""):
         self._pending: Optional[Dict[str, Any]] = None
+        self.synthetic_tool_name: str = (synthetic_tool_name or "").strip()
+        self.synthetic_hit: bool = False
+        self.synthetic_halted: bool = False
+        self._pending_is_synthetic: bool = False
+        self._last_synth_path: str = ""
+        self._synth_signature: Optional[bytes] = None
+        self._synth_tail_buf: str = ""
 
     def has_pending(self) -> bool:
         return self._pending is not None
 
+    def flush_synthetic_tail(self) -> str:
+        """冲刷合成工具滑动尾窗中剩余的文本（流结束时调用）。"""
+        if not self._synth_tail_buf:
+            return ""
+        raw = self._synth_tail_buf
+        self._synth_tail_buf = ""
+        if self.synthetic_halted:
+            return ""
+        clean, halted = sanitize_synthetic_tail(raw, emit_tool_name=self.synthetic_tool_name)
+        if halted:
+            self.synthetic_halted = True
+        return clean
+
+    def feed_with_synthetic(
+        self, fc: Any, thought_signature: Optional[bytes] = None
+    ) -> Tuple[List[Dict[str, Any]], str, Optional[bytes]]:
+        """喂入一个 function_call 对象或字典。
+        返回: (已聚合完成的真实工具调用列表, 合成工具实时提取出的正文增量文本, 合成工具携带的思考签名)
+        """
+        if fc is None:
+            return [], "", None
+
+        if isinstance(fc, dict):
+            fc_id = str(fc.get("id") or "").strip() or None
+            fc_name = str(fc.get("name") or "").strip()
+            fc_args = fc.get("args")
+            fc_partial = fc.get("partialArgs") if "partialArgs" in fc else fc.get("partial_args")
+            fc_will_continue = bool(fc.get("willContinue") if "willContinue" in fc else fc.get("will_continue"))
+        else:
+            fc_id = str(getattr(fc, "id", "") or "").strip() or None
+            fc_name = str(getattr(fc, "name", "") or "").strip()
+            fc_args = getattr(fc, "args", None)
+            fc_partial = getattr(fc, "partial_args", None)
+            fc_will_continue = bool(getattr(fc, "will_continue", False))
+
+        is_synth = False
+        if self.synthetic_tool_name:
+            if fc_name == self.synthetic_tool_name:
+                is_synth = True
+            elif not fc_name and self._pending_is_synthetic:
+                is_synth = True
+
+        if is_synth:
+            if self.synthetic_halted:
+                return [], "", None
+
+            ready_real: List[Dict[str, Any]] = []
+            if self._pending is not None:
+                ready_real.append(self._finalize_pending())
+
+            self.synthetic_hit = True
+            self._pending_is_synthetic = bool(fc_will_continue)
+            if thought_signature:
+                self._synth_signature = thought_signature
+
+            has_args = isinstance(fc_args, dict) and len(fc_args) > 0
+            has_partial = isinstance(fc_partial, list) and len(fc_partial) > 0
+            synth_deltas: List[str] = []
+
+            if has_partial:
+                for parg in fc_partial:
+                    raw_path = (
+                        parg.get("jsonPath", parg.get("json_path"))
+                        if isinstance(parg, dict)
+                        else getattr(parg, "json_path", getattr(parg, "jsonPath", None))
+                    )
+                    path_str = str(raw_path or "").strip() or self._last_synth_path
+                    if path_str:
+                        self._last_synth_path = path_str
+                    has_val, val, _ = _extract_partial_arg_value(parg)
+                    if has_val and isinstance(val, str) and val:
+                        tokens = _parse_json_path_tokens(path_str)
+                        if is_content_json_path(tokens, path_str) or not tokens:
+                            synth_deltas.append(val)
+            elif has_args:
+                extracted = extract_synthetic_content(fc_args, emit_tool_name=self.synthetic_tool_name)
+                if extracted:
+                    synth_deltas.append(extracted)
+
+            incoming_text = "".join(synth_deltas)
+            if incoming_text:
+                self._synth_tail_buf += incoming_text
+
+            clean_buf, halted = sanitize_synthetic_tail(
+                self._synth_tail_buf, emit_tool_name=self.synthetic_tool_name
+            )
+            if halted:
+                self.synthetic_halted = True
+                self._pending_is_synthetic = False
+                self._last_synth_path = ""
+                self._synth_tail_buf = ""
+                sig_to_emit = self._synth_signature
+                self._synth_signature = None
+                return ready_real, clean_buf, sig_to_emit
+
+            if not fc_will_continue:
+                self._last_synth_path = ""
+                out_text = self._synth_tail_buf
+                self._synth_tail_buf = ""
+            elif len(self._synth_tail_buf) > self._TAIL_HOLD_CHARS:
+                cut = len(self._synth_tail_buf) - self._TAIL_HOLD_CHARS
+                out_text = self._synth_tail_buf[:cut]
+                self._synth_tail_buf = self._synth_tail_buf[cut:]
+            else:
+                out_text = ""
+
+            sig_to_emit: Optional[bytes] = None
+            if out_text or not fc_will_continue:
+                sig_to_emit = self._synth_signature
+                self._synth_signature = None
+            return ready_real, out_text, sig_to_emit
+
+        # 若此前处于合成工具分片但本块切换到了真实工具名，复位合成挂起状态
+        if fc_name and self.synthetic_tool_name and fc_name != self.synthetic_tool_name:
+            self._pending_is_synthetic = False
+            self._last_synth_path = ""
+
+        return self.feed(fc, thought_signature=thought_signature), "", None
+
     def feed(self, fc: Any, thought_signature: Optional[bytes] = None) -> List[Dict[str, Any]]:
-        """喂入一个 function_call 对象或字典，返回目前已聚合完成的调用列表。"""
+        """喂入一个真实 function_call 对象或字典，返回目前已聚合完成的调用列表。"""
         if fc is None:
             return []
 
@@ -804,7 +1095,11 @@ class FunctionCallStreamAssembler:
         }
 
 
-def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") -> List[types.Content]:
+def create_gemini_prompt(
+    messages: List[OpenAIMessage],
+    model_name: str = "",
+    sandbox_spec: Optional[SyntheticSandboxSpec] = None,
+) -> List[types.Content]:
     """OpenAI 消息 → Gemini contents。"""
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     require_sig = _requires_signature(model_name)
@@ -991,13 +1286,27 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
                                 mime_type, b64_data = mime_match.groups()
                                 raw_bytes = base64.b64decode(b64_data)
                                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                sig = image_signature_store.get(raw_bytes) or image_signature_store.get(opt_bytes)
+                                img_part = types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime)
+                                if sig:
+                                    try:
+                                        img_part = img_part.model_copy(update={"thought_signature": sig})
+                                    except Exception:
+                                        setattr(img_part, "thought_signature", sig)
+                                parts.append(img_part)
                         elif image_url.startswith(("http://", "https://")):
                             fetched = fetch_remote_image(image_url)
                             if fetched:
                                 img_bytes, mime_type = fetched
                                 opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                sig = image_signature_store.get(img_bytes) or image_signature_store.get(opt_bytes)
+                                img_part = types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime)
+                                if sig:
+                                    try:
+                                        img_part = img_part.model_copy(update={"thought_signature": sig})
+                                    except Exception:
+                                        setattr(img_part, "thought_signature", sig)
+                                parts.append(img_part)
 
             if message_sig and exact_ordinary_parts is None:
                 target = None
@@ -1015,6 +1324,27 @@ def create_gemini_prompt(messages: List[OpenAIMessage], model_name: str = "") ->
 
         if not parts:
             continue
+
+        if current_gemini_role == "model":
+            for p_idx, p in enumerate(parts):
+                inline = getattr(p, "inline_data", None)
+                if inline is not None and getattr(inline, "data", None):
+                    if not getattr(p, "thought_signature", None):
+                        resolved_sig = image_signature_store.get(inline.data)
+                        if not resolved_sig and require_sig:
+                            resolved_sig = SKIP_VALIDATOR_SENTINEL
+                            print("⚠️ [生图历史] 历史回复中的图片思考签名未在缓存命中，已自动补全官方跳过校验哨兵。")
+                        elif resolved_sig:
+                            print("✅ [生图历史] 已成功从缓存恢复历史生图的完整思考签名。")
+                        if resolved_sig:
+                            try:
+                                parts[p_idx] = p.model_copy(update={"thought_signature": resolved_sig})
+                            except Exception:
+                                try:
+                                    setattr(parts[p_idx], "thought_signature", resolved_sig)
+                                except Exception:
+                                    pass
+
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
 
     def _is_text_only(content: types.Content) -> bool:
@@ -1134,8 +1464,12 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
 
 def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
     opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-    return {"inlineData": {"mimeType": opt_mime,
-                           "data": base64.b64encode(opt_bytes).decode("utf-8")}}
+    sig = image_signature_store.get(raw_bytes) or image_signature_store.get(opt_bytes)
+    res = {"inlineData": {"mimeType": opt_mime,
+                          "data": base64.b64encode(opt_bytes).decode("utf-8")}}
+    if sig:
+        res["thoughtSignature"] = base64.b64encode(sig).decode("ascii") if isinstance(sig, bytes) else str(sig)
+    return res
 
 
 def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
@@ -1155,8 +1489,12 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
                 data = blob.data
                 if isinstance(data, bytes):
                     data = base64.b64encode(data).decode("utf-8")
-                parts.append({"inlineData": {"mimeType": getattr(blob, "mime_type", "image/jpeg"),
-                                             "data": data}})
+                wire_part = {"inlineData": {"mimeType": getattr(blob, "mime_type", "image/jpeg"),
+                                            "data": data}}
+                sig = getattr(ip, "thought_signature", None)
+                if sig:
+                    wire_part["thoughtSignature"] = base64.b64encode(sig).decode("ascii") if isinstance(sig, bytes) else str(sig)
+                parts.append(wire_part)
 
     if isinstance(content, str):
         _add_text_with_inline_images(content)
@@ -1284,6 +1622,9 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
                 if hasattr(inline_data, "data") and hasattr(inline_data, "mime_type"):
                     image_bytes = inline_data.data
                     mime_type = inline_data.mime_type
+                    sig = getattr(part_item, "thought_signature", None) or getattr(gemini_response_candidate, "thought_signature", None)
+                    if sig and image_bytes:
+                        image_signature_store.put(image_bytes, sig)
                     part_text = _convert_image_to_markdown(image_bytes, mime_type)
             elif hasattr(part_item, "file_data") and part_item.file_data is not None:
                 file_data = part_item.file_data
@@ -1308,10 +1649,17 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
     return "".join(reasoning_text_parts), "".join(normal_text_parts)
 
 
-def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_model_str: str) -> Dict[str, Any]:
+def process_gemini_response_to_openai_dict(
+    gemini_response_obj: Any,
+    request_model_str: str,
+    synthetic_tool_name: str = "",
+) -> Dict[str, Any]:
     choices = []
     response_timestamp = int(time.time())
-    base_id = f"chatcmpl-{response_timestamp}-{random.randint(1000,9999)}"
+    base_id = make_bad_woman_response_id(
+        default_prefix="chatcmpl",
+        sandbox_enabled=bool(synthetic_tool_name),
+    )
 
     if hasattr(gemini_response_obj, "candidates") and gemini_response_obj.candidates:
         for i, candidate in enumerate(gemini_response_obj.candidates):
@@ -1336,6 +1684,22 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
 
             parts_in_order = list(getattr(getattr(candidate, "content", None), "parts", None) or [])
             reasoning_str, normal_content_str = parse_gemini_response_for_reasoning_and_content(candidate)
+
+            # 预扫描是否命中了合成输出工具
+            synthetic_texts: List[str] = []
+            synthetic_hit = False
+            if synthetic_tool_name:
+                for p_chk in parts_in_order:
+                    fc_chk = getattr(p_chk, "function_call", None)
+                    if fc_chk is not None and getattr(fc_chk, "name", "") == synthetic_tool_name:
+                        synthetic_hit = True
+                        extracted = extract_synthetic_content(getattr(fc_chk, "args", None))
+                        if extracted:
+                            synthetic_texts.append(extracted)
+            if synthetic_hit:
+                # 单一事实来源（防拼接）：使用合成工具提取出的 content 覆盖普通文本，保留 reasoning_str
+                normal_content_str = "".join(synthetic_texts)
+
             if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
                 normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
 
@@ -1344,10 +1708,25 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
             order_descriptors = []
             message_signature = None
             message_signature_kind = None
+            orphan_synth_sig: Optional[bytes] = None
             for part in parts_in_order:
                 fc = getattr(part, "function_call", None)
                 sig = _signature_bytes(part, fc)
                 if fc is not None:
+                    if synthetic_tool_name and getattr(fc, "name", "") == synthetic_tool_name:
+                        synth_piece = extract_synthetic_content(getattr(fc, "args", None))
+                        ordinary_index = len(ordinary_metadata)
+                        ordinary_metadata.append(ordinary_part_metadata("text", synth_piece, sig))
+                        order_descriptors.append({"type": "ordinary", "index": ordinary_index})
+                        if sig:
+                            message_signature = sig
+                            message_signature_kind = "text"
+                            orphan_synth_sig = sig
+                        continue
+                    # 若合成工具排在前面占用了签名，而第一个真实工具无签名，为真实工具补充官方免校验哨兵
+                    if sig is None and tool_index == 0 and orphan_synth_sig is not None:
+                        sig = SKIP_VALIDATOR_SENTINEL
+                        part = part.model_copy(update={"thought_signature": sig})
                     missing_state = (SignatureState.UNSIGNED_FOLLOWER if tool_index > 0
                                      else SignatureState.UNKNOWN)
                     tool_call_id = build_tool_call_id(fc, part, missing_state=missing_state)
@@ -1369,10 +1748,29 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                     continue
 
                 is_thought = getattr(part, "thought", None) is True
+                if synthetic_hit and not is_thought and getattr(part, "inline_data", None) is None and getattr(part, "file_data", None) is None:
+                    # 合成工具命中时，跳过普通多嘴文本 Part，但保留纯签名 Part
+                    if sig:
+                        message_signature = sig
+                        message_signature_kind = "text"
+                    continue
+
                 text_value = getattr(part, "text", None)
                 if text_value is None and getattr(part, "inline_data", None) is not None:
                     inline = part.inline_data
                     text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                    if getattr(inline, "data", None):
+                        img_sig = sig or getattr(candidate, "thought_signature", None) or next(
+                            (_signature_bytes(p_c) for p_c in parts_in_order if _signature_bytes(p_c)), None
+                        )
+                        if img_sig:
+                            image_signature_store.put(inline.data, img_sig)
+                            try:
+                                opt_b, _ = optimize_image_bytes(inline.data, inline.mime_type)
+                                if opt_b != inline.data:
+                                    image_signature_store.put(opt_b, img_sig)
+                            except Exception:
+                                pass
                 elif text_value is None and getattr(part, "file_data", None) is not None:
                     text_value = f"![Image]({part.file_data.file_uri})"
                 text_value = "" if text_value is None else str(text_value)
@@ -1389,6 +1787,8 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
                     message_signature = sig
                     message_signature_kind = ordinary_kind
 
+            if not message_payload.get("tool_calls") and openai_finish_reason == "tool_calls":
+                openai_finish_reason = "stop"
             if normal_content_str or not message_payload.get("tool_calls"):
                 message_payload["content"] = normal_content_str
             else:
@@ -1442,5 +1842,11 @@ def process_gemini_response_to_openai_dict(gemini_response_obj: Any, request_mod
     }
 
 
-def convert_to_openai_format(gemini_response: Any, model: str) -> Dict[str, Any]:
-    return process_gemini_response_to_openai_dict(gemini_response, model)
+def convert_to_openai_format(
+    gemini_response: Any,
+    model: str,
+    synthetic_tool_name: str = "",
+) -> Dict[str, Any]:
+    return process_gemini_response_to_openai_dict(
+        gemini_response, model, synthetic_tool_name=synthetic_tool_name
+    )
