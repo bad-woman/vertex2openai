@@ -178,7 +178,7 @@ class ExpressSDKUpstream(BaseUpstream):
                 _prefill_mode,
                 allow_model_last=not profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), is_image_model),
-                cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not is_image_model,
+                cot_guard=not is_image_model,
                 synthetic_tool_name=synth_tool_name,
                 has_callable_client_tools=bool(sandbox_spec.real_tool_names),
             )
