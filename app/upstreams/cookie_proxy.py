@@ -44,7 +44,7 @@ from message_processing import (
 )
 from logger import stats
 from api_helpers import get_retry_settings
-from signature_store import SignatureRecord, SignatureState, signature_store
+from signature_store import SignatureRecord, SignatureState, signature_store, image_signature_store, SKIP_VALIDATOR_SENTINEL
 from schema_validation import SchemaValidationError, validate_request_schemas
 from synthetic_wrapper import (
     SyntheticSandboxSpec,
@@ -717,6 +717,18 @@ def _convert_messages_to_contents(
                 parts.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
             else:
                 parts = call_parts + ordinary_parts
+            for p in parts:
+                if "inlineData" in p and "thoughtSignature" not in p:
+                    b64_str = p["inlineData"].get("data", "")
+                    try:
+                        raw_b = base64.b64decode(b64_str)
+                        resolved_sig = image_signature_store.get(raw_b)
+                    except Exception:
+                        resolved_sig = None
+                    if not resolved_sig and require_sig:
+                        p["thoughtSignature"] = "skip_thought_signature_validator"
+                    elif resolved_sig:
+                        p["thoughtSignature"] = _encode_wire_signature(resolved_sig)
             contents.append({"role": "model", "parts": parts})
             continue
 
@@ -728,6 +740,19 @@ def _convert_messages_to_contents(
             if role in ("assistant", "model"):
                 _attach_message_signature(parts, msg)
         if parts:
+            if gemini_role == "model":
+                for p in parts:
+                    if "inlineData" in p and "thoughtSignature" not in p:
+                        b64_str = p["inlineData"].get("data", "")
+                        try:
+                            raw_b = base64.b64decode(b64_str)
+                            resolved_sig = image_signature_store.get(raw_b)
+                        except Exception:
+                            resolved_sig = None
+                        if not resolved_sig and require_sig:
+                            p["thoughtSignature"] = "skip_thought_signature_validator"
+                        elif resolved_sig:
+                            p["thoughtSignature"] = _encode_wire_signature(resolved_sig)
             contents.append({"role": gemini_role, "parts": parts})
 
     merged: list = []
@@ -820,12 +845,12 @@ def _build_batch_graphql_body(
             if mv is None:
                 mv = settings.get("default_max_tokens")
             if mv is not None:
-                if "gemini-4-argon" in (model_name or "").lower():
+                if re.search(r"(?:^|/)gemini-4-", (model_name or "").lower()):
                     _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
                     _is_real_stream = bool(request.stream and not _fake_on and not profile["is_image"])
-                    _argon_cap = 65536 if _is_real_stream else 32768
+                    _g4_cap = 65536 if _is_real_stream else 32768
                     try:
-                        mv = min(int(mv), _argon_cap)
+                        mv = min(int(mv), _g4_cap)
                     except (TypeError, ValueError):
                         pass
                 gen_config["maxOutputTokens"] = mv
@@ -1095,6 +1120,12 @@ def _extract_from_results(obj: dict):
                     b64 = inline_data.get("data", "")
                     if mime_type and b64:
                         image_md = f"![Generated Image](data:{mime_type};base64,{b64})"
+                        sig = part.get("thoughtSignature") or candidate.get("thoughtSignature")
+                        if sig:
+                            try:
+                                image_signature_store.put(base64.b64decode(b64), sig)
+                            except Exception:
+                                pass
                         yield ("image", image_md)
 
             finish_reason = candidate.get("finishReason")
@@ -1532,7 +1563,7 @@ class CookieProxyUpstream(BaseUpstream):
                 _prefill_mode,
                 allow_model_last=not _profile["requires_user_last_turn"],
                 instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
-                cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not _profile["is_image"],
+                cot_guard=not _profile["is_image"],
                 synthetic_tool_name=synth_tool_name,
                 has_callable_client_tools=bool(sandbox_spec.real_tool_names),
             )
@@ -1671,7 +1702,7 @@ class CookieProxyUpstream(BaseUpstream):
                                     _prefill_mode,
                                     allow_model_last=not _profile["requires_user_last_turn"],
                                     instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
-                                    cot_guard=bool(_inj_settings.get("prefill_cot_guard", True)) and not _profile["is_image"],
+                                    cot_guard=not _profile["is_image"],
                                     synthetic_tool_name="",
                                     has_callable_client_tools=False,
                                 )
