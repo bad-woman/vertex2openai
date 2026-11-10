@@ -29,15 +29,6 @@ def _normalize_models_config(data: object) -> Optional[Dict[str, List[str]]]:
     return None
 
 
-def _merge_configs(primary: Dict[str, List[str]], secondary: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """合并两个模型配置列表，保留 primary 顺序，并将 secondary 中新增的模型追加至末尾。"""
-    models = list(primary.get("models", []))
-    for m in secondary.get("models", []):
-        if m not in models:
-            models.append(m)
-    return {"models": models}
-
-
 def _load_local_models_config() -> Dict[str, List[str]]:
     try:
         local_file = next((path for path in _LOCAL_MODEL_FILE_CANDIDATES if path.exists()), None)
@@ -78,9 +69,8 @@ async def fetch_and_parse_models_config() -> Optional[Dict[str, List[str]]]:
                 response.raise_for_status()
                 normalized = _normalize_models_config(response.json())
                 if normalized is not None:
-                    merged = _merge_configs(normalized, _load_local_models_config())
-                    print(f"✅ [模型配置] 远程模型配置加载成功，与本地合并后共 {len(merged['models'])} 个模型。")
-                    return merged
+                    print(f"✅ [模型配置] 远程模型配置加载成功，共 {len(normalized['models'])} 个模型。")
+                    return normalized
                 print(f"⚠️ [模型配置] 远程模型配置结构无效，准备尝试下一个地址：{url}")
             except httpx.HTTPStatusError as exc:
                 print(f"⚠️ [模型配置] 远程模型配置地址返回 HTTP {exc.response.status_code}，准备尝试下一个地址：{url}")

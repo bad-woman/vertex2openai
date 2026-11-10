@@ -434,13 +434,13 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
 
     mc.sanitize_sampling(config, profile)
 
-    if re.search(r"(?:^|/)gemini-4-", (request.model or "").lower()) and config.get("max_output_tokens"):
+    if "gemini-4-argon" in (request.model or "").lower() and config.get("max_output_tokens"):
         _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
         _is_real_stream = bool(request.stream and not _fake_on and not is_image_model)
-        _g4_cap = 65536 if _is_real_stream else 32768
+        _argon_cap = 65536 if _is_real_stream else 32768
         try:
-            if int(config["max_output_tokens"]) > _g4_cap:
-                config["max_output_tokens"] = _g4_cap
+            if int(config["max_output_tokens"]) > _argon_cap:
+                config["max_output_tokens"] = _argon_cap
         except (TypeError, ValueError):
             pass
 
