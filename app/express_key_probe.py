@@ -34,11 +34,31 @@ def mask_key(key: str) -> str:
     return f"{k[:6]}…{k[-4:]}"
 
 
+def inspect_express_client_state(key: str) -> dict:
+    """按 Google 官方 intro_gemini_express.ipynb 规范，检查 genai.Client(enterprise=True) 的底层绑定状态。"""
+    try:
+        from google import genai
+        try:
+            client = genai.Client(enterprise=True, api_key=key)
+        except TypeError:
+            client = genai.Client(vertexai=True, api_key=key)
+        api_client = getattr(client, "_api_client", None)
+        return {
+            "vertexai": bool(getattr(client, "vertexai", False)),
+            "project": getattr(api_client, "project", None) if api_client else None,
+            "location": getattr(api_client, "location", None) if api_client else None,
+        }
+    except Exception:
+        return {"vertexai": False, "project": None, "location": None}
+
+
 async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
     """探测单个 Key 所属的 GCP Project ID。返回 (project_id, 说明)。"""
     key = (key or "").strip()
     if not key:
         return None, "Key 为空。"
+    sdk_state = inspect_express_client_state(key)
+    sdk_mode_tag = " [SDK enterprise=True 已就绪]" if sdk_state.get("vertexai") else ""
     url = GENERATE_CONTENT_URL.format(model=PROBE_FAKE_MODEL)
     body = {"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}
     try:
@@ -53,7 +73,7 @@ async def probe_project_id(key: str) -> Tuple[Optional[str], str]:
         if m:
             project = m.group(1)
             tag = "（项目编号，可直接用于资源路径）" if project[:1].isdigit() else ""
-            return project, f"探测成功{tag}：从上游 404 错误信息中解析出项目。"
+            return project, f"探测成功{tag}{sdk_mode_tag}：从上游 404 错误信息中解析出项目。"
         return None, f"上游返回 404，但错误信息里没有项目路径：{text[:200]}"
     if resp.status_code in (400, 401, 403):
         return None, f"Key 可能无效或无权访问（HTTP {resp.status_code}）：{text[:200]}"
