@@ -1,3 +1,26 @@
+## 2026-11-10 生图模型多轮修图 thought_signature 恢复与免校验保护、Gemini 4 系列适配
+
+### 1. 生图模型多轮修图/连续追问思考签名全链路保护
+- **问题根因**：Gemini 3.x 生图模型（如 `gemini-3.1-flash-image`）多轮对话中，Google 严格强制要求历史模型回复中的图片 (`inlineData`) 必须携带上轮的思考签名 (`thought_signature`)。普通 OpenAI 客户端（酒馆、NextChat 等）仅保存 markdown base64 图片，丢失了非标扩展字段，导致在第二轮追问/二次修图时触发上游 Google `HTTP 400: Image part is missing a thought_signature in content position 2, part position 1`。
+- **ImageSignatureStore 图片哈希缓存**：
+  - 新增线程安全的 `ImageSignatureStore`（SHA-256 图片字节哈希 ➔ `thought_signature` LRU 缓存）；
+  - 上游生成图片时透明捕获并持久化思考签名；
+  - 客户端下一轮将历史图片发回时，网关通过 SHA-256 毫秒级恢复原始真实的思考签名，无损保证 Gemini 连贯推理与上下文继承。
+- **官方免校验哨兵兜底**：
+  - 当缓存过期、服务重启或用户外部注入图片时，自动为模型角色的图片部分补充官方 `skip_thought_signature_validator` 免校验哨兵，彻底杜绝 400 阻断。
+- **修正 `_requires_signature` 规则**：
+  - 将 `gemini-3.1-flash-image`、`gemini-3-pro-image` 等生图模型正式纳入思考签名强校验序列，双通道（Express SDK 与 Cookie Proxy）全面受益。
+
+### 2. 控制台与移动端交互体验优化
+- **手机端导航栏自适应**：主导航栏采用 `repeat(4, minmax(0, 1fr))` 并在窄屏下隐藏 Emoji，确保「运行日志」等 4 个标签完整显示不越界。
+- **参数控制台布局修复**：调整单列/双列流顺序为「思考 ➔ 预填充兼容 ➔ 采样 ➔ 生图」。
+- **默认配置优化**：生图默认分辨率设为 1K，「多 Key 顺序轮询」默认开启，「Function Call 抗截断传输」样式统一。
+
+### 3. Gemini 4 系列模型适配
+- 支持 `gemini-4-` 正则动态匹配，本地自动包含 `gemini-4-carbon`，并支持本地与远程模型智能合并去重。
+
+---
+
 ## 2026-10-23 多账号轮询容灾、Key ↔ Cookie 跨通道互备与 500 智能重试体系
 
 ### 1. 多 Express Key 轮换与 Project ID 动态感知
