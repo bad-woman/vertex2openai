@@ -8,7 +8,7 @@ class AppSettings(BaseSettings):
     FAKE_STREAMING: bool = False
     FAKE_STREAMING_INTERVAL: float = 1.0
     MODELS_CONFIG_URL: str = ""
-    ROUNDROBIN: bool = False
+    ROUNDROBIN: bool = True
     SAFETY_SCORE: bool = False
     PROXY_URL: Optional[str] = None
     SSL_CERT_FILE: Optional[str] = None
@@ -55,7 +55,7 @@ DEFAULT_SETTINGS = {
     "thinking_g3_level": "",
     "native_thinking_mode": "request",
     # 生图
-    "image_size": "4K",
+    "image_size": "1K",
     "image_aspect_ratio": "",
     "image_system_instruction": False,
     "inject_prefill_for_image": False,
