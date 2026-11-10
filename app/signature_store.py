@@ -11,12 +11,14 @@ record has three possible states because ``None`` alone is ambiguous:
   skip sentinel for the first call of a step.
 """
 
+import base64
+import hashlib
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 SKIP_VALIDATOR_SENTINEL = b"skip_thought_signature_validator"
 
@@ -119,3 +121,81 @@ class SignatureStore:
 
 
 signature_store = SignatureStore()
+
+
+class ImageSignatureStore:
+    """线程安全的图片哈希 (SHA-256) -> 思考签名 (thought_signature) TTL/LRU 缓存。
+    
+    用于在多轮生图/修图对话中，自动为客户端回传的历史图片恢复原生 thought_signature，
+    解决 OpenAI 格式客户端剥离 Google 扩展字段后上游报错 400 (Image part is missing a thought_signature)。
+    """
+
+    def __init__(self, ttl_seconds: int = DEFAULT_TTL_SECONDS,
+                 max_entries: int = DEFAULT_MAX_ENTRIES):
+        self._ttl = ttl_seconds
+        self._max = max_entries
+        self._lock = threading.Lock()
+        self._data: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
+
+    @staticmethod
+    def _hash(data: Union[bytes, str]) -> str:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return hashlib.sha256(data).hexdigest()
+
+    def put(self, image_data: Union[bytes, str], signature: Optional[Union[bytes, str]]) -> None:
+        if not image_data or not signature:
+            return
+        if isinstance(signature, str):
+            try:
+                sig_bytes = base64.b64decode(signature)
+            except Exception:
+                sig_bytes = signature.encode("utf-8")
+        else:
+            sig_bytes = signature
+
+        h = self._hash(image_data)
+        now = time.time()
+        with self._lock:
+            self._data[h] = (now, sig_bytes)
+            self._data.move_to_end(h)
+            self._evict(now)
+
+    def get(self, image_data: Union[bytes, str]) -> Optional[bytes]:
+        if not image_data:
+            return None
+        h = self._hash(image_data)
+        now = time.time()
+        with self._lock:
+            item = self._data.get(h)
+            if item is None:
+                return None
+            ts, sig_bytes = item
+            if now - ts > self._ttl:
+                self._data.pop(h, None)
+                return None
+            self._data.move_to_end(h)
+            return sig_bytes
+
+    def _evict(self, now: float) -> None:
+        while self._data:
+            oldest_key = next(iter(self._data))
+            ts, _ = self._data[oldest_key]
+            if now - ts > self._ttl:
+                self._data.pop(oldest_key, None)
+                continue
+            break
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"entries": len(self._data), "ttl_seconds": self._ttl, "max_entries": self._max}
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+image_signature_store = ImageSignatureStore()
+
