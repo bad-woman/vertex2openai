@@ -1,10 +1,11 @@
 import asyncio
+import base64
 import os
 import secrets
 import threading
 import time
 from typing import Optional
-from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi import FastAPI, Depends, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -188,10 +189,17 @@ async def require_auth(request: Request):
     return True
 
 
+
+# 极简 128x128 429 娘 WebP 头像 (6.3 KB)，经 1:1 下对齐视网膜重采样与高压缩比处理，零内存/网络负担
+AVATAR_WEBP_B64 = "UklGRhoZAABXRUJQVlA4IA4ZAADQTgCdASqAAIAAPk0ci0QioaEY/K7YKATEtgBWGWhAT+w/qvobWJ/K7o/YHmQ9Hedf0X/qL2EOev5mfNw9HP969Qr+uf7DrVvQA8u39zvhc/tv/L/dT4AP249QD//5fzv4/Q+CPi49rfu37pevFij6l/9n0D/ln3+/T+cXe38o9Qj8r/pv+53122voEd7/+h4Zv+J6GfYL/mf3f4AP5z/Qf+B63/7vwmfv/+/9gP+gf2H/k/4L8uvk8/8f9j+W/t9+m//Z/nvgN/nX9n/5H+K/JL51/ZD+5fsmfsw5xC+qgo3O4kDduOhtK9HFPGUQdMS1FUYTuO+ZdaCQWQcOn+H+BJpJEzhtGCFhgvjtieU5F1AlpmNSQ6k5FOrCsjL/td/ATYBo5nKsmd5RyqpZRv4rZOJQoekAkQw3LjWWiGs58ACSnWD/YVr4+mBU7iseD9kWTS2GuD9kR6x1YPysLTEUDRkWIOlNbr/FAUDQlWDReDvCnAdoIDW+6APyFEEIiOPl6lW65OLPA1PV/XApSvAkWzi4u35YH6iAlbwUkMYgYwrFSTJOd2snLzsXlIkNAy00sm8feU7maSwG8wHU/NX/2eCtiPH1PMugjOY9Bw2/rjNjJ4c/f/dZMP1Hg/gop+I//ymqDwISG9p359/9GlYU24+iU45gGcbNzOirWBt8mXGVfpcEOFbAkZJz5QucpYcioEsIz4HfLfbaHZESacMvb19LOx3N99qK7ci+Xosza/dM3c9xUw56mY1fXRwSUKz4z2KbETemdda0qNq0lN7LkpzeMXEDDU+V6Pr0//KjJwzsDPbjPloLgCOZ7lnhA3eXxTqd44n3oq3cluyhBBAA/vRc4msF9nlqnbn00EL62iqCyNLzivJdKQH1vVizFjJcGOitUy4cN/38pKIJVNg3LDddsfFXWgf/Pvwou7KKUDbNYeklt9+XXBEPUhKMGy/lRKMW2Md9Ftj0XLrySiIqOvEE3CxB/1oaY75qdYykKln+ozy4/cOEd8Kyn6Raj3EzroBe4WbA+6IeE5lTkx5rvmd4hgeTKWl9h75N0Ppmj48ATH9dcJoKIwg3+Xg6+T3fJ523IxCCsW2ptMH+ntLDKVgb0UsWntlGaIW4oXRhqJDvqgqRpkRQyFYE3kV3V4To9LQYwNRLsL2LS9n0VeX5/dv5HHLpGCb7VhuyZ8CJDYgp6oUlGd1LTKlPY4AeJPcsschcgiqC8C0iFsQc4JMUo5J/ObQNwGNSH0sfft7CUni5WnuaqO6gQ8ZHSiP3Lt6L1nDpauKnC4wJamH7KZyWhWpgj58DDgKi/wgpTPs19c1Nza0FIoqe4ZaF4ienXGAuCcz8OaWnCDX0aPOB/191PwbmNicCgAsCfhmrsy1womqJ2Jmzm5mV8xbb7SRYUprruk9mH4sjRYiBtPEQzSsFTLA2oJXCa4+1YfbLySs0AKEe61QgMGCoIsmmFp0x83eR9RSL0I0ldoDRG+Kr81/tYPUIRNDK3bei+OePWQSl78dAZF2JDEJxMgwfpyyHJhmBenGP7ad/41k88HkphRzroQhg4PecLLEqRUvL3jshUk9m3LMlQH+iII8tLfrR7HGRGVA9mHiCcXMZhHNxzJj+wFqv9SUVnmxQCR9F08SsNLF36amrhgF8V5Tuo0ogp41WsxZCDgau9oteligFSjcOZC6yI5HMZrMAFe+bAC2JFqlEesNw9v4i9z61c9Ju/Rd30QoCitVFI0vvc1CGfYk6sRDQIVu0PJVFNbDsQHE877bglSAl36qE430hwRftIRKckhGq8gtnSVto0dMGhrCKw1VEcJJ8SasT1OSOYL0TIIRxBxKqWOEuZbJ9d/RMLzO+Q/N4iNQmY4amFvutoRFbXjDg0IVe0z5luFU8WDmVPoKJBYMGYhI2Z8xhArLotlfgKJ/bjaWfkaN7ginsHQdz4C61CptV5G0YBNJXkTn2zlrLRcMi+lTrrrKz16Im3uy7hKbgcRB1gRBNfHBltE23KS2lb2fVmHTtEigrYwGdrxOa7PKOTdVCa8nh0ad+7NWLsnrAZYNFJocdaFZemdnLpUYjU5ggRR8h8qNWhlRX1VibR9JvqssQIHmgUJag2L8zUhE4zbtlZrooV3yqdv3ivhfr+Uoc/m0qPn0jC+SFG4JA7XnzDiUACYuf4qGkKpsYEIXzRCjBbL/ux5ba2Hu6v5dE151WL0wv0oQAaTNk1ZKuH0M+Uq2tmgiFuP4kO2dxOa3qK6JLBIE67HC+Iv8SyvRNObV79yKioOTBXPxpdRPyrgQhc7nClpv1maVQGiDBNBDSn0Z6Kc6RspfbSyIg7A3U56LJ7qcbm2B5JvCPSdTFL3myGpyBHVeO10rf+06eQpTHYGVwhJfmiqE2Tgtu112ThgVkN820ugOfw/iuMMCUNZVa3yhnqRO609C6+oVMuyh/dFRU5+fFUywSRJIZdZznpNowwnY7kICcbC+V5GQT6NwHL5ggGhrfp5ueBs/P9V+CzqPygPvMsASX4Zxdj+S1A4WGkTyjqpu6zs6DjDXHFTgnmpL1b8oRywzreJsvj9+uH+S3W6zsvDGfIF5DyuQshecf0BOriVcPvEbo0lUdhENXTgRuf5WPBv/P4Q7iKIKabErm2/6/id+xU/rW5hn5+ZUSXmUBMRLHsa80wylud5vniAOVasGXQprXJ7W5ik4a6uDRQ1FL2JLrjcyk2JsedVNEJP5P5I497lnrcQcaXNDY4lm3YQDNjOrEy7dR/tb9R6MwIudvaRg92Igpyqo0C7Ifn8b5nY2qgwvGr4Pk80ilJbcf09ev3esFVjJLuuXw839kXk7gtMXDjYYJjIwPq/sLSMam6s1ZCas2WIpc9sfjtUt790qzDznR8KF5mr1S87gC4qHwiYV3UyqgV/JestVji1sVy4nrX+3lsJ4mN+8y5jGZdBGeKWr4hga26yd74SFuOKlOnpTS4+yRKmk++k6VoRbh4PCz3AFu/0K8SMpEum5l8K3/sNPzBo3DOT5y4tyRMWgMQO3gJ0y0W0XkSQiFT7OwudBqN1In5qH7hUa26RbBtHjj6lQpNB6SiMCZsl/Zk4Oh4rpR38yvlQN14RDBLyufyJ0nePwxeiUjLPKG2EVj8LfiyyeNj5fjj3NxmH/pHnnZXmxQRxEqS1H4eBB19XCYeRt+XlhvCvsKbdjzRHLJRTtn/WkHvdK+pAgTwwsh+b4yXu3RFDMqqTlXoRvZIJyJx6vQZwPHFWjvdkhhal2bA8Om99azr+BSjkBqRwLL9JgEwITsBngxDD/tCSWBUzAhmpJioZkApCdNJKvO8sSCj8xEFCKBbHc3Mn6Rl/zX6XqH417gVjvluslOtKbGRux7qkfGOsJVgyZ5u7Gtn81U/rUikVNOsqK5xH+J0N+u9wanIcMVVQy1CNYseaqH3pcgQoBcIblqF4Z8XVYXaAMz48Z7et/2vDi2nspDF8TyP7KM6BgGarfyFD/uIr20ClwrXel6oMOLA3J/PFwA3XaZK40awMPpLY1x3o3GIeYKGjHeyDRH/MsvYBnsaV3zVlW+yd3uCGKPhXLakyFOA2kG6Hb1O3qQuA/xocPGFpf7u6e1+JJGeOfeUp/EjEO0VtfYoNUkWGTxQbe6KxEyxo9OYxp7j17iuM7qivYRcpt+ID48JDef2H10M5jk07IWWPZ4ivbK93/C/IUf7TEBLTJbDwrbW3pMnmYxRXcji5r8GnlUIEw/MehPyhiLc4zrpb9YAxmwmRknggezsbdNtS+eGk1/vztcfawZsqNBsxht7v8/4ZoJTueJeNu3ThRITaj2JkhKoBm1ZpovZhKH1e2tUmfpSPtV+nBvCSEAYG9sska6kne+lISYRdten/nP9q5TfUfccct917/R19uRbDX20waICmK+toqYp9d4dgFzVIA9cm1a8AjnCJuiqhH3zfPCDtcVkoDkQpQrBbbuFidt9XaomPMS1grN2f7IRtq5f7HoVoze0xWa5H0XX0GrOCKt3mMOwQYfIKfQffEzUO63qoZ/QNt60F7f3Xekhog1r9qMERXeI3HsL4fYs9HSBx8UYuUMzuUKDad7jQ77DqdEolOLRItu6grbWCDNuMY4q+qtojNxkh5Vo3mkmI8cJH1acxtYGrCxtE/Kqq47F7uQ3m18ROnyry5NZ5csZ0e69RqbWKBTGHKifbsvYajri8e71AGwsBSjhSIy/gVzExO2siMWNBs+vJgdtiZgu5KhbtUv2lJg8gUuL64wRYU+4VLA5vWSV6Ltgf04FDKBHifonsCq8i+RdPYBUlzjNYhbeNo+1GPKYeMc2dSbfd42nM/y10d/0QLnKRk6KVmneQqgMayEdzRBV9ETmxhycuBQQCCdwyuSHPjfQVbWjtkLUtTMbYQhCm2KXcHx7fPcYp+SOAu4+SOAZkNNHCUF/JGa9XQavkY7cDTbsnP+dfT59NJBmLjZ5jSxV24zsOYf/JxtBH6Gg9YePddov9fHFEIWPcXtzMNURuI/JUXucJmYRwM6xCmZYL4KvBFzdna/I4p+IibFGSxhZYRQaafa/Z2tfJ9Zi3wNMYA1qwNrDBtKB1871y5gcZVjqpFeAirQD1q8kIXOfcu3uZ2F/i0ZhNCyN4BfYg4yPtpIdsmfhowtdUo8dVVARXihd0FpoSl51rY24orjLOA+iGS2O1UrWJXEVg8V4mj8ApNMsZ/fZtYOlrbbATvbdNTog7z6gv03tbcV303Z7QXvGe9OG/prAmrD/X/Ov9oTcqtsb6N/8J1Fkio04/408oAWjHlFeXqrCk2eWUxQClHaJaalP44H+xyOxi83Sua6xi9WwtZ/Q5IxxD4Fs78nfP8RT2JGrsP1hK8t8rfXUkUQFb8T5eDKM49QbiaSlu9Bft1O0jMBWiWTYJEGmUUH7vcVan4ZVBm4RAZAX0/rwE0SOaDOJaqkPHiNnEyADZfGPZJMu3PbbDG/zHVr2DTVAYSU8Azjc8K7ipBkWuZ0aLkqujmQ9TklRYs+jUu5p/uIc9Kwdh+Kmbzb5Y1GzO54TxMciJvktyQzb346RWURNw/O47x9AU6R6u06xZqLThmi1mX78t6QYD/HT4FtE8ZzNXmox6KG7e+H9B8Dzqy8xL52XNeI+SCTenQ2hTL8rs/WU1Ly+JRtt/iGn5ksvycVw2U9zTWc+CD1lS/iV1zjgoVbs7ShzO8KE28+ZE/R/VkMwpDDypaVdxSEeAd3juPKDJIrajkd7O/HqkNgHJmu2GblGurTew00yPvFdDvZAIIGEnwD7suSlrvB3j+eJ9f0QNdpDsVH1l5Ply80PDpOPCg5Sfgltyx32/NTUCxd2LFnTl8emJsCiucPe9fYmaJHE4mIAe2u9JhtKG6R9aCUdu34zr8TIAL2PcrhUsTprsqo61TcGF8EpdIaZPg3L+aWg4X3vzkuSUSMQlwYHj1DfH6IGBjx8M1E++l7CeSLMNiwfBa63B2QURY5ieQHmcQcaPA3HfIt6ZPFCsIMpYXLt2VosZaUY3mW4VW9bZsW5d1Pp9ytK7lcejLzXTPV9b6+a04igm2wWRAzl3Y+tfGPUuqM/5TtAyNx9+nU63YGG5ZZh3bkGYfxiYnbq2ZvpyYftqHDA2WVLLCbRH0sTRavQ4Uf5HvcR1x3TalmuV1F/SNNutQ53fQ1v0lhY30Mq9hmyIWjDzZFr9dBgya8kI4IcjqID0bLXKMjJQ1/tUlRAa3f/Jz5NXToaXozxVyOQAySCa0SLCDhbl3rPC4hPPKY+Hpr+nhJeYfwY8zXhmknlacm0kk1aN0DPbSagwx06apZRwjkw/ZUCvUCCBYVI6gjmbN0JhiA8B3DdoTnE/3w+Ij71bZnwcJaF3GKQqaM1sb1GFLEUTf8V2lO70U6PaLRR9iX3VH1xEXw8dBRYJjEXxPC/wUcttbXGfWbgaXlAafU5HldEs7PgV5KFHRHpTvLs4VwTr6vfZmyirfb02SYe4EB8vmJRCvxIyoBfndwI2W88w1dNbA3z5mxWPsIS3iZ8j3S1ee0qyCghHPZlXM/jRvVVUTOYcwVP+BQwAIBrRVIFZpsQmO2EDUqmqtzyTne+jCmZiUCwnGYJD31xTTN87xIO/LY1ZZIqElaCuU+IPOseUQlECo62BGLe+BqmtPyLtXvbPwdfmU4wpaRJ0lpFGUtm0/sI3QPvMyCThzh5ZMuGj2SAXMRSASaywKcAsGXgiQ+/62jZWJUdfR73P1c/Tx8B+dEAllChPliUPohzOSyTBtW2o+/5gpg8nV50cHq3j0tuYmTr6YxTyD/XOPYs0iGJldQV9xEpS0PnmvbSb0onsV3LztSGEJjfdKdPMU354+Djb/j2OCoOXtaW9Ebp+N7M2ll1aj/PvRmXYfdv36V/kZ+NT35BeVv1kX/nVWwDZIfABnYJjjCYDztmjvhIpzSLK4+QVxFEiPTDwAHUtoxGZGNqoF7mw5LIkUUi8pgF5T/FLt2xuSSIIW/Ph44vKGQ6iSJVFa67HWZBMfsuS0tC3JBf6pfUganFF+qmHgR/NcB0laJpljC005+rmNJgvZhnmjuDMjgHEBdYtr5FhV7yYZK0l1DPh59zI5KTIfzAQMlECMidho13f42blnXP9CtkPpwc9yFwJ1Pmmb/OSgJJ8lPLk2iNui2ZRuqwMOuQ7xlDCsQyRNySrwgd9HeWdc8jYTuyhuJ+ucYm4C+j1Xs0O7y/sFuQfkTUwTflnAUuCG/owRLzpUPzWQAGAKpnszEZ7S1HqyDmUapTBXf5YVOa/mP8Ru+1lKc6ciVAg+TllBBjzcI42VcDgo1xSzqQRa0AYod0M7P+QVAAZklIpAiPzqlEZR8CduxOwD9n+OaUdLVoZTZ80lIVLrg5hjlO2qFche+2u3rnKShAGyXxahdClMlBb6KWFTaMkxWSCoQWqx6+P6oFUlg4sMet96yNNS01UD+2nz+KBiEFOTXJOGSdJLRFiUvXDvTe31shaHpAvNmX8uUcCWw9EhBpJzIBGhtbQ63HIs2HkdtQfeedgmAi/5GZQBuzaQ7IhMwwGFs4i8qhe8rylLOv449hYrGovtOw+uyCTp0ZbIVZony6mnK2yU3AN59eb6OBGPsvgGSYCVodyvXmcL5nqp4L8xJdJwRfZeJYQsp+yqfsIL5/ZeXPnHFWk4F6JOjqdponfupS097AgaVrBnZAY1oypC2+sHJsYuDXbsb9/vFcIjhr11JE/IfWP07u6qbCEW/gMr/J7NWnQO/GFODtZg+3mqOT6dPIQnNhPh8FSw9miKkPWIbcFhlzq2hIqN02XNljedeDgzjisNC1GRHiSjjz3m/piE8HIG3+XaqpdrVnwNQ5hWz1dQOA4WBwmn8V0Tgk6KANRygUbk1Y4reIl+VcXubBys3/TlW8rSAKY3lR/e3u+0Mnh88ZUfgQ3JNo/N9APpE4PvbOFw7kGaSd/S3S+cbi4bkhUGrScoKhhY6IvU6ukmAz6btYsIJbxcUkyffIR5nSs6pfMJek1dy3szBKkQxro58scBDaSBqUU7SI1ZMgN66yrX5qWPot7cILCLGuXVJkNpN1A/almFQs4uU7zOSs09MFWCq8NVPN0iGOR5IvnWFyC1j+RvxwrYnTWUQvZ/LFlPOTR2dhWyXPc1ySjKWRksZ/8HrQogLQeoLrM79URMU+jffQtwSfh4UUfZv/O0sFt2bsPeihnOpUWwnyDv3LVkBtaAQuf3qFbzyWyYUam2xjcl1YzjmHuQ04/YE9RGdpe69eNS9UaQQvVulhB2dUl45SmB53V7TIL5gAOAQDnv5PzjO6SubvgkKoHfdxERr71G5uFc+kKcwP/IdztXowr3mi+DWWtWS+wPaP8dWovAWyvR+YHY6JrpGlOOxj7D1QvD5suQuGOmqCrjS9Upjzl5Sffb5E0fC9VWp5mejbGrpX7atdR6GTMLdAePqrjaHzos25QvnAJ5FOVUCpMiG+dP7RMJMORUR+itkoUkT5fPxEnTuiviMbXCtY/jYsTLiRiVHm64sjTgE1FT2H35nSuu2lbDxRVdO4E2yK/wxecEAAFhKIES/u3m0H9jxm1kOzY6Yv2KpxPgSbvhbtnQlBuEyHMzUTy0UdDLndBEgQ7htwGEq6PTYsw0ToJJB8pdIQa12WsqaWarmv/i6tA2SKthtfNVUKogG4ak/W8JFA9JpPf6nzPW4g2JBNFJo+vuocmxwLWXv+JfhTPN2Suf9uDoX5P0Z3fdqvNBOveChQjX6z4YeCJDON/kZ9jji/QrTxr8nSNl52bzGsJC8IjN+mrrBgS/2qr2H9nWSKSLUjdbj9WXtX2FXdBS1rM3eW0FfMu3fT9DMTPsfQemPuj8hOJbSlKQRrgBRjvkjc1ymMd743Zwu+jBjgof8D8vRB+lERSCvr1eRD/B3rCw161x/8p98SKRMIfOIj8llSoh3EjwNsUxzbab9CSK5DBu+mMv0Jnf018xeqF+mMfFy4tC4wNLapn1/mr+NZnWWaaREMfQSyXlGa551nArstqfBQNk/gWKXwpGRI00WEKSJqy0sJq/Cpz/9aIS2n4f0tr/brbfAAAA="
+AVATAR_DATA_URI = f"data:image/webp;base64,{AVATAR_WEBP_B64}"
+AVATAR_BYTES = base64.b64decode(AVATAR_WEBP_B64)
+
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>登录 · agentplatform2api</title>
+<link rel="icon" type="image/webp" href="__AVATAR_URI__">
 <script>
 (function(){
   try{
@@ -231,10 +239,7 @@ html.dark .muted-txt{color:#9a90b0}
   </div>
   <div class="w-full max-w-sm">
     <div class="flex flex-col items-center gap-2 mb-6 text-center">
-      <svg width="46" height="46" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="12" fill="url(#lg)"/>
-      <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/><path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/><path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
-      <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#8b7cf6"/><stop offset=".55" stop-color="#f48fb1"/><stop offset="1" stop-color="#5fd3bc"/></linearGradient></defs></svg>
+      <img src="__AVATAR_URI__" width="46" height="46" alt="429" class="w-12 h-12 rounded-2xl object-cover shadow-md border border-[rgba(255,255,255,.15)] flex-shrink-0" />
       <div class="text-xl font-bold tracking-tight mt-1">agentplatform<span style="color:#8b7cf6">2api</span></div>
       <div class="text-xs muted-txt">OpenAI 兼容网关 · 双通道管理控制台</div>
     </div>
@@ -282,6 +287,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>agentplatform2api · 控制台</title>
+<link rel="icon" type="image/webp" href="__AVATAR_URI__">
 <script>
 (function(){
   try{
@@ -472,14 +478,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- Header -->
   <header class="hero px-4 sm:px-5 py-3.5 mb-5 flex items-center justify-between flex-wrap gap-3">
     <div class="flex items-center gap-3">
-      <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true" class="flex-shrink-0">
-        <rect width="40" height="40" rx="12" fill="url(#lg)"/>
-        <path d="M11 16 H27" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
-        <path d="M23 12 L28.5 16 L23 20" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
-        <path d="M29 24 H13" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-opacity=".92"/>
-        <path d="M17 20 L11.5 24 L17 28" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" stroke-opacity=".92"/>
-        <defs><linearGradient id="lg" x1="0" y1="0" x2="40" y2="40" gradientUnits="userSpaceOnUse"><stop stop-color="#8b7cf6"/><stop offset=".55" stop-color="#f48fb1"/><stop offset="1" stop-color="#5fd3bc"/></linearGradient></defs>
-      </svg>
+      <img src="__AVATAR_URI__" width="40" height="40" alt="429" class="w-10 h-10 rounded-xl object-cover shadow-sm border border-[var(--border)] flex-shrink-0" />
       <div>
         <h1 class="text-lg sm:text-xl font-bold tracking-tight leading-none">agentplatform<span style="color:var(--accent)">2api</span></h1>
         <p class="text-xs text-muted mt-1">OpenAI 兼容代理 · Gemini Agent Platform 双通道</p>
@@ -1673,6 +1672,15 @@ fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExp
 </html>
 """
 
+LOGIN_HTML = LOGIN_HTML.replace("__AVATAR_URI__", AVATAR_DATA_URI)
+DASHBOARD_HTML = DASHBOARD_HTML.replace("__AVATAR_URI__", AVATAR_DATA_URI)
+
+
+
+
+@app.get("/favicon.ico")
+async def favicon_endpoint():
+    return Response(content=AVATAR_BYTES, media_type="image/webp", headers={"Cache-Control": "public, max-age=86400"})
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard_ui(request: Request):
