@@ -12,6 +12,7 @@ import model_capabilities as mc
 from runtime_state import app_state
 from signature_store import (
     signature_store,
+    image_signature_store,
     SKIP_VALIDATOR_SENTINEL,
     SignatureRecord,
     SignatureState,
@@ -97,11 +98,20 @@ SUPPORTED_ROLES = ["user", "model", "function"]
 LEGACY_THOUGHT_SEP = "__thought__"
 
 
-def _signature_bytes(part: Any, fc: Any) -> Optional[bytes]:
+def _signature_bytes(part: Any, fc: Any = None) -> Optional[bytes]:
     """从 part / function_call 上取出思考签名，统一成 bytes。"""
-    sig = getattr(part, "thought_signature", None)
+    sig = None
+    if isinstance(part, dict):
+        sig = part.get("thoughtSignature") or part.get("thought_signature")
+    elif part is not None:
+        sig = getattr(part, "thought_signature", None)
+
     if sig is None:
-        sig = getattr(fc, "thought_signature", None)
+        if isinstance(fc, dict):
+            sig = fc.get("thoughtSignature") or fc.get("thought_signature")
+        elif fc is not None:
+            sig = getattr(fc, "thought_signature", None)
+
     if isinstance(sig, bytes):
         return sig or None
     if isinstance(sig, str) and sig:
@@ -235,11 +245,14 @@ def resolve_tool_call_signature(tool_call_id: str,
 
 
 def _requires_signature(model_name: str) -> bool:
-    """该模型是否强校验思考签名（仅 Gemini 3.x / 4.x 家族）。"""
+    """该模型是否强校验思考签名（Gemini 3.x / 4.x 家族及生图模型）。"""
     if not model_name:
         return False
     try:
-        return mc.get_profile(model_name)["family"] in ("g3", "g4")
+        prof = mc.get_profile(model_name)
+        if prof.get("is_image"):
+            return True
+        return prof.get("family") in ("g3", "g4")
     except Exception:
         return False
 
@@ -261,7 +274,14 @@ def _extract_markdown_images_to_parts(text: str) -> Tuple[List[types.Part], str]
             try:
                 raw_bytes = base64.b64decode(b64_data)
                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                sig = image_signature_store.get(raw_bytes) or image_signature_store.get(opt_bytes)
+                part = types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime)
+                if sig:
+                    try:
+                        part = part.model_copy(update={"thought_signature": sig})
+                    except Exception:
+                        setattr(part, "thought_signature", sig)
+                parts.append(part)
                 start, end = match.span()
                 remaining_text = remaining_text[:start] + remaining_text[end:]
             except Exception as e:
@@ -378,17 +398,31 @@ def apply_console_injection(
     return new_msgs, notes
 
 
-_TAG_OPEN_RE = re.compile(r"<([A-Za-z][A-Za-z0-9_\-~.:]*)\s*>")
+_VOID_HTML_TAGS = {
+    "br", "hr", "img", "input", "meta", "link", "area", "base",
+    "col", "embed", "param", "source", "track", "wbr",
+}
+
+_TAG_OPEN_RE = re.compile(
+    r"<([A-Za-z\u4e00-\u9fff\u3040-\u30ff][A-Za-z0-9_\-~.:\u4e00-\u9fff\u3040-\u30ff]{0,48})"
+    r"(?:\s+[^<>]*?)?>"
+)
 
 
 def detect_unclosed_tag(text: str) -> Optional[str]:
-    """找出文本里"开了但没闭合"的最后一个标签名，没有则返回 None。"""
+    """找出文本里"开了但没闭合"的最后一个标签名（支持英文、中文及带属性标签），没有则返回 None。"""
     if not text:
         return None
     last: Optional[str] = None
     for m in _TAG_OPEN_RE.finditer(text):
+        full_tag = m.group(0)
+        if full_tag.rstrip().endswith("/>"):
+            continue
         name = m.group(1)
-        if re.search(rf"</\s*{re.escape(name)}\s*>", text[m.end():]):
+        low_name = name.lower()
+        if low_name in _VOID_HTML_TAGS or low_name.startswith(("http:", "https:", "mailto:", "ftp:")):
+            continue
+        if re.search(rf"</\s*{re.escape(name)}\s*>", text[m.end():], re.IGNORECASE):
             continue
         last = name
     return last
@@ -405,7 +439,7 @@ def build_cot_guard(tag: str, is_keep_turn: bool = False) -> str:
 
 
 def _append_control_to_last_user(messages: List[OpenAIMessage], control_text: str) -> List[OpenAIMessage]:
-    """当请求无 prefill 时，将合成工具传输指令追加到最后一条 user 消息末尾。"""
+    """当请求无 prefill 时，将合成工具传输指令追加到最后一条 user 消息末尾（若仅含 system 消息则补一条 user）。"""
     if not control_text or not messages:
         return messages
     new_msgs = list(messages)
@@ -428,12 +462,13 @@ def apply_prefill_compat(
     mode: str = "smart",
     allow_model_last: bool = False,
     instruction_template: str = "",
-    cot_guard: bool = False,
+    cot_guard: bool = True,
     synthetic_tool_name: str = "",
     has_callable_client_tools: bool = False,
 ) -> Tuple[List[OpenAIMessage], str, bool]:
     """
     预填充(prefill)兼容：Gemini 3.x / 4.x 拒绝以 assistant/model 结尾的请求（400）。
+    自动穿透末尾或中间夹杂的 system 消息识别真实的最后一条对话轮次，并保留全部 system 消息。
     返回 (处理后的消息列表, 需拼回输出开头的预填充文本, 是否检测到预填充)。
     """
     if not messages:
@@ -449,10 +484,18 @@ def apply_prefill_compat(
             return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
+    # 倒序寻找最后一条非空且非 system 的实际对话消息（因为 system 会被抽入 system_instruction，不进入 contents）
     idx = len(messages) - 1
-    while idx >= 0 and _is_empty_message(messages[idx]):
+    while idx >= 0 and (_is_empty_message(messages[idx]) or messages[idx].role == "system"):
         idx -= 1
     if idx < 0:
+        if synthetic_tool_name:
+            ctrl = build_sandbox_control_instruction(
+                synthetic_tool_name,
+                has_prefill=False,
+                has_callable_client_tools=has_callable_client_tools,
+            )
+            return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
     last = messages[idx]
@@ -466,23 +509,33 @@ def apply_prefill_compat(
             return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
-    # 向上收集末尾所有连续的 assistant 预填充消息并合并（兼容未预合并连续 assistant 的客户端）
+    # 向上收集末尾所有连续的 assistant 预填充消息（穿透中间夹杂的空消息或 system 消息）
     start_idx = idx
     while start_idx > 0:
         prev_m = messages[start_idx - 1]
-        if _is_empty_message(prev_m):
+        if _is_empty_message(prev_m) or prev_m.role == "system":
             start_idx -= 1
             continue
         if prev_m.role == "assistant" and not getattr(prev_m, "tool_calls", None):
             start_idx -= 1
             continue
         break
-    prefill_segments = []
-    for k in range(start_idx, idx + 1):
-        if not _is_empty_message(messages[k]):
-            seg_text = _message_text(messages[k].content)
+    # 将 start_idx 向前收紧到第一条实际的 assistant 预填充处（其前面的 system 留在 prefix_msgs 中）
+    while start_idx < idx and (messages[start_idx].role == "system" or _is_empty_message(messages[start_idx])):
+        start_idx += 1
+
+    prefill_segments: List[str] = []
+    trailing_system_msgs: List[OpenAIMessage] = []
+    for k in range(start_idx, len(messages)):
+        m_item = messages[k]
+        if m_item.role == "system":
+            if not _is_empty_message(m_item):
+                trailing_system_msgs.append(m_item)
+        elif not _is_empty_message(m_item) and m_item.role == "assistant":
+            seg_text = _message_text(m_item.content)
             if seg_text and seg_text.strip():
                 prefill_segments.append(seg_text.lstrip("\r\n").rstrip(" \t\r"))
+
     raw_prefill = "\n\n".join(prefill_segments)
     if not raw_prefill or not raw_prefill.strip():
         if synthetic_tool_name:
@@ -498,13 +551,11 @@ def apply_prefill_compat(
     if prefill.endswith("\n\n"):
         prefill = prefill.rstrip("\n") + "\n"
 
-    # 若合并了多条连续 assistant，统一归一为 start_idx 处的单条 assistant
-    if start_idx < idx:
-        messages = list(messages[:start_idx]) + [OpenAIMessage(role="assistant", content=prefill)]
-        idx = start_idx
+    prefix_msgs = list(messages[:start_idx])
+    merged_assistant_msg = OpenAIMessage(role="assistant", content=prefill)
 
     if mode == "minimal":
-        new_msgs = list(messages[:idx + 1])
+        new_msgs = prefix_msgs + trailing_system_msgs + [merged_assistant_msg]
         tail_text = "(请继续)"
         if synthetic_tool_name:
             unclosed_min = detect_unclosed_tag(prefill) if cot_guard else None
@@ -518,12 +569,12 @@ def apply_prefill_compat(
         return new_msgs, "", True
 
     if allow_model_last and not synthetic_tool_name:
-        return messages, prefill, True
+        return prefix_msgs + trailing_system_msgs + [merged_assistant_msg], prefill, True
 
     unclosed_tag = detect_unclosed_tag(prefill) if cot_guard else None
 
     if mode == "keep_turn":
-        new_msgs = list(messages[:idx + 1])
+        new_msgs = prefix_msgs + trailing_system_msgs + [merged_assistant_msg]
         nudge = (instruction_template or "").strip() or DEFAULT_KEEP_TURN_NUDGE
         if synthetic_tool_name:
             nudge = nudge + "\n" + build_sandbox_control_instruction(
@@ -538,9 +589,8 @@ def apply_prefill_compat(
         new_msgs.append(OpenAIMessage(role="user", content=nudge))
         return new_msgs, prefill, True
 
-    # smart 模式：将合成工具传输指令置于 intro 内（位于 prefill 原文之前），
-    # 确保整条消息的最后字符 100% 为 prefill 原始续写断点！
-    new_msgs = list(messages[:idx])
+    # smart 模式：将合成工具传输指令与标签守卫置于 intro 内（位于 prefill 原文之前），
+    # 并穿透末尾 system 找到最后一条真实 user 消息进行无损合并，确保最终对话严格以 prefill 原文收尾！
     intro = (instruction_template or "").strip() or DEFAULT_PREFILL_INSTRUCTION
     if synthetic_tool_name:
         intro = intro + "\n" + build_sandbox_control_instruction(
@@ -555,18 +605,25 @@ def apply_prefill_compat(
     instruction = intro + "\n\n" + prefill
     join_sep = "\n\n"
 
-    if new_msgs and new_msgs[-1].role == "user":
-        prev_user = new_msgs[-1]
+    # 在 prefix_msgs 中倒序查找最后一条非 system 的对话消息，若为 user 则直接合并
+    last_non_sys_idx = len(prefix_msgs) - 1
+    while last_non_sys_idx >= 0 and prefix_msgs[last_non_sys_idx].role == "system":
+        last_non_sys_idx -= 1
+
+    new_msgs = list(prefix_msgs) + trailing_system_msgs
+    if last_non_sys_idx >= 0 and new_msgs[last_non_sys_idx].role == "user":
+        prev_user = new_msgs.pop(last_non_sys_idx)
         if isinstance(prev_user.content, str):
-            merged = prev_user.content + join_sep + instruction
-            new_msgs[-1] = prev_user.model_copy(update={"content": merged})
+            merged_u = prev_user.model_copy(update={"content": prev_user.content + join_sep + instruction})
         elif isinstance(prev_user.content, list):
             merged_list = list(prev_user.content) + [{"type": "text", "text": join_sep + instruction}]
-            new_msgs[-1] = prev_user.model_copy(update={"content": merged_list})
+            merged_u = prev_user.model_copy(update={"content": merged_list})
         else:
-            new_msgs.append(OpenAIMessage(role="user", content=instruction))
+            merged_u = OpenAIMessage(role="user", content=instruction)
+        new_msgs.append(merged_u)
     else:
         new_msgs.append(OpenAIMessage(role="user", content=instruction))
+
     return new_msgs, prefill, True
 
 
@@ -601,7 +658,10 @@ def strip_prefill_overlap(prefill: str, output: str, min_overlap: int = 4) -> st
 
     unclosed_tag = detect_unclosed_tag(prefill)
     if unclosed_tag:
-        tag_pattern = re.compile(rf"<\s*{re.escape(unclosed_tag)}\s*>", re.IGNORECASE)
+        tag_pattern = re.compile(
+            rf"<\s*{re.escape(unclosed_tag)}(?:\s+[^<>]*?)?\s*>",
+            re.IGNORECASE,
+        )
         last_tag_match = None
         for m in tag_pattern.finditer(pre_clean):
             last_tag_match = m
@@ -798,7 +858,7 @@ def _set_json_path_value(root: Dict[str, Any], tokens: List[Any], value: Any, ap
 
 class FunctionCallStreamAssembler:
     """将 Gemini streamFunctionCallArguments 的分片 FunctionCall (partialArgs / willContinue)
-    安全聚合成完整的函数调用事件，同时支持合成传输工具 (router_emit) 的实时流式直通拆包与防闭合溢出熔断。"""
+    安全聚合成完整的函数调用事件，同时支持合成传输工具 (compose_reply) 的实时流式直通拆包与防闭合溢出熔断。"""
 
     _TAIL_HOLD_CHARS = 96
 
@@ -1226,13 +1286,27 @@ def create_gemini_prompt(
                                 mime_type, b64_data = mime_match.groups()
                                 raw_bytes = base64.b64decode(b64_data)
                                 opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                sig = image_signature_store.get(raw_bytes) or image_signature_store.get(opt_bytes)
+                                img_part = types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime)
+                                if sig:
+                                    try:
+                                        img_part = img_part.model_copy(update={"thought_signature": sig})
+                                    except Exception:
+                                        setattr(img_part, "thought_signature", sig)
+                                parts.append(img_part)
                         elif image_url.startswith(("http://", "https://")):
                             fetched = fetch_remote_image(image_url)
                             if fetched:
                                 img_bytes, mime_type = fetched
                                 opt_bytes, opt_mime = optimize_image_bytes(img_bytes, mime_type)
-                                parts.append(types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime))
+                                sig = image_signature_store.get(img_bytes) or image_signature_store.get(opt_bytes)
+                                img_part = types.Part.from_bytes(data=opt_bytes, mime_type=opt_mime)
+                                if sig:
+                                    try:
+                                        img_part = img_part.model_copy(update={"thought_signature": sig})
+                                    except Exception:
+                                        setattr(img_part, "thought_signature", sig)
+                                parts.append(img_part)
 
             if message_sig and exact_ordinary_parts is None:
                 target = None
@@ -1250,6 +1324,27 @@ def create_gemini_prompt(
 
         if not parts:
             continue
+
+        if current_gemini_role == "model":
+            for p_idx, p in enumerate(parts):
+                inline = getattr(p, "inline_data", None)
+                if inline is not None and getattr(inline, "data", None):
+                    if not getattr(p, "thought_signature", None):
+                        resolved_sig = image_signature_store.get(inline.data)
+                        if not resolved_sig and require_sig:
+                            resolved_sig = SKIP_VALIDATOR_SENTINEL
+                            print("⚠️ [生图历史] 历史回复中的图片思考签名未在缓存命中，已自动补全官方跳过校验哨兵。")
+                        elif resolved_sig:
+                            print("✅ [生图历史] 已成功从缓存恢复历史生图的完整思考签名。")
+                        if resolved_sig:
+                            try:
+                                parts[p_idx] = p.model_copy(update={"thought_signature": resolved_sig})
+                            except Exception:
+                                try:
+                                    setattr(parts[p_idx], "thought_signature", resolved_sig)
+                                except Exception:
+                                    pass
+
         raw_gemini_messages.append(types.Content(role=current_gemini_role, parts=parts))
 
     def _is_text_only(content: types.Content) -> bool:
@@ -1369,8 +1464,12 @@ def fetch_remote_image(url: str, timeout: float = 10.0) -> Optional[Tuple[bytes,
 
 def _wire_image_part(raw_bytes: bytes, mime_type: str) -> Dict[str, Any]:
     opt_bytes, opt_mime = optimize_image_bytes(raw_bytes, mime_type)
-    return {"inlineData": {"mimeType": opt_mime,
-                           "data": base64.b64encode(opt_bytes).decode("utf-8")}}
+    sig = image_signature_store.get(raw_bytes) or image_signature_store.get(opt_bytes)
+    res = {"inlineData": {"mimeType": opt_mime,
+                          "data": base64.b64encode(opt_bytes).decode("utf-8")}}
+    if sig:
+        res["thoughtSignature"] = base64.b64encode(sig).decode("ascii") if isinstance(sig, bytes) else str(sig)
+    return res
 
 
 def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
@@ -1390,8 +1489,12 @@ def openai_content_to_wire_parts(content: Any) -> List[Dict[str, Any]]:
                 data = blob.data
                 if isinstance(data, bytes):
                     data = base64.b64encode(data).decode("utf-8")
-                parts.append({"inlineData": {"mimeType": getattr(blob, "mime_type", "image/jpeg"),
-                                             "data": data}})
+                wire_part = {"inlineData": {"mimeType": getattr(blob, "mime_type", "image/jpeg"),
+                                            "data": data}}
+                sig = getattr(ip, "thought_signature", None)
+                if sig:
+                    wire_part["thoughtSignature"] = base64.b64encode(sig).decode("ascii") if isinstance(sig, bytes) else str(sig)
+                parts.append(wire_part)
 
     if isinstance(content, str):
         _add_text_with_inline_images(content)
@@ -1519,6 +1622,9 @@ def parse_gemini_response_for_reasoning_and_content(gemini_response_candidate: A
                 if hasattr(inline_data, "data") and hasattr(inline_data, "mime_type"):
                     image_bytes = inline_data.data
                     mime_type = inline_data.mime_type
+                    sig = getattr(part_item, "thought_signature", None) or getattr(gemini_response_candidate, "thought_signature", None)
+                    if sig and image_bytes:
+                        image_signature_store.put(image_bytes, sig)
                     part_text = _convert_image_to_markdown(image_bytes, mime_type)
             elif hasattr(part_item, "file_data") and part_item.file_data is not None:
                 file_data = part_item.file_data
@@ -1653,6 +1759,18 @@ def process_gemini_response_to_openai_dict(
                 if text_value is None and getattr(part, "inline_data", None) is not None:
                     inline = part.inline_data
                     text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
+                    if getattr(inline, "data", None):
+                        img_sig = sig or getattr(candidate, "thought_signature", None) or next(
+                            (_signature_bytes(p_c) for p_c in parts_in_order if _signature_bytes(p_c)), None
+                        )
+                        if img_sig:
+                            image_signature_store.put(inline.data, img_sig)
+                            try:
+                                opt_b, _ = optimize_image_bytes(inline.data, inline.mime_type)
+                                if opt_b != inline.data:
+                                    image_signature_store.put(opt_b, img_sig)
+                            except Exception:
+                                pass
                 elif text_value is None and getattr(part, "file_data", None) is not None:
                     text_value = f"![Image]({part.file_data.file_uri})"
                 text_value = "" if text_value is None else str(text_value)
