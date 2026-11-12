@@ -413,7 +413,9 @@ def _cookie_ui_schema(schema: Any) -> Any:
         out["type"] = _SCHEMA_TYPES.get(str(raw_type).lower(), str(raw_type).upper())
 
     for key, value in schema.items():
-        if key == "type":
+        if key in ("type", "$schema"):
+            continue
+        if key == "additionalProperties" and isinstance(value, bool):
             continue
         if key == "properties" and isinstance(value, dict):
             out[key] = [{"key": name, "value": _cookie_ui_schema(child)}
@@ -720,17 +722,17 @@ def _convert_messages_to_contents(
                     elif item.get("type") == "ordinary" and isinstance(idx, int) and 0 <= idx < len(ordinary_parts):
                         parts.append(ordinary_parts[idx])
                         used_ordinary.add(idx)
-                parts.extend(p for i, p in enumerate(call_parts) if i not in used_calls)
                 parts.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
-                seen_prior_sig = False
-                for p_ord in parts:
-                    if "functionCall" in p_ord:
-                        if seen_prior_sig and "thoughtSignature" in p_ord:
-                            p_ord.pop("thoughtSignature", None)
-                    elif p_ord.get("thoughtSignature"):
-                        seen_prior_sig = True
+                parts.extend(p for i, p in enumerate(call_parts) if i not in used_calls)
             else:
-                parts = call_parts + ordinary_parts
+                # 严格遵守 Gemini 生成因果拓扑：先输出思考/正文 (ordinary_parts)，最后发起函数调用 (call_parts)！
+                parts = ordinary_parts + call_parts
+
+            has_signed_fc = any("functionCall" in p_chk and p_chk.get("thoughtSignature") for p_chk in parts)
+            if has_signed_fc:
+                for p_ord in parts:
+                    if "functionCall" not in p_ord and not _is_thought_part(p_ord) and "inlineData" not in p_ord:
+                        p_ord.pop("thoughtSignature", None)
             for p in parts:
                 if "inlineData" in p and "thoughtSignature" not in p:
                     b64_str = p["inlineData"].get("data", "")
@@ -781,7 +783,8 @@ def _convert_messages_to_contents(
             previous_fr = bool(merged[-1]["parts"]) and all(
                 "functionResponse" in p for p in merged[-1]["parts"])
             current_fr = bool(c["parts"]) and all("functionResponse" in p for p in c["parts"])
-            if previous_fr != current_fr:
+            previous_has_fc = any("functionCall" in p for p in (merged[-1]["parts"] or []))
+            if previous_fr != current_fr or previous_has_fc:
                 merged.append(c)
                 continue
             if not (previous_fr and current_fr):
@@ -1484,11 +1487,7 @@ async def _collect_full_response_once(
             if blocked_msg:
                 detail += f"；promptFeedback 拦截：{blocked_msg}"
             print(f"🔎 [Studio 诊断] 模型={base_model_name} 假流式无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
-            is_malformed = any(
-                r in str(finish_raw or "").upper()
-                for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
-            )
-            is_synth_retry = bool((synth_tool_name or is_malformed) and not blocked_msg)
+            is_synth_retry = bool(synth_tool_name and not blocked_msg)
             return {
                 "kind": "retryable_error" if is_synth_retry else "fatal_error",
                 "status_code": 400 if blocked_msg else 502,
@@ -1633,7 +1632,10 @@ class CookieProxyUpstream(BaseUpstream):
         debug_outbound = bool(app_state.get_setting("debug_outbound", False))
 
         _eff_settings = app_state.get_effective_settings(base_model_name)
-        _tk = mc.resolve_thinking(base_model_name, request_obj, _eff_settings, prefill_active=prefill_active)
+        _tk = mc.resolve_thinking(
+            request_obj.model or base_model_name, request_obj, _eff_settings,
+            prefill_active=prefill_active,
+        )
         strip_thoughts = bool(_tk.get("mode") and not _tk.get("include_thoughts", True))
 
         is_image = _profile["is_image"]
@@ -1985,11 +1987,7 @@ class CookieProxyUpstream(BaseUpstream):
                         hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
                         print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                        is_malformed = any(
-                            r in str(finish_raw or "").upper()
-                            for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
-                        )
-                        is_synth_retry = bool((synth_tool_name or is_malformed) and not blocked_msg)
+                        is_synth_retry = bool(synth_tool_name and not blocked_msg)
                         raise CookieAttemptError(
                             400 if blocked_msg else 502,
                             f"上游{desc}（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。{hint}",
@@ -2231,11 +2229,7 @@ class CookieProxyUpstream(BaseUpstream):
                 hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
                 print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
                 print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                is_malformed = any(
-                    r in str(finish_raw or "").upper()
-                    for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
-                )
-                is_synth_retry = bool((synth_tool_name or is_malformed) and not blocked_msg)
+                is_synth_retry = bool(synth_tool_name and not blocked_msg)
                 raise CookieAttemptError(
                     400 if blocked_msg else 502,
                     f"上游{desc}（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。{hint}",
