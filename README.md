@@ -97,6 +97,8 @@ docker compose up -d
 {
   "models": [
     "gemini-4-argon",
+    "gemini-4-carbon",
+    "gemini-4-hydrogen",
     "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
@@ -115,9 +117,10 @@ docker compose up -d
 ### 模型能力自动适配规则（`app/model_capabilities.py`）
 - **采样参数自动剥离**：自 `gemini-3.6-flash`、`gemini-3.5-flash-lite` 及 `gemini-4-*` 起，官方已废弃 `temperature` / `top_p` / `top_k`，代理会自动剥离以防 400 报错；惩罚参数（`presence_penalty` / `frequency_penalty`）全系默认剥离。
 - **思考档位（`thinking_level`）**：
+  - 选「自动」档位时不强塞猜测档位，直接交由 Google 上游采用该模型真实的官方原生默认思考强度（如 Pro 级默认 `high`、Flash 级默认 `medium`）。
   - `3.6-flash` / `3.5-flash` / `3.5-flash-lite` / `3.1-flash-lite`：支持 `minimal / low / medium / high`。
-  - `3.7-flash` / `3.8-flash` / `3.1-pro-preview` / `4-argon`：支持 `low / medium / high`（最低合法档为 `low`）。
-  - 跑酒馆角色扮演预设时，推荐在控制台将「原生思考控制」设为 **「关闭原生思考」**，自动忽略前端传来的 `reasoning_effort=xhigh`，将思考压到该模型最低合法档并剥离原生思考块。
+  - `3.7-flash` / `3.8-flash` / `3.1-pro-preview` 及 `gemini-4-*` 全系（`argon` / `carbon` / `hydrogen` 等）：统一支持 `low / medium / high`（最低统一发送 `low`）。
+  - 跑酒馆角色扮演预设时，推荐在控制台将「原生思考控制」设为 **「关闭原生思考」**，自动忽略前端传来的 `reasoning_effort=xhigh`，将思考压到该模型支持的最低合法档并剥离原生思考块。
 - **生图模型**：`gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-nano-banana-2.1` 均支持全部 15 种官方宽高比（`1:1, 3:2, 2:3, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9, 9:21, 1:4, 4:1, 1:8, 8:1`）及最高 `4K` 分辨率，生图请求自动启用假流式保活输出。
 
 ---
