@@ -35,6 +35,7 @@ from message_processing import (
     PrefillDeduper,
     FunctionCallStreamAssembler,
     openai_content_to_wire_parts,
+    sanitize_orphan_tool_turns,
     _coerce_tool_response,
     resolve_tool_call_signature,
     signature_from_extra,
@@ -624,6 +625,8 @@ def _convert_messages_to_contents(
 ) -> tuple:
     contents = []
     system_parts = []
+    if native_tools:
+        messages = sanitize_orphan_tool_turns(messages or [])
     require_sig = _requires_signature(model_name)
     call_names = {}
     for message in messages or []:
@@ -691,12 +694,18 @@ def _convert_messages_to_contents(
                 call_parts.append(part)
 
             ordinary_parts = _ordinary_wire_parts_from_extra(msg)
+            if ordinary_parts is not None:
+                msg_sig_chk, _ = signature_from_extra(msg)
+                has_any_sig = any(p.get("thoughtSignature") for p in ordinary_parts) or bool(msg_sig_chk)
+                if not has_any_sig:
+                    ordinary_parts = [p for p in ordinary_parts if not _is_thought_part(p)]
             if ordinary_parts is None:
                 ordinary_parts = []
+                msg_sig_chk, _ = signature_from_extra(msg)
                 reasoning = getattr(msg, "reasoning_content", None)
-                if reasoning:
+                if reasoning and msg_sig_chk:
                     ordinary_parts.append({"text": reasoning, "thought": True})
-                ordinary_parts.extend(openai_content_to_wire_parts(content))
+                ordinary_parts.extend(openai_content_to_wire_parts(content, for_model_role=True))
                 _attach_message_signature(ordinary_parts, msg)
 
             google = ((getattr(msg, "extra_content", None) or {}).get("google") or {})
@@ -715,6 +724,13 @@ def _convert_messages_to_contents(
                         used_ordinary.add(idx)
                 parts.extend(p for i, p in enumerate(call_parts) if i not in used_calls)
                 parts.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
+                seen_prior_sig = False
+                for p_ord in parts:
+                    if "functionCall" in p_ord:
+                        if seen_prior_sig and "thoughtSignature" in p_ord:
+                            p_ord.pop("thoughtSignature", None)
+                    elif p_ord.get("thoughtSignature"):
+                        seen_prior_sig = True
             else:
                 parts = call_parts + ordinary_parts
             for p in parts:
@@ -726,21 +742,27 @@ def _convert_messages_to_contents(
                     except Exception:
                         resolved_sig = None
                     if not resolved_sig and require_sig:
-                        p["thoughtSignature"] = "skip_thought_signature_validator"
+                        p["thoughtSignature"] = _encode_wire_signature(SKIP_VALIDATOR_SENTINEL)
                     elif resolved_sig:
                         p["thoughtSignature"] = _encode_wire_signature(resolved_sig)
             contents.append({"role": "model", "parts": parts})
             continue
 
         gemini_role = "user" if role == "user" else "model"
+        is_model_turn = (gemini_role == "model")
         parts = (_ordinary_wire_parts_from_extra(msg)
-                 if role in ("assistant", "model") else None)
+                 if is_model_turn else None)
+        if parts is not None:
+            msg_sig_chk, _ = signature_from_extra(msg)
+            has_any_sig = any(p.get("thoughtSignature") for p in parts) or bool(msg_sig_chk)
+            if not has_any_sig:
+                parts = [p for p in parts if not _is_thought_part(p)]
         if parts is None:
-            parts = openai_content_to_wire_parts(content)
-            if role in ("assistant", "model"):
+            parts = openai_content_to_wire_parts(content, for_model_role=is_model_turn)
+            if is_model_turn:
                 _attach_message_signature(parts, msg)
         if parts:
-            if gemini_role == "model":
+            if is_model_turn:
                 for p in parts:
                     if "inlineData" in p and "thoughtSignature" not in p:
                         b64_str = p["inlineData"].get("data", "")
@@ -750,7 +772,7 @@ def _convert_messages_to_contents(
                         except Exception:
                             resolved_sig = None
                         if not resolved_sig and require_sig:
-                            p["thoughtSignature"] = "skip_thought_signature_validator"
+                            p["thoughtSignature"] = _encode_wire_signature(SKIP_VALIDATOR_SENTINEL)
                         elif resolved_sig:
                             p["thoughtSignature"] = _encode_wire_signature(resolved_sig)
             contents.append({"role": gemini_role, "parts": parts})
@@ -1082,6 +1104,10 @@ def _extract_from_results(obj: dict):
         for candidate in candidates:
             content_obj = candidate.get("content") or {}
             parts = content_obj.get("parts") or []
+            cand_sig = candidate.get("thoughtSignature") or next(
+                (p.get("thoughtSignature") for p in parts if isinstance(p, dict) and p.get("thoughtSignature")),
+                None,
+            )
 
             for part in parts:
                 text = part.get("text", "")
@@ -1120,13 +1146,14 @@ def _extract_from_results(obj: dict):
                     b64 = inline_data.get("data", "")
                     if mime_type and b64:
                         image_md = f"![Generated Image](data:{mime_type};base64,{b64})"
-                        sig = part.get("thoughtSignature") or candidate.get("thoughtSignature")
-                        if sig:
-                            try:
-                                image_signature_store.put(base64.b64decode(b64), sig)
-                            except Exception:
-                                pass
-                        yield ("image", image_md)
+                        sig = part.get("thoughtSignature") or cand_sig
+                        try:
+                            raw_img_b = base64.b64decode(b64)
+                            if sig:
+                                image_signature_store.put(raw_img_b, sig)
+                        except Exception:
+                            raw_img_b = b""
+                        yield ("image", {"markdown": image_md, "raw_bytes": raw_img_b})
 
             finish_reason = candidate.get("finishReason")
             if finish_reason and not str(finish_reason).upper().endswith("UNSPECIFIED"):
@@ -1396,7 +1423,10 @@ async def _collect_full_response_once(
         safety_html = ""
         sampler = _RawSampler()
         synth_tool_name = sandbox_spec.emit_tool_name if (sandbox_spec and sandbox_spec.enabled) else ""
-        fc_assembler = FunctionCallStreamAssembler(synthetic_tool_name=synth_tool_name)
+        synth_prefill = sandbox_spec.prefill_text if sandbox_spec else ""
+        fc_assembler = FunctionCallStreamAssembler(
+            synthetic_tool_name=synth_tool_name, prefill_text=synth_prefill
+        )
         synth_text = ""
 
         class _F:
@@ -1405,6 +1435,7 @@ async def _collect_full_response_once(
             async def aiter_text(self):
                 yield self._t
 
+        pending_img_bytes: list[bytes] = []
         async for obj in _iter_json_objects(_F(response.text)):
             sampler.add(obj)
             for et, data in _extract_from_results(obj):
@@ -1413,7 +1444,17 @@ async def _collect_full_response_once(
                 elif et == "thought":
                     reasoning_text += data
                 elif et == "image":
-                    full_text += data
+                    img_md = data["markdown"] if isinstance(data, dict) else str(data)
+                    img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
+                    if img_b:
+                        pending_img_bytes.append(img_b)
+                    full_text += img_md
+                elif et == "thought_signature":
+                    sig_b = _signature_bytes_from_wire(data.get("value"))
+                    if sig_b and pending_img_bytes:
+                        for ib in pending_img_bytes:
+                            if not image_signature_store.get(ib):
+                                image_signature_store.put(ib, sig_b)
                 elif et == "function_call":
                     _, s_delta, _ = fc_assembler.feed_with_synthetic(data)
                     if s_delta:
@@ -1443,7 +1484,9 @@ async def _collect_full_response_once(
             synth_text += tail_text
         for c_item in fc_assembler.flush():
             if synth_tool_name and c_item.get("name") == synth_tool_name:
-                synth_text += extract_synthetic_content(c_item.get("args"), emit_tool_name=synth_tool_name)
+                synth_text += extract_synthetic_content(
+                    c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=synth_prefill
+                )
         if synth_text:
             full_text = synth_text
 
@@ -1744,7 +1787,10 @@ class CookieProxyUpstream(BaseUpstream):
                     blocked_msg = None
                     sampler = _RawSampler()
                     deduper = PrefillDeduper(prefill_text)
-                    fc_assembler = FunctionCallStreamAssembler(synthetic_tool_name=synth_tool_name)
+                    fc_assembler = FunctionCallStreamAssembler(
+                        synthetic_tool_name=synth_tool_name, prefill_text=prefill_text
+                    )
+                    pending_stream_imgs: list[bytes] = []
 
                     async for status, data in _execute_stream_request_generator(
                         client, req_headers, body, sampler=sampler, fallback_body=fallback_body,
@@ -1798,6 +1844,10 @@ class CookieProxyUpstream(BaseUpstream):
 
                         elif status == "thought_signature":
                             signature = _signature_bytes_from_wire(data.get("value"))
+                            if signature and pending_stream_imgs:
+                                for ib in pending_stream_imgs:
+                                    if not image_signature_store.get(ib):
+                                        image_signature_store.put(ib, signature)
                             extra = thought_signature_extra(signature, data.get("part_kind"))
                             if extra:
                                 if stream_ordinary_metadata:
@@ -1811,14 +1861,24 @@ class CookieProxyUpstream(BaseUpstream):
                                     google["ordinary_parts"] = list(stream_ordinary_metadata)
                                 if got_tool_call:
                                     google["part_order"] = list(stream_part_order)
-                                if not has_yielded_to_client:
-                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                    has_yielded_to_client = True
-                                yield _make_openai_chunk(response_id, model_display, extra_content=extra)
+                                if has_yielded_to_client:
+                                    yield _make_openai_chunk(response_id, model_display, extra_content=extra)
 
                         elif status in ("text", "thought", "image", "api_error_text"):
                             if status == "text" and fc_assembler.synthetic_hit:
                                 continue
+                            if status == "api_error_text" and not has_yielded_to_client:
+                                err_str = str(data)
+                                is_auth = _is_cookie_expired_error(err_str) or _is_project_error(err_str)
+                                is_ret = (not is_auth) and (
+                                    _is_retryable_error(err_str) or err_str.startswith("连接中断")
+                                )
+                                raise CookieAttemptError(
+                                    403 if is_auth else (503 if is_ret else 400),
+                                    err_str,
+                                    is_retryable=is_ret,
+                                    is_auth_or_billing=is_auth,
+                                )
                             if not has_yielded_to_client:
                                 print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
                                 yield _make_openai_chunk(response_id, model_display, role="assistant")
@@ -1832,13 +1892,17 @@ class CookieProxyUpstream(BaseUpstream):
                                 print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:2000]}")
                                 yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
                             elif status == "image":
+                                img_md = data["markdown"] if isinstance(data, dict) else str(data)
+                                img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
+                                if img_b:
+                                    pending_stream_imgs.append(img_b)
                                 if prefill_text and not prefill_emitted:
                                     prefill_emitted = True
                                     yield _make_openai_chunk(response_id, model_display, content=prefill_text)
                                 got_text = True
                                 stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                stream_ordinary_metadata.append(ordinary_part_metadata("text", data, None))
-                                yield _make_openai_chunk(response_id, model_display, content=data)
+                                stream_ordinary_metadata.append(ordinary_part_metadata("text", img_md, None))
+                                yield _make_openai_chunk(response_id, model_display, content=img_md)
                             else:
                                 if prefill_text and not prefill_emitted:
                                     prefill_emitted = True
@@ -2035,7 +2099,9 @@ class CookieProxyUpstream(BaseUpstream):
             message_extra, retry_error, fatal_error, auth_error = None, None, None, None
             usage_meta, finish_raw, blocked_msg = None, None, None
             sampler = _RawSampler()
-            fc_assembler = FunctionCallStreamAssembler(synthetic_tool_name=synth_tool_name)
+            fc_assembler = FunctionCallStreamAssembler(
+                synthetic_tool_name=synth_tool_name, prefill_text=prefill_text
+            )
             synth_text = ""
 
             class _FakeResponse:
@@ -2044,6 +2110,7 @@ class CookieProxyUpstream(BaseUpstream):
                 async def aiter_text(self):
                     yield self._text
 
+            pending_nonstream_imgs: list[bytes] = []
             async for obj in _iter_json_objects(_FakeResponse(response.text)):
                 sampler.add(obj)
                 for event_type, data in _extract_from_results(obj):
@@ -2058,9 +2125,13 @@ class CookieProxyUpstream(BaseUpstream):
                         part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
                         ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
                     elif event_type == "image":
-                        full_text += data
+                        img_md = data["markdown"] if isinstance(data, dict) else str(data)
+                        img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
+                        if img_b:
+                            pending_nonstream_imgs.append(img_b)
+                        full_text += img_md
                         part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                        ordinary_metadata.append(ordinary_part_metadata("text", data, None))
+                        ordinary_metadata.append(ordinary_part_metadata("text", img_md, None))
                     elif event_type == "function_call":
                         completed_calls, s_delta, s_sig = fc_assembler.feed_with_synthetic(
                             data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
@@ -2076,6 +2147,10 @@ class CookieProxyUpstream(BaseUpstream):
                             tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
                     elif event_type == "thought_signature":
                         sig = _signature_bytes_from_wire(data.get("value"))
+                        if sig and pending_nonstream_imgs:
+                            for ib in pending_nonstream_imgs:
+                                if not image_signature_store.get(ib):
+                                    image_signature_store.put(ib, sig)
                         if sig:
                             message_extra = thought_signature_extra(sig, data.get("part_kind"))
                             if ordinary_metadata:
@@ -2103,9 +2178,16 @@ class CookieProxyUpstream(BaseUpstream):
                             break
                         fatal_error = f"{diag} — {clean_em}"
 
+            tail_synth = fc_assembler.flush_synthetic_tail()
+            if tail_synth:
+                synth_text += tail_synth
+                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
+                ordinary_metadata.append(ordinary_part_metadata("text", tail_synth, None))
             for c_item in fc_assembler.flush():
                 if synth_tool_name and c_item.get("name") == synth_tool_name:
-                    synth_text += extract_synthetic_content(c_item.get("args"))
+                    synth_text += extract_synthetic_content(
+                        c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=prefill_text
+                    )
                     continue
                 part_order.append({"type": "tool_call", "index": len(tool_calls)})
                 tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
