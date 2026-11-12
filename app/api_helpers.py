@@ -628,7 +628,6 @@ def print_outbound_debug_report(
     gen_config_dict: dict,
     messages: list,
     prefill_text: str = "",
-    sandbox_spec: Any = None,
 ) -> None:
     """输出详尽、结构化的出站参数与提示词断点诊断日志。"""
     if not app_state.get_setting("debug_outbound", False):
