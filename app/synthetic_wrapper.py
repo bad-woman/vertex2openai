@@ -97,7 +97,7 @@ class SyntheticSandboxSpec:
     emit_tool_name: str = ""
     strip_client_tools: bool = False
     real_tool_names: List[str] = field(default_factory=list)
-    prefill_text: str = ""
+    prefill_text: str = field(default="", repr=False)
     has_prefill: bool = False
     is_streaming: bool = False
     bypass_reason: str = ""
@@ -190,8 +190,6 @@ def create_sandbox_spec(model_name: str, request_obj: Any, settings: Optional[di
 
 def build_emit_tool_declaration(
     emit_tool_name: str,
-    prefill_text: str = "",
-    has_prefill: bool = False,
     for_cookie: bool = False,
 ) -> Dict[str, Any]:
     """构建通用单字段 content 传输工具声明：
@@ -269,17 +267,6 @@ def build_sandbox_control_instruction(
     return transport_line
 
 
-def build_anti_truncation_stop_sequences(
-    existing_stops: Optional[List[str]],
-) -> List[str]:
-    """服务端 stop_sequences 透传函数：严格保持与原版一致，不注入任何自定义结构停止词以保护受限解码状态机。"""
-    stops: List[str] = []
-    for s in (existing_stops or []):
-        if isinstance(s, str) and s and s not in stops:
-            stops.append(s)
-    return stops[:5]
-
-
 def inject_express_gen_config(
     gen_config_dict: Dict[str, Any],
     spec: Optional[SyntheticSandboxSpec],
@@ -291,8 +278,6 @@ def inject_express_gen_config(
 
     emit_decl = build_emit_tool_declaration(
         spec.emit_tool_name,
-        prefill_text=spec.prefill_text,
-        has_prefill=spec.has_prefill,
         for_cookie=False,
     )
 
@@ -740,20 +725,6 @@ def _primitive_period(s: str) -> int:
         if n % p == 0 and s == s[:p] * (n // p):
             return p
     return n
-
-
-def find_tail_repetition(s: str, min_unit_len: int = 2, max_unit_len: int = 48) -> Optional[Tuple[int, str, int]]:
-    """兼容保留的尾部周期退化检测接口（基于词法感知过滤合法配对代码、表格与排版线）。"""
-    if not s:
-        return None
-    clean, halted, _ = analyze_synthetic_tail(s, at_eof=True)
-    if halted and len(clean) < len(s):
-        tail = s[len(clean):]
-        p = _primitive_period(tail)
-        unit = tail[:p] if p > 0 else tail
-        reps = len(tail) // p if p > 0 else 1
-        return (len(clean), unit, max(1, reps))
-    return None
 
 
 def analyze_synthetic_tail(
