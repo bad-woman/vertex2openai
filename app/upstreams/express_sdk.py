@@ -37,7 +37,7 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool]:
             raw_name = raw_name[:-len("-search")]
             continue
         import re as _re
-        m_th = _re.search(r"-think-(?:minimal|low|medium|high|off|none)$", low)
+        m_th = _re.search(r"-think-(?:minimal|low|medium|high|xhigh|off|none)$", low)
         if m_th:
             raw_name = raw_name[:m_th.start()]
             continue
