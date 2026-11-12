@@ -179,6 +179,21 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
     return code, formatted
 
 
+_RETRYABLE_MALFORMED_REASONS = ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+
+
+def _is_malformed_finish_reason(finish_reason: Any) -> bool:
+    s = (getattr(finish_reason, "name", None) or str(finish_reason or "")).upper()
+    return any(r in s for r in _RETRYABLE_MALFORMED_REASONS)
+
+
+def _response_has_malformed_finish(response_obj: Any) -> bool:
+    for cand in (getattr(response_obj, "candidates", None) or []):
+        if _is_malformed_finish_reason(getattr(cand, "finish_reason", None)):
+            return True
+    return False
+
+
 def _describe_empty_gemini_response(response_obj: Any, model_to_call: str) -> str:
     """当 Gemini 返回无有效正文的响应时，生成清晰的中文诊断详情。"""
     if response_obj is None:
@@ -199,10 +214,10 @@ def _describe_empty_gemini_response(response_obj: Any, model_to_call: str) -> st
     fr_str = getattr(fr, "name", None) or str(fr or "未知")
     finish_msg = getattr(cand, "finish_message", None) or ""
 
-    if "MALFORMED_FUNCTION_CALL" in fr_str.upper():
+    if _is_malformed_finish_reason(fr_str):
         return (
-            f"模型 {model_to_call} 触发了格式错误的合成/真实函数调用"
-            f"（finish_reason={fr_str} {finish_msg}）。"
+            f"模型 {model_to_call} 上游解码格式异常（finish_reason={fr_str} {finish_msg}），"
+            "常见于超长上下文或复杂函数参数生成偶发失步。"
         )
 
     parts = getattr(getattr(cand, "content", None), "parts", None) or []
@@ -1529,7 +1544,7 @@ async def execute_unified_completion(
                             if not is_gemini_response_valid(raw_gemini_response, synthetic_tool_name=synth_tool_name):
                                 print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                                 err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
-                                if synth_tool_name:
+                                if synth_tool_name or _response_has_malformed_finish(raw_gemini_response):
                                     err_v.is_retryable = True
                                 raise err_v
 
@@ -1581,9 +1596,11 @@ async def execute_unified_completion(
                                     deduper = PrefillDeduper(prefill_text) if (prefill_text and (exp_req_obj.n or 1) == 1) else None
                                     prefill_emitted = not bool(prefill_text)
                                     emitted_finish_reason = False
+                                    last_stream_chunk_obj = None
                                     final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
 
                                     async for chunk_item_call in stream_gen_obj:
+                                        last_stream_chunk_obj = chunk_item_call
                                         sampler.add(extract_gemini_chunk_debug_dict(chunk_item_call))
                                         if getattr(chunk_item_call, "usage_metadata", None):
                                             final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
@@ -1599,7 +1616,8 @@ async def execute_unified_completion(
                                                 chunk_item_call, exp_req_obj.model, response_id_for_stream, ci,
                                                 indexer=tool_indexer,
                                             )
-                                            if synth_tool_name and not has_yielded_output and '"finish_reason": "content_filter"' in sse_chunk:
+                                            if not has_yielded_output and '"finish_reason": "content_filter"' in sse_chunk:
+                                                print(f"🔎 [Express 诊断] 模型={model_to_call} 触发安全过滤。原始响应样本：\n{sampler.dump()}")
                                                 raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
 
                                             if deduper is not None:
@@ -1615,7 +1633,7 @@ async def execute_unified_completion(
                                             if is_real_chunk and not has_yielded_output:
                                                 has_yielded_output = True
                                                 print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
-                                            elif synth_tool_name and not has_yielded_output:
+                                            elif not has_yielded_output:
                                                 continue
 
                                             if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
@@ -1662,31 +1680,22 @@ async def execute_unified_completion(
                                             }
                                             yield f"data: {json.dumps(_rem_chunk, ensure_ascii=False)}\n\n"
 
-                                    if synth_tool_name and not has_yielded_output:
-                                        print(f"🔎 [Express 诊断] 模型={model_to_call} 沙箱模式未产出正文。原始响应样本：\n{sampler.dump()}")
-                                        err_empty_s = ValueError(
-                                            f"模型 {model_to_call} 在沙箱模式下未产出任何有效正文（可能触发 MALFORMED_FUNCTION_CALL 或空回）。"
-                                        )
-                                        err_empty_s.is_retryable = True
-                                        raise err_empty_s
-
-                                    if not prefill_emitted:
-                                        prefill_emitted = True
-                                        if not has_yielded_output:
-                                            has_yielded_output = True
-                                            print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
-                                        _pf = {
-                                            "id": response_id_for_stream,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": exp_req_obj.model,
-                                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
-                                        }
-                                        yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
-
                                     if deduper is not None and not deduper.done:
                                         tail = deduper.flush()
                                         if tail:
+                                            if not has_yielded_output:
+                                                has_yielded_output = True
+                                                print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                            if not prefill_emitted:
+                                                prefill_emitted = True
+                                                _pf = {
+                                                    "id": response_id_for_stream,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": exp_req_obj.model,
+                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
+                                                }
+                                                yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
                                             _tail = {
                                                 "id": response_id_for_stream,
                                                 "object": "chat.completion.chunk",
@@ -1695,6 +1704,15 @@ async def execute_unified_completion(
                                                 "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
                                             }
                                             yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+
+                                    # 真流式全量空回拦截：无论是否开启沙箱，只要模型未产出任何有效正文/思考/工具调用，绝不把纯 prefill 或空串当成功发出！
+                                    if not has_yielded_output:
+                                        print(f"🔎 [Express 诊断] 模型={model_to_call} 真流式未产出任何有效正文。原始响应样本：\n{sampler.dump()}")
+                                        desc_empty = _describe_empty_gemini_response(last_stream_chunk_obj, model_to_call)
+                                        err_empty_stream = ValueError(desc_empty)
+                                        if synth_tool_name or _response_has_malformed_finish(last_stream_chunk_obj):
+                                            err_empty_stream.is_retryable = True
+                                        raise err_empty_stream
 
                                     if has_yielded_output and not emitted_finish_reason:
                                         _fin_reason = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
@@ -1931,7 +1949,7 @@ async def execute_unified_completion(
                 if not is_gemini_response_valid(response_obj_call, synthetic_tool_name=synth_tool_name):
                     print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                     err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
-                    if synth_tool_name:
+                    if synth_tool_name or _response_has_malformed_finish(response_obj_call):
                         err_v.is_retryable = True
                     raise err_v
 
