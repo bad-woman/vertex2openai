@@ -28,11 +28,21 @@ from synthetic_wrapper import create_sandbox_spec, inject_express_gen_config
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool]:
-    base_model_name = (model_name or "").strip()
-    is_grounded_search = base_model_name.endswith("-search")
-    if is_grounded_search:
-        base_model_name = base_model_name[:-len("-search")]
-    return base_model_name, is_grounded_search
+    raw_name = (model_name or "").strip()
+    is_grounded_search = False
+    while True:
+        low = raw_name.lower()
+        if low.endswith("-search"):
+            is_grounded_search = True
+            raw_name = raw_name[:-len("-search")]
+            continue
+        import re as _re
+        m_th = _re.search(r"-think-(?:minimal|low|medium|high|off|none)$", low)
+        if m_th:
+            raw_name = raw_name[:m_th.start()]
+            continue
+        break
+    return raw_name, is_grounded_search
 
 
 def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
@@ -45,13 +55,15 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
                            prefill_active: bool = False) -> dict | None:
     settings = app_state.get_effective_settings(base_model_name)
-    t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active)
+    # 传入 request（含原始 request.model 后缀）以便识别 -think-xxx 内联后缀
+    probe_name = getattr(request, "model", None) or base_model_name
+    t = mc.resolve_thinking(probe_name, request, settings, prefill_active=prefill_active)
     if t.get("mode") is None:
         return None
 
     thinking_config = {"include_thoughts": t.get("include_thoughts", True)}
 
-    if t["mode"] == "level":
+    if t["mode"] == "level" and t.get("level"):
         genai_version_str = getattr(google.genai, "__version__", "1.0.0")
         try:
             parts = genai_version_str.split(".")
@@ -219,7 +231,6 @@ class ExpressSDKUpstream(BaseUpstream):
         prompt_func = partial(
             create_gemini_prompt,
             model_name=base_model_name,
-            sandbox_spec=sandbox_spec,
         )
 
         from api_helpers import print_outbound_debug_report
@@ -229,7 +240,6 @@ class ExpressSDKUpstream(BaseUpstream):
             gen_config_dict=gen_config_dict,
             messages=request_obj.messages,
             prefill_text=prefill_text,
-            sandbox_spec=sandbox_spec,
         )
 
         return {
