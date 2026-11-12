@@ -1457,7 +1457,7 @@ def create_gemini_prompt(
                 tool_output_data = _coerce_tool_response(message.content)
 
                 func_resp_kwargs = {"name": function_name, "response": tool_output_data}
-                if real_tool_id:
+                if real_tool_id and real_tool_id.startswith("function-call-"):
                     func_resp_kwargs["id"] = real_tool_id
 
                 try:
@@ -1494,7 +1494,7 @@ def create_gemini_prompt(
                 )
 
                 fc_kwargs = {"name": function_name, "args": parsed_arguments}
-                if real_tool_id:
+                if real_tool_id and real_tool_id.startswith("function-call-"):
                     fc_kwargs["id"] = real_tool_id
 
                 try:
@@ -1555,22 +1555,28 @@ def create_gemini_prompt(
                             used_ordinary.add(i)
                 ordered.extend(p for i, p in enumerate(ordinary_parts) if i not in used_ordinary)
                 ordered.extend(p for i, p in enumerate(tool_parts) if i not in used_tools)
-                # 若排在前面的 ordinary Part 已携带真实签名，避免同轮后续 function_call 重复挂同一签名或跳过哨兵
-                seen_prior_sig = False
-                for idx_ord, p_ord in enumerate(ordered):
-                    p_sig = getattr(p_ord, "thought_signature", None)
-                    if getattr(p_ord, "function_call", None) is not None:
-                        if seen_prior_sig and p_sig:
-                            try:
-                                ordered[idx_ord] = p_ord.model_copy(update={"thought_signature": None})
-                            except Exception:
-                                pass
-                    elif p_sig:
-                        seen_prior_sig = True
-                parts.extend(ordered)
             else:
-                parts.extend(tool_parts)
-                parts.extend(ordinary_parts)
+                # 严格遵守 Gemini 生成因果拓扑：先输出思考/正文 (ordinary_parts)，最后发起函数调用 (tool_parts)！
+                ordered = list(ordinary_parts) + list(tool_parts)
+
+            # 当本轮包含 function_call 且首个 function_call 已携带签名时，清理前面非思考普通文本块上的重复签名（防双签名冲突）
+            has_signed_fc = any(
+                getattr(p_chk, "function_call", None) is not None and getattr(p_chk, "thought_signature", None)
+                for p_chk in ordered
+            )
+            if has_signed_fc:
+                for idx_ord, p_ord in enumerate(ordered):
+                    if (
+                        getattr(p_ord, "function_call", None) is None
+                        and not getattr(p_ord, "thought", None)
+                        and getattr(p_ord, "inline_data", None) is None
+                        and getattr(p_ord, "thought_signature", None)
+                    ):
+                        try:
+                            ordered[idx_ord] = p_ord.model_copy(update={"thought_signature": None})
+                        except Exception:
+                            pass
+            parts.extend(ordered)
         else:
             message_sig, signature_kind = signature_from_extra(message)
             reasoning = getattr(message, "reasoning_content", None)
@@ -1726,13 +1732,16 @@ def create_gemini_prompt(
         return bool(content.parts) and all(
             getattr(p, "function_response", None) is not None for p in content.parts)
 
+    def _has_function_call(content: types.Content) -> bool:
+        return any(getattr(p, "function_call", None) is not None for p in (content.parts or []))
+
     merged_messages = []
     for msg in raw_gemini_messages:
         if merged_messages and merged_messages[-1].role == msg.role:
             previous = merged_messages[-1]
             previous_is_results = _is_function_response_only(previous)
             current_is_results = _is_function_response_only(msg)
-            if previous_is_results != current_is_results:
+            if previous_is_results != current_is_results or _has_function_call(previous):
                 merged_messages.append(msg)
                 continue
             if _is_text_only(previous) and _is_text_only(msg):
