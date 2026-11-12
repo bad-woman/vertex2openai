@@ -765,7 +765,9 @@ def is_gemini_response_valid(response: Any, synthetic_tool_name: str = "") -> bo
                     fc = getattr(part, "function_call", None)
                     if fc is not None:
                         if synthetic_tool_name and getattr(fc, "name", "") == synthetic_tool_name:
-                            if extract_synthetic_content(getattr(fc, "args", None)).strip():
+                            if extract_synthetic_content(
+                                getattr(fc, "args", None), emit_tool_name=synthetic_tool_name
+                            ).strip():
                                 return True
                             continue
                         return True
@@ -781,19 +783,38 @@ def is_gemini_response_valid(response: Any, synthetic_tool_name: str = "") -> bo
 class ToolCallIndexer:
     """一次流式响应内，为 tool_calls 分配稳定递增的 index，聚合分片函数参数，并实时拆包合成传输工具。"""
 
-    def __init__(self, synthetic_tool_name: str = ""):
+    def __init__(self, synthetic_tool_name: str = "", prefill_text: str = ""):
         self.synthetic_tool_name: str = (synthetic_tool_name or "").strip()
+        self.prefill_text: str = prefill_text or ""
         self._next: Dict[int, int] = {}
         self._seen_tool_calls: set[int] = set()
         self._ordinary_parts: Dict[int, list] = {}
         self._part_order: Dict[int, list] = {}
         self._assemblers: Dict[int, Any] = {}
+        self._pending_images: Dict[int, list[bytes]] = {}
+
+    def record_image_bytes(self, candidate_index: int, img_bytes: bytes) -> None:
+        if img_bytes:
+            self._pending_images.setdefault(candidate_index, []).append(img_bytes)
+
+    def bind_trailing_image_signature(self, candidate_index: int, sig: Optional[bytes]) -> None:
+        if not sig:
+            return
+        imgs = self._pending_images.get(candidate_index)
+        if imgs:
+            from signature_store import image_signature_store
+            for ib in imgs:
+                if not image_signature_store.get(ib):
+                    image_signature_store.put(ib, sig)
 
     def _assembler(self, candidate_index: int = 0):
         from message_processing import FunctionCallStreamAssembler
         asm = self._assemblers.get(candidate_index)
         if asm is None:
-            asm = FunctionCallStreamAssembler(synthetic_tool_name=self.synthetic_tool_name)
+            asm = FunctionCallStreamAssembler(
+                synthetic_tool_name=self.synthetic_tool_name,
+                prefill_text=self.prefill_text,
+            )
             self._assemblers[candidate_index] = asm
         return asm
 
@@ -940,6 +961,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     text_value = getattr(part, "text", None)
                     if text_value is None and getattr(part, "inline_data", None) is not None:
                         inline = part.inline_data
+                        if indexer and getattr(inline, "data", None):
+                            indexer.record_image_bytes(candidate_index, inline.data)
                         text_value = _convert_image_to_markdown(inline.data, inline.mime_type)
                     elif text_value is None and getattr(part, "file_data", None) is not None:
                         text_value = f"![Image]({part.file_data.file_uri})"
@@ -958,6 +981,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                     part_order.append({"type": "ordinary", "index": ordinary_index})
                     ordinary_metadata.append(metadata)
                     if sig:
+                        if indexer:
+                            indexer.bind_trailing_image_signature(candidate_index, sig)
                         ordinary_signature = sig
                         ordinary_signature_kind = kind
                     continue
@@ -1494,7 +1519,10 @@ async def execute_unified_completion(
 
                             _record_usage(raw_gemini_response)
                             openai_response_dict = convert_to_openai_format(
-                                raw_gemini_response, exp_req_obj.model, synthetic_tool_name=synth_tool_name
+                                raw_gemini_response,
+                                exp_req_obj.model,
+                                synthetic_tool_name=synth_tool_name,
+                                prefill_text=prefill_text,
                             )
                             _prepend_prefill(openai_response_dict, prefill_text)
 
@@ -1530,9 +1558,13 @@ async def execute_unified_completion(
                                         contents=actual_prompt,
                                         config=gen_config_dict,
                                     )
-                                    tool_indexer = ToolCallIndexer(synthetic_tool_name=synth_tool_name)
+                                    tool_indexer = ToolCallIndexer(
+                                        synthetic_tool_name=synth_tool_name,
+                                        prefill_text=prefill_text,
+                                    )
                                     deduper = PrefillDeduper(prefill_text) if (prefill_text and (exp_req_obj.n or 1) == 1) else None
                                     prefill_emitted = not bool(prefill_text)
+                                    emitted_finish_reason = False
                                     final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
 
                                     async for chunk_item_call in stream_gen_obj:
@@ -1551,6 +1583,14 @@ async def execute_unified_completion(
                                                 chunk_item_call, exp_req_obj.model, response_id_for_stream, ci,
                                                 indexer=tool_indexer,
                                             )
+                                            if synth_tool_name and not has_yielded_output and '"finish_reason": "content_filter"' in sse_chunk:
+                                                raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
+
+                                            if deduper is not None:
+                                                sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
+                                                if sse_chunk is None:
+                                                    continue
+
                                             is_real_chunk = (
                                                 '"reasoning_content":' in sse_chunk
                                                 or '"tool_calls":' in sse_chunk
@@ -1560,8 +1600,6 @@ async def execute_unified_completion(
                                                 has_yielded_output = True
                                                 print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
                                             elif synth_tool_name and not has_yielded_output:
-                                                if '"finish_reason": "content_filter"' in sse_chunk:
-                                                    raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
                                                 continue
 
                                             if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
@@ -1574,10 +1612,8 @@ async def execute_unified_completion(
                                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
                                                 }
                                                 yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
-                                            if deduper is not None:
-                                                sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
-                                                if sse_chunk is None:
-                                                    continue
+                                            if '"finish_reason": null' not in sse_chunk and '"finish_reason":' in sse_chunk:
+                                                emitted_finish_reason = True
                                             yield sse_chunk
                                         if tool_indexer.has_synthetic_halted(0):
                                             print(f"🛑 [抗截断保护] 检测到 {model_to_call} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
@@ -1588,7 +1624,19 @@ async def execute_unified_completion(
                                         if deduper is not None:
                                             rem_synth = deduper.feed(rem_synth)
                                         if rem_synth:
-                                            has_yielded_output = True
+                                            if not has_yielded_output:
+                                                has_yielded_output = True
+                                                print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                            if not prefill_emitted:
+                                                prefill_emitted = True
+                                                _pf = {
+                                                    "id": response_id_for_stream,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": exp_req_obj.model,
+                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
+                                                }
+                                                yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
                                             _rem_chunk = {
                                                 "id": response_id_for_stream,
                                                 "object": "chat.completion.chunk",
@@ -1631,6 +1679,17 @@ async def execute_unified_completion(
                                                 "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
                                             }
                                             yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+
+                                    if has_yielded_output and not emitted_finish_reason:
+                                        _fin_reason = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
+                                        _fin_chunk = {
+                                            "id": response_id_for_stream,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": exp_req_obj.model,
+                                            "choices": [{"index": 0, "delta": {}, "finish_reason": _fin_reason}],
+                                        }
+                                        yield f"data: {json.dumps(_fin_chunk, ensure_ascii=False)}\n\n"
 
                                     if final_p_tk > 0 or final_c_tk > 0:
                                         stats.add_tokens(final_p_tk, final_c_tk)
@@ -1862,7 +1921,10 @@ async def execute_unified_completion(
 
                 _record_usage(response_obj_call)
                 openai_response_content = convert_to_openai_format(
-                    response_obj_call, exp_req_obj.model, synthetic_tool_name=synth_tool_name
+                    response_obj_call,
+                    exp_req_obj.model,
+                    synthetic_tool_name=synth_tool_name,
+                    prefill_text=prefill_text,
                 )
                 _prepend_prefill(openai_response_content, prefill_text)
                 if app_state.get_setting("debug_outbound", False):
