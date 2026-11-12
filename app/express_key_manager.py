@@ -23,10 +23,6 @@ class ExpressKeyManager:
             if r.get("enabled", True)
         ]
 
-    @property
-    def express_keys(self) -> List[str]:
-        return [r["key"] for r in self.get_records()]
-
     def get_total_keys(self) -> int:
         return len(self.get_records())
 
