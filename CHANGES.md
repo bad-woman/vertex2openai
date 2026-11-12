@@ -3,9 +3,9 @@
 ### 0. 新增 `gemini-4-hydrogen`、`XHIGH` 第四思考档位与 64K 全模式输出适配
 - `vertexModels.json` 新增 `gemini-4-hydrogen`（自动支持 `-search` 后缀），`requirements.txt` 升级至官方要求的 `google-genai>=2.30.0` 并移除冗余依赖 `curl_cffi`。
 - **支持 Gemini 4 官方 `XHIGH` 档位与 64K 非流式/假流式上限**：`gemini-4-*` 全系开放 `low / medium / high / xhigh` 四档（控制台新增 `xhigh` 选项并支持 `-think-xhigh` 后缀，Gemini 3.x 自动向下兼容夹到 `high`）；`3.7+` 与 `4.x` 开启关闭/压制原生思考时统一发送最低合法档 `low`；放宽 Gemini 4 非流式与假流式 `32K` 旧上限至官方 `64K`（`65536`）。
-- **根治工具思考签名错位漏接与严格对齐官方「当前轮次（Current Turn）」校验规则**：
-  - 按 Google 官方《Thought Signatures》规范：仅对最后一条真实 `user` 消息之后的「当前活跃工具循环（Current Turn）」强校验并在缺失时补免校验哨兵；对于已经完结的历史旧楼层（Prior Turns），有缓存真签名则无损带上，缓存过期时绝不再乱塞降低模型智商的 `skip_thought_signature_validator` 假哨兵，彻底根治历史楼层越叠越高连刷几十遍警告的 Bug；
-  - 修复同轮先输出思考/正文再发起工具调用时未将本轮签名绑定给工具、以及收尾块漏接签名的 Bug；新增 `NO_THOUGHT` 状态区分「原生未思考」与「缓存丢失」，并将 `SignatureStore` 缓存扩容至 72 小时 / 20000 条。
+- **根治工具思考签名错位漏接与长楼层刷屏（保留全历史哨兵保护防 `MALFORMED_RESPONSE`）**：
+  - 实测确认 Gemini 4 在历史旧楼层存在大量无签名 `functionCall` 时会因内部状态机失步必现 `finish_reason=MALFORMED_RESPONSE`（仅吐 14 tokens 即中断）：现已完整恢复对全历史无签名工具调用（每步首个调用）自动补全 `skip_thought_signature_validator` 免校验哨兵的保护；
+  - 修复同轮先输出思考/正文再发起工具调用时未将本轮签名绑定给工具、以及收尾块漏接签名的 Bug；新增 `NO_THOUGHT` 状态并将 `SignatureStore` 缓存扩容至 72 小时 / 20000 条，同时将多楼层哨兵提示合并为单行日志汇总，既保证 100% 正常生成又不刷屏。
 
 ### 1. 零前瞻确定性词法状态机（`LexicalState`）与代码/前端美化免误伤保护
 - **问题根因**：旧版 `sanitize_synthetic_tail` 采用无状态全文正则（如匹配 `]}` / `]})` / `}])}` 及 `Done!` 后空白）并在流式进行期以结构字符重复 `>= 2` 次即断流，导致正常 Python 嵌套括号（如 `foo({"a": [1]})`、多层缩进 `)\n)`）、Markdown 表格（`| --- | --- |`）、连续代码块与酒馆前端美化嵌套闭合标签（`</div></div>`）在流式或非流式下被误判腰斩；若简单放宽正则又会漏放真实的末尾闭合残片。
