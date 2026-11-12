@@ -435,14 +435,14 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     mc.sanitize_sampling(config, profile)
 
     if re.search(r"(?:^|/)gemini-4-", (request.model or "").lower()) and config.get("max_output_tokens"):
+        # Gemini 4 官方支持流式与非流式单轮标准 64K (65536) 输出；Express SDK >= 2.30.0 超过 64K 时原生支持自动 Long Decode
         _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
-        _is_real_stream = bool(request.stream and not _fake_on and not is_image_model)
-        _g4_cap = 65536 if _is_real_stream else 32768
-        try:
-            if int(config["max_output_tokens"]) > _g4_cap:
-                config["max_output_tokens"] = _g4_cap
-        except (TypeError, ValueError):
-            pass
+        if _fake_on and not is_image_model:
+            try:
+                if int(config["max_output_tokens"]) > 65536:
+                    config["max_output_tokens"] = 65536
+            except (TypeError, ValueError):
+                pass
 
     if tools_list:
         config["tools"] = tools_list
@@ -791,14 +791,28 @@ class ToolCallIndexer:
         self._part_order: Dict[int, list] = {}
         self._assemblers: Dict[int, Any] = {}
         self._pending_images: Dict[int, list[bytes]] = {}
+        self._first_tool_ids: Dict[int, str] = {}
 
     def record_image_bytes(self, candidate_index: int, img_bytes: bytes) -> None:
         if img_bytes:
             self._pending_images.setdefault(candidate_index, []).append(img_bytes)
 
+    def note_candidate_signature(self, candidate_index: int, sig: Optional[bytes]) -> None:
+        if not sig:
+            return
+        self._assembler(candidate_index).note_turn_signature(sig)
+        # 若首个工具调用已提前发出但当时尚未拿到尾随签名，立即补绑到缓存中
+        first_id = self._first_tool_ids.get(candidate_index)
+        if first_id:
+            from signature_store import signature_store, SignatureRecord, SignatureState
+            rec = signature_store.get_record(first_id)
+            if rec is None or rec.state is not SignatureState.SIGNED:
+                signature_store.put_record(first_id, SignatureRecord(SignatureState.SIGNED, sig))
+
     def bind_trailing_image_signature(self, candidate_index: int, sig: Optional[bytes]) -> None:
         if not sig:
             return
+        self.note_candidate_signature(candidate_index, sig)
         imgs = self._pending_images.get(candidate_index)
         if imgs:
             from signature_store import image_signature_store
@@ -928,13 +942,15 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 "id": build_tool_call_id(
                     fake_fc, fake_part,
                     missing_state=(SignatureState.UNSIGNED_FOLLOWER
-                                   if tc_index > 0 else SignatureState.UNKNOWN)),
+                                   if tc_index > 0 else SignatureState.NO_THOUGHT)),
                 "type": "function",
                 "function": {
                     "name": fake_fc.name,
                     "arguments": json.dumps(fake_fc.args, ensure_ascii=False) if fake_fc.args is not None else "{}",
                 },
             }
+            if indexer and tc_index == 0:
+                indexer._first_tool_ids[candidate_index] = tc["id"]
             extra = thought_signature_extra(call_dict.get("thought_signature"))
             if extra:
                 tc["extra_content"] = extra
@@ -954,6 +970,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                             and getattr(part, "inline_data", None) is None
                             and getattr(part, "file_data", None) is None):
                         if sig:
+                            indexer.note_candidate_signature(candidate_index, sig)
                             ordinary_signature = sig
                             ordinary_signature_kind = "text"
                         continue
