@@ -528,7 +528,7 @@ def _openai_tool_call(response_id: str, call_index: int, call: dict) -> dict:
     elif call_index > 0:
         signature_store.put_unsigned_follower(call_id)
     else:
-        signature_store.put_unknown(call_id)
+        signature_store.put_no_thought(call_id)
     payload = {
         "id": call_id,
         "type": "function",
@@ -624,6 +624,12 @@ def _convert_messages_to_contents(
     if native_tools:
         messages = sanitize_orphan_tool_turns(messages or [])
     require_sig = _requires_signature(model_name)
+    last_fresh_user_idx = -1
+    for u_i in range(len(messages) - 1, -1, -1):
+        if messages[u_i].role == "user":
+            last_fresh_user_idx = u_i
+            break
+    tool_sig_fallback_cnt = [0]
     call_names = {}
     for message in messages or []:
         for tc in (getattr(message, "tool_calls", None) or []):
@@ -632,7 +638,7 @@ def _convert_messages_to_contents(
             if tc_id and fn_name:
                 call_names[tc_id] = fn_name
 
-    for msg in messages:
+    for msg_idx, msg in enumerate(messages):
         role = msg.role
         content = msg.content
         if role == "system":
@@ -670,15 +676,17 @@ def _convert_messages_to_contents(
                 contents.append({"role": "model", "parts": [{"text": "\n".join(lines)}]})
                 continue
 
+            is_in_current_turn = (msg_idx > last_fresh_user_idx)
             call_parts = []
             for tool_index, tc in enumerate(tool_calls):
                 fn = (tc or {}).get("function") or {}
                 explicit_sig, _ = signature_from_extra(tc)
                 _, signature = resolve_tool_call_signature(
                     str((tc or {}).get("id") or ""),
-                    require_signature=require_sig and tool_index == 0,
+                    require_signature=(require_sig and is_in_current_turn and tool_index == 0),
                     explicit_signature=explicit_sig,
                     explicit_unsigned=tool_index > 0,
+                    fallback_counter=tool_sig_fallback_cnt,
                 )
                 part = {"functionCall": {
                     "name": str(fn.get("name") or "unknown"),
@@ -788,6 +796,9 @@ def _convert_messages_to_contents(
         else:
             merged.append(c)
 
+    if tool_sig_fallback_cnt[0] > 0:
+        print(f"ℹ️ [工具历史] 已为历史记录中 {tool_sig_fallback_cnt[0]} 处旧工具调用自动补全官方免校验哨兵（请求不受影响）。")
+
     system_text = "\n".join(t for t in system_parts if t) if system_parts else None
     return merged, system_text
 
@@ -864,11 +875,8 @@ def _build_batch_graphql_body(
                 mv = settings.get("default_max_tokens")
             if mv is not None:
                 if re.search(r"(?:^|/)gemini-4-", (model_name or "").lower()):
-                    _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
-                    _is_real_stream = bool(request.stream and not _fake_on and not profile["is_image"])
-                    _g4_cap = 65536 if _is_real_stream else 32768
                     try:
-                        mv = min(int(mv), _g4_cap)
+                        mv = min(int(mv), 65536)
                     except (TypeError, ValueError):
                         pass
                 gen_config["maxOutputTokens"] = mv
@@ -1562,7 +1570,7 @@ class CookieProxyUpstream(BaseUpstream):
             if _low_m.endswith("-search"):
                 base_model_name = base_model_name[:-len("-search")]
                 continue
-            _m_th = re.search(r"-think-(?:minimal|low|medium|high|off|none)$", _low_m)
+            _m_th = re.search(r"-think-(?:minimal|low|medium|high|xhigh|off|none)$", _low_m)
             if _m_th:
                 base_model_name = base_model_name[:_m_th.start()]
                 continue
@@ -1780,6 +1788,7 @@ class CookieProxyUpstream(BaseUpstream):
                         synthetic_tool_name=synth_tool_name, prefill_text=prefill_text
                     )
                     pending_stream_imgs: list[bytes] = []
+                    first_stream_tool_id: Optional[str] = None
 
                     async for status, data in _execute_stream_request_generator(
                         client, req_headers, body, sampler=sampler, fallback_body=fallback_body,
@@ -1823,6 +1832,8 @@ class CookieProxyUpstream(BaseUpstream):
                                     has_yielded_to_client = True
                                 tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
                                 tool_payload["index"] = tool_call_index
+                                if tool_call_index == 0:
+                                    first_stream_tool_id = tool_payload["id"]
                                 stream_part_order.append({"type": "tool_call", "index": tool_call_index})
                                 yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
                                 tool_call_index += 1
@@ -1833,6 +1844,14 @@ class CookieProxyUpstream(BaseUpstream):
 
                         elif status == "thought_signature":
                             signature = _signature_bytes_from_wire(data.get("value"))
+                            if signature:
+                                fc_assembler.note_turn_signature(signature)
+                                if first_stream_tool_id:
+                                    rec_chk = signature_store.get_record(first_stream_tool_id)
+                                    if rec_chk is None or rec_chk.state is not SignatureState.SIGNED:
+                                        signature_store.put_record(
+                                            first_stream_tool_id, SignatureRecord(SignatureState.SIGNED, signature)
+                                        )
                             if signature and pending_stream_imgs:
                                 for ib in pending_stream_imgs:
                                     if not image_signature_store.get(ib):
@@ -2135,6 +2154,16 @@ class CookieProxyUpstream(BaseUpstream):
                             tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
                     elif event_type == "thought_signature":
                         sig = _signature_bytes_from_wire(data.get("value"))
+                        if sig:
+                            fc_assembler.note_turn_signature(sig)
+                            if tool_calls:
+                                f_id = tool_calls[0].get("id")
+                                if f_id:
+                                    rec_chk = signature_store.get_record(f_id)
+                                    if rec_chk is None or rec_chk.state is not SignatureState.SIGNED:
+                                        signature_store.put_record(
+                                            f_id, SignatureRecord(SignatureState.SIGNED, sig)
+                                        )
                         if sig and pending_nonstream_imgs:
                             for ib in pending_nonstream_imgs:
                                 if not image_signature_store.get(ib):
