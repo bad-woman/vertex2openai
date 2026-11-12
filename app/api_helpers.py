@@ -27,6 +27,37 @@ from synthetic_wrapper import (
 )
 
 
+def _strip_json_schema_meta(node: Any) -> Any:
+    """递归移除 JSON Schema 中的 $schema 元字段（保留 properties 字典内用户定义的同名属性键）。"""
+    if isinstance(node, list):
+        return [_strip_json_schema_meta(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out: Dict[str, Any] = {}
+    for k, v in node.items():
+        if k == "$schema":
+            continue
+        if k == "properties" and isinstance(v, dict):
+            out[k] = {pk: _strip_json_schema_meta(pv) for pk, pv in v.items()}
+        else:
+            out[k] = _strip_json_schema_meta(v)
+    return out
+
+
+def _sdk_supports_params_json_schema() -> bool:
+    try:
+        fields = getattr(types.FunctionDeclaration, "model_fields", None) or {}
+        if "parameters_json_schema" in fields:
+            return True
+        ann = getattr(types.FunctionDeclaration, "__annotations__", None) or {}
+        return "parameters_json_schema" in ann
+    except Exception:
+        return False
+
+
+_USE_PARAMS_JSON_SCHEMA = _sdk_supports_params_json_schema()
+
+
 def _safety_score_enabled() -> bool:
     try:
         return bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
@@ -75,8 +106,11 @@ def _diagnose_express_error(code: int, msg: str, status_str: str = "") -> str:
         "finish_reason=safety", "image_safety", "recitation", "blocklist",
     )):
         return "请求或回复被 Google 安全策略拦截（不可重试），请检查提示词内容"
-    if any(k in low for k in ("只返回了思考过程", "返回了空内容", "返回了空对象", "未返回任何有效内容")):
-        return "模型未输出有效正文（思考耗尽额度或返回空候选，不可重试）"
+    if any(k in low for k in (
+        "只返回了思考过程", "返回了空内容", "返回了空对象", "未返回任何有效内容",
+        "解码格式异常", "malformed_response", "malformed_function_call",
+    )):
+        return "模型未输出有效正文（思考耗尽额度、返回空候选或解码格式异常，不可重试）"
     if any(k in low for k in (
         "remoteprotocolerror", "connecterror", "readerror", "writeerror",
         "proxyerror", "pooltimeout", "server disconnected", "connection reset",
@@ -179,21 +213,6 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
     return code, formatted
 
 
-_RETRYABLE_MALFORMED_REASONS = ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
-
-
-def _is_malformed_finish_reason(finish_reason: Any) -> bool:
-    s = (getattr(finish_reason, "name", None) or str(finish_reason or "")).upper()
-    return any(r in s for r in _RETRYABLE_MALFORMED_REASONS)
-
-
-def _response_has_malformed_finish(response_obj: Any) -> bool:
-    for cand in (getattr(response_obj, "candidates", None) or []):
-        if _is_malformed_finish_reason(getattr(cand, "finish_reason", None)):
-            return True
-    return False
-
-
 def _describe_empty_gemini_response(response_obj: Any, model_to_call: str) -> str:
     """当 Gemini 返回无有效正文的响应时，生成清晰的中文诊断详情。"""
     if response_obj is None:
@@ -214,11 +233,8 @@ def _describe_empty_gemini_response(response_obj: Any, model_to_call: str) -> st
     fr_str = getattr(fr, "name", None) or str(fr or "未知")
     finish_msg = getattr(cand, "finish_message", None) or ""
 
-    if _is_malformed_finish_reason(fr_str):
-        return (
-            f"模型 {model_to_call} 上游解码格式异常（finish_reason={fr_str} {finish_msg}），"
-            "常见于超长上下文或复杂函数参数生成偶发失步。"
-        )
+    if any(r in fr_str.upper() for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")):
+        return f"模型 {model_to_call} 上游解码格式异常（finish_reason={fr_str} {finish_msg}）。"
 
     parts = getattr(getattr(cand, "content", None), "parts", None) or []
     thought_chars = 0
@@ -393,11 +409,15 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                         "description": func_data.get("description"),
                     }
                     parameters = func_data.get("parameters")
-                    if isinstance(parameters, dict) and "$schema" in parameters:
-                        parameters = parameters.copy()
-                        del parameters["$schema"]
+                    if isinstance(parameters, dict):
+                        parameters = _strip_json_schema_meta(parameters)
+                        if not parameters:
+                            parameters = {"type": "object", "properties": {}}
                     if parameters is not None:
-                        declaration["parameters"] = parameters
+                        if _USE_PARAMS_JSON_SCHEMA:
+                            declaration["parameters_json_schema"] = parameters
+                        else:
+                            declaration["parameters"] = parameters
                     declaration = {k: v for k, v in declaration.items() if v is not None}
                     if declaration.get("name"):
                         function_declarations.append(declaration)
@@ -1544,7 +1564,7 @@ async def execute_unified_completion(
                             if not is_gemini_response_valid(raw_gemini_response, synthetic_tool_name=synth_tool_name):
                                 print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                                 err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
-                                if synth_tool_name or _response_has_malformed_finish(raw_gemini_response):
+                                if synth_tool_name:
                                     err_v.is_retryable = True
                                 raise err_v
 
@@ -1705,12 +1725,12 @@ async def execute_unified_completion(
                                             }
                                             yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
-                                    # 真流式全量空回拦截：无论是否开启沙箱，只要模型未产出任何有效正文/思考/工具调用，绝不把纯 prefill 或空串当成功发出！
+                                    # 真流式全量空回拦截：无论是否开启沙箱，只要模型未产出任何有效正文/思考/工具调用，绝不把空壳当成功发出，立即报错（非沙箱模式不盲目重试）！
                                     if not has_yielded_output:
                                         print(f"🔎 [Express 诊断] 模型={model_to_call} 真流式未产出任何有效正文。原始响应样本：\n{sampler.dump()}")
                                         desc_empty = _describe_empty_gemini_response(last_stream_chunk_obj, model_to_call)
                                         err_empty_stream = ValueError(desc_empty)
-                                        if synth_tool_name or _response_has_malformed_finish(last_stream_chunk_obj):
+                                        if synth_tool_name:
                                             err_empty_stream.is_retryable = True
                                         raise err_empty_stream
 
@@ -1949,7 +1969,7 @@ async def execute_unified_completion(
                 if not is_gemini_response_valid(response_obj_call, synthetic_tool_name=synth_tool_name):
                     print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                     err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
-                    if synth_tool_name or _response_has_malformed_finish(response_obj_call):
+                    if synth_tool_name:
                         err_v.is_retryable = True
                     raise err_v
 
