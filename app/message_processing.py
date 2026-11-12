@@ -1425,13 +1425,6 @@ def create_gemini_prompt(
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     messages = sanitize_orphan_tool_turns(messages)
     require_sig = _requires_signature(model_name)
-    # 按 Google 官方文档：仅从最近一条真实 user 消息开始的「当前活跃轮次 (Current Turn)」强校验函数调用思考签名！
-    last_fresh_user_idx = -1
-    for u_i in range(len(messages) - 1, -1, -1):
-        if messages[u_i].role == "user":
-            last_fresh_user_idx = u_i
-            break
-
     raw_gemini_messages = []
     tool_sig_fallback_cnt = [0]
     tool_name_by_id = {}
@@ -1479,7 +1472,6 @@ def create_gemini_prompt(
 
         elif role in ("assistant", "model") and message.tool_calls:
             current_gemini_role = "model"
-            is_in_current_turn = (idx > last_fresh_user_idx)
             tool_parts = []
             for tool_index, tool_call in enumerate(message.tool_calls):
                 function_call_data = tool_call.get("function", {})
@@ -1495,7 +1487,7 @@ def create_gemini_prompt(
                 explicit_sig, _ = signature_from_extra(tool_call)
                 real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
                     tool_call_id_str,
-                    require_signature=(require_sig and is_in_current_turn and tool_index == 0),
+                    require_signature=(require_sig and tool_index == 0),
                     explicit_signature=explicit_sig,
                     explicit_unsigned=tool_index > 0,
                     fallback_counter=tool_sig_fallback_cnt,
