@@ -313,7 +313,7 @@ class AppState:
             if norm.endswith("-search"):
                 norm = norm[:-len("-search")]
             import re as _re
-            norm = _re.sub(r"-think-(minimal|low|medium|high|off|none)$", "", norm)
+            norm = _re.sub(r"-think-(minimal|low|medium|high|xhigh|off|none)$", "", norm)
             ov = overrides.get(norm)
         if isinstance(ov, dict):
             for k in app_config.PER_MODEL_KEYS:
