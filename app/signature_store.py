@@ -22,13 +22,14 @@ from typing import Optional, Union
 
 SKIP_VALIDATOR_SENTINEL = b"skip_thought_signature_validator"
 
-DEFAULT_TTL_SECONDS = 2 * 60 * 60
-DEFAULT_MAX_ENTRIES = 5000
+DEFAULT_TTL_SECONDS = 72 * 60 * 60
+DEFAULT_MAX_ENTRIES = 20000
 
 
 class SignatureState(str, Enum):
     SIGNED = "signed"
     UNSIGNED_FOLLOWER = "unsigned_follower"
+    NO_THOUGHT = "no_thought"
     UNKNOWN = "unknown"
 
 
@@ -70,6 +71,9 @@ class SignatureStore:
 
     def put_unsigned_follower(self, call_id: str) -> None:
         self.put_record(call_id, SignatureRecord(SignatureState.UNSIGNED_FOLLOWER))
+
+    def put_no_thought(self, call_id: str) -> None:
+        self.put_record(call_id, SignatureRecord(SignatureState.NO_THOUGHT))
 
     def put_unknown(self, call_id: str) -> None:
         self.put_record(call_id, SignatureRecord(SignatureState.UNKNOWN))
