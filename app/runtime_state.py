@@ -301,10 +301,20 @@ class AppState:
             return True
 
     def get_effective_settings(self, model_name: str) -> dict:
-        """该模型生效的设置：全局默认叠加该模型专属覆盖（仅 PER_MODEL_KEYS）。"""
+        """该模型生效的设置：全局默认叠加该模型专属覆盖（仅 PER_MODEL_KEYS，自动对齐 -search / -think- 后缀）。"""
         base = self.get_settings()
         overrides = base.get("model_overrides") or {}
-        ov = overrides.get((model_name or "").strip())
+        raw_key = (model_name or "").strip()
+        ov = overrides.get(raw_key)
+        if not isinstance(ov, dict) and raw_key:
+            norm = raw_key.lower()
+            if "/" in norm:
+                norm = norm.rsplit("/", 1)[-1]
+            if norm.endswith("-search"):
+                norm = norm[:-len("-search")]
+            import re as _re
+            norm = _re.sub(r"-think-(minimal|low|medium|high|off|none)$", "", norm)
+            ov = overrides.get(norm)
         if isinstance(ov, dict):
             for k in app_config.PER_MODEL_KEYS:
                 if k in ov:
