@@ -692,10 +692,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 <div class="lbl mb-1.5">思考档位 <span class="code-tag">thinking_level</span></div>
                 <select id="thinking_g3_level" class="inp">
                   <option value="">自动（按模型默认档位）</option>
-                  <option value="minimal">minimal（最低思考）</option>
+                  <option value="minimal">minimal（最低思考 · 3.6及更早）</option>
                   <option value="low">low（轻量思考）</option>
                   <option value="medium">medium（均衡思考）</option>
                   <option value="high">high（深度思考）</option>
+                  <option value="xhigh">xhigh（超高思考 · Gemini 4）</option>
                 </select>
               </div>
               <div>
