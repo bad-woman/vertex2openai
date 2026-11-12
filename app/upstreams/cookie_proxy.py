@@ -16,8 +16,7 @@ import base64
 import hashlib
 import asyncio
 import httpx
-import traceback
-from typing import Any, Optional, List, Dict, AsyncGenerator
+from typing import Any, Optional, Dict, AsyncGenerator
 from fastapi import Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -44,9 +43,8 @@ from message_processing import (
     _requires_signature,
 )
 from logger import stats
-from api_helpers import get_retry_settings
 from signature_store import SignatureRecord, SignatureState, signature_store, image_signature_store, SKIP_VALIDATOR_SENTINEL
-from schema_validation import SchemaValidationError, validate_request_schemas
+from schema_validation import validate_request_schemas
 from synthetic_wrapper import (
     SyntheticSandboxSpec,
     build_emit_tool_declaration,
@@ -346,9 +344,13 @@ def _build_request_context(project_id: str) -> dict:
 def _build_thinking_config(model_name: str, request: OpenAIRequest,
                            prefill_active: bool = False) -> Optional[dict]:
     settings = app_state.get_effective_settings(model_name)
-    t = mc.resolve_thinking(model_name, request, settings, prefill_active=prefill_active)
+    probe_name = getattr(request, "model", None) or model_name
+    t = mc.resolve_thinking(probe_name, request, settings, prefill_active=prefill_active)
     if t.get("mode") == "level":
-        return {"thinkingLevel": t["level"].upper(), "includeThoughts": t.get("include_thoughts", True)}
+        cfg: dict = {"includeThoughts": t.get("include_thoughts", True)}
+        if t.get("level"):
+            cfg["thinkingLevel"] = t["level"].upper()
+        return cfg
     return None
 
 
@@ -382,11 +384,6 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
 
     return {"declared": declared, "history": history,
             "builtin_search": builtin_search, "custom_names": custom_names}
-
-
-def has_tool_traffic(messages: list, tools: Any = None) -> bool:
-    tt = classify_tool_traffic(messages, tools)
-    return bool(tt["declared"] or tt["history"])
 
 
 _SCHEMA_TYPES = {
@@ -621,7 +618,6 @@ def _convert_messages_to_contents(
     messages: list,
     model_name: str = "",
     native_tools: bool = True,
-    sandbox_spec: Optional[SyntheticSandboxSpec] = None,
 ) -> tuple:
     contents = []
     system_parts = []
@@ -827,7 +823,7 @@ def _build_batch_graphql_body(
     sandbox_spec: Optional[SyntheticSandboxSpec] = None,
 ) -> dict:
     contents, system_text = _convert_messages_to_contents(
-        request.messages, model_name=model_name, native_tools=native_tools, sandbox_spec=sandbox_spec
+        request.messages, model_name=model_name, native_tools=native_tools
     )
     model_path = f"projects/{project_id}/locations/global/publishers/google/models/{model_name}"
 
@@ -936,8 +932,6 @@ def _build_batch_graphql_body(
         base_decls = [] if sandbox_spec.strip_client_tools else list(declarations)
         s_decl = build_emit_tool_declaration(
             sandbox_spec.emit_tool_name,
-            prefill_text=sandbox_spec.prefill_text,
-            has_prefill=sandbox_spec.has_prefill,
             for_cookie=True,
         )
         base_decls.append({
@@ -1229,20 +1223,6 @@ def _make_openai_chunk(
 
 def _sse_heartbeat() -> str:
     return ": keep-alive\n\n"
-
-
-async def _sleep_with_heartbeat(total_sec: float, hb_interval: float = 3.0):
-    """边等待边吐心跳的异步生成器：以 0.5s 细粒度步进（便于快速响应客户端取消），每 hb_interval 秒 yield 一次心跳。"""
-    waited = 0.0
-    hb_acc = 0.0
-    while waited < total_sec:
-        step = min(0.5, total_sec - waited)
-        await asyncio.sleep(step)
-        waited += step
-        hb_acc += step
-        if hb_acc >= max(0.5, hb_interval):
-            hb_acc = 0.0
-            yield _sse_heartbeat()
 
 
 def _make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
@@ -1575,8 +1555,18 @@ class CookieProxyUpstream(BaseUpstream):
         _forced_search = bool(_choice_name and _is_builtin_search_name(_choice_name))
         native_custom_tools = bool(_tool_info["custom_names"] or _tool_info["history"])
 
-        model_display = request_obj.model
-        base_model_name = model_display[:-len("-search")] if model_display.endswith("-search") else model_display
+        model_display = (request_obj.model or "").strip()
+        base_model_name = model_display
+        while True:
+            _low_m = base_model_name.lower()
+            if _low_m.endswith("-search"):
+                base_model_name = base_model_name[:-len("-search")]
+                continue
+            _m_th = re.search(r"-think-(?:minimal|low|medium|high|off|none)$", _low_m)
+            if _m_th:
+                base_model_name = base_model_name[:_m_th.start()]
+                continue
+            break
 
         _profile = mc.get_profile(base_model_name)
         prefill_text = ""
@@ -1770,7 +1760,6 @@ class CookieProxyUpstream(BaseUpstream):
                         gen_config_dict=outbound_cfg,
                         messages=request_obj.messages,
                         prefill_text=prefill_text,
-                        sandbox_spec=sandbox_spec,
                     )
 
                 async with httpx.AsyncClient(**client_kwargs) as client:
@@ -2045,7 +2034,6 @@ class CookieProxyUpstream(BaseUpstream):
                     gen_config_dict=outbound_cfg,
                     messages=request_obj.messages,
                     prefill_text=prefill_text,
-                    sandbox_spec=sandbox_spec,
                 )
 
             async with httpx.AsyncClient(**client_kwargs) as client:
