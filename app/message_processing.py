@@ -209,6 +209,8 @@ def build_tool_call_id(fc: Any, part: Any,
         signature_store.put_record(real_id, SignatureRecord(SignatureState.SIGNED, sig))
     elif missing_state is SignatureState.UNSIGNED_FOLLOWER:
         signature_store.put_unsigned_follower(real_id)
+    elif missing_state is SignatureState.NO_THOUGHT:
+        signature_store.put_no_thought(real_id)
     else:
         signature_store.put_unknown(real_id)
     return real_id
@@ -217,7 +219,8 @@ def build_tool_call_id(fc: Any, part: Any,
 def resolve_tool_call_signature(tool_call_id: str,
                                 require_signature: bool = False,
                                 explicit_signature: Optional[bytes] = None,
-                                explicit_unsigned: bool = False) -> Tuple[str, Optional[bytes]]:
+                                explicit_unsigned: bool = False,
+                                fallback_counter: Optional[List[int]] = None) -> Tuple[str, Optional[bytes]]:
     """Restore (real id, signature) with explicit OpenAI metadata first."""
     real_id = tool_call_id or ""
     sig: Optional[bytes] = explicit_signature
@@ -235,11 +238,15 @@ def resolve_tool_call_signature(tool_call_id: str,
         sig = record.signature
     is_unsigned_follower = explicit_unsigned or bool(
         record and record.state is SignatureState.UNSIGNED_FOLLOWER)
+    is_native_no_thought = bool(record and record.state is SignatureState.NO_THOUGHT)
 
     if sig is None and require_signature and not is_unsigned_follower:
         sig = SKIP_VALIDATOR_SENTINEL
-        print("⚠️ [工具调用] 必需的思考签名无法恢复，已使用官方跳过校验哨兵。"
-              "请求不会失败，但模型表现可能下降。")
+        if not is_native_no_thought:
+            if fallback_counter is not None:
+                fallback_counter[0] += 1
+            else:
+                print("⚠️ [工具调用] 历史工具调用未携带思考签名，已自动补全官方跳过校验哨兵。")
 
     return real_id, sig
 
@@ -980,17 +987,24 @@ class FunctionCallStreamAssembler:
         self._pending_is_synthetic: bool = False
         self._last_synth_path: str = ""
         self._synth_signature: Optional[bytes] = None
-        self._captured_synth_sig: Optional[bytes] = None
+        self._turn_signature: Optional[bytes] = None
         self._real_calls_emitted: int = 0
         self._synth_tail_buf: str = ""
         self._lex_state: LexicalState = LexicalState()
         self._lex_seeded: bool = not bool(self.prefill_text)
 
+    def note_turn_signature(self, sig: Optional[bytes]) -> None:
+        """记录本轮候选在普通文本/思考 Part 或收尾块上收到的真实思考签名，供同轮无独立签名的首个工具调用自动继承。"""
+        if sig:
+            self._turn_signature = sig
+
     def _attach_fallback_synth_sig(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """当同轮合成工具占用了唯一的真思考签名，而首个真实工具无签名时，自动将真签名继承给首个真实工具。"""
+        """当同轮前面 Part 或合成工具携带了真实思考签名，而首个真实工具自身无签名时，自动将真签名继承给首个真实工具。"""
         for item in calls:
-            if self._real_calls_emitted == 0 and not item.get("thought_signature") and self._captured_synth_sig:
-                item["thought_signature"] = self._captured_synth_sig
+            if item.get("thought_signature"):
+                self._turn_signature = item["thought_signature"]
+            elif self._real_calls_emitted == 0 and self._turn_signature:
+                item["thought_signature"] = self._turn_signature
             self._real_calls_emitted += 1
         return calls
 
@@ -1067,7 +1081,7 @@ class FunctionCallStreamAssembler:
             self._pending_is_synthetic = bool(fc_will_continue)
             if thought_signature:
                 self._synth_signature = thought_signature
-                self._captured_synth_sig = thought_signature
+                self._turn_signature = thought_signature
             if ready_real:
                 self._attach_fallback_synth_sig(ready_real)
 
@@ -1183,6 +1197,9 @@ class FunctionCallStreamAssembler:
             fc_args = getattr(fc, "args", None)
             fc_partial = getattr(fc, "partial_args", None)
             fc_will_continue = bool(getattr(fc, "will_continue", False))
+
+        if thought_signature:
+            self._turn_signature = thought_signature
 
         has_args = isinstance(fc_args, dict) and len(fc_args) > 0
         has_partial = isinstance(fc_partial, list) and len(fc_partial) > 0
@@ -1408,7 +1425,15 @@ def create_gemini_prompt(
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
     messages = sanitize_orphan_tool_turns(messages)
     require_sig = _requires_signature(model_name)
+    # 按 Google 官方文档：仅从最近一条真实 user 消息开始的「当前活跃轮次 (Current Turn)」强校验函数调用思考签名！
+    last_fresh_user_idx = -1
+    for u_i in range(len(messages) - 1, -1, -1):
+        if messages[u_i].role == "user":
+            last_fresh_user_idx = u_i
+            break
+
     raw_gemini_messages = []
+    tool_sig_fallback_cnt = [0]
     tool_name_by_id = {}
     for prior in messages:
         for tool_call in (getattr(prior, "tool_calls", None) or []):
@@ -1454,6 +1479,7 @@ def create_gemini_prompt(
 
         elif role in ("assistant", "model") and message.tool_calls:
             current_gemini_role = "model"
+            is_in_current_turn = (idx > last_fresh_user_idx)
             tool_parts = []
             for tool_index, tool_call in enumerate(message.tool_calls):
                 function_call_data = tool_call.get("function", {})
@@ -1469,9 +1495,10 @@ def create_gemini_prompt(
                 explicit_sig, _ = signature_from_extra(tool_call)
                 real_tool_id, thought_sig_bytes = resolve_tool_call_signature(
                     tool_call_id_str,
-                    require_signature=require_sig and tool_index == 0,
+                    require_signature=(require_sig and is_in_current_turn and tool_index == 0),
                     explicit_signature=explicit_sig,
                     explicit_unsigned=tool_index > 0,
+                    fallback_counter=tool_sig_fallback_cnt,
                 )
 
                 fc_kwargs = {"name": function_name, "args": parsed_arguments}
@@ -1724,6 +1751,9 @@ def create_gemini_prompt(
 
     if not merged_messages:
         merged_messages.append(types.Content(role="user", parts=[types.Part.from_text(text="继续")]))
+
+    if tool_sig_fallback_cnt[0] > 0:
+        print(f"ℹ️ [工具历史] 已为历史记录中 {tool_sig_fallback_cnt[0]} 处旧工具调用自动补全官方免校验哨兵（请求不受影响）。")
 
     return merged_messages
 
@@ -2083,7 +2113,10 @@ def process_gemini_response_to_openai_dict(
             order_descriptors = []
             message_signature = None
             message_signature_kind = None
-            orphan_synth_sig: Optional[bytes] = None
+            turn_any_sig: Optional[bytes] = next(
+                (_signature_bytes(p_s, getattr(p_s, "function_call", None)) for p_s in parts_in_order if _signature_bytes(p_s, getattr(p_s, "function_call", None))),
+                None,
+            )
             for part in parts_in_order:
                 fc = getattr(part, "function_call", None)
                 sig = _signature_bytes(part, fc)
@@ -2100,14 +2133,16 @@ def process_gemini_response_to_openai_dict(
                         if sig:
                             message_signature = sig
                             message_signature_kind = "text"
-                            orphan_synth_sig = sig
                         continue
-                    # 若合成工具排在前面占用了真实签名，而首个真实工具无签名，直接继承真实签名供无扩展客户端回放
-                    if sig is None and tool_index == 0 and orphan_synth_sig is not None:
-                        sig = orphan_synth_sig
+                    # 若本轮前面的思考/文本/合成工具携带了真实签名，而首个真实工具无签名，直接继承真实签名
+                    if sig is None and tool_index == 0 and turn_any_sig is not None:
+                        sig = turn_any_sig
                         part = part.model_copy(update={"thought_signature": sig})
-                    missing_state = (SignatureState.UNSIGNED_FOLLOWER if tool_index > 0
-                                     else SignatureState.UNKNOWN)
+                    missing_state = (
+                        SignatureState.UNSIGNED_FOLLOWER
+                        if tool_index > 0
+                        else SignatureState.NO_THOUGHT
+                    )
                     tool_call_id = build_tool_call_id(fc, part, missing_state=missing_state)
                     tool_payload = {
                         "id": tool_call_id,
