@@ -29,7 +29,7 @@ _IMAGE_ARS = {
     "1:8", "8:1", "9:16", "16:9", "21:9", "9:21",
 }
 
-_LEVEL_ORDER = ["minimal", "low", "medium", "high"]
+_LEVEL_ORDER = ["minimal", "low", "medium", "high", "xhigh"]
 
 # 3.6 及更早的非 Pro 机型支持 MINIMAL；3.7 及更新机型（含 4.x 全系）最低统一发送 LOW
 _MINIMAL_MAX_VERSION = (3, 6)
@@ -73,7 +73,7 @@ def _strip_known_suffixes(name: str) -> str:
     for suf in ("-search", "-1k", "-2k", "-4k", "-512"):
         if n.endswith(suf):
             n = n[: -len(suf)]
-    n = re.sub(r"-think-(minimal|low|medium|high|off|none)$", "", n)
+    n = re.sub(r"-think-(minimal|low|medium|high|xhigh|off|none)$", "", n)
     return n
 
 
@@ -137,6 +137,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     family = f"g{major}"
 
     levels = {"low", "medium", "high"}
+    if major >= 4:
+        levels = levels | {"xhigh"}
     if _supports_minimal(major, minor, is_pro):
         levels = levels | {"minimal"}
 
@@ -163,7 +165,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
 _EFFORT_ALIASES = {
     "min": "minimal", "minimal": "minimal",
     "low": "low", "medium": "medium", "med": "medium",
-    "high": "high", "max": "high", "xhigh": "high", "x-high": "high", "very_high": "high",
+    "high": "high",
+    "xhigh": "xhigh", "x-high": "xhigh", "very_high": "xhigh", "max": "xhigh",
     "none": "off", "off": "off",
 }
 
@@ -185,7 +188,7 @@ def _effort(request: Any) -> Optional[str]:
 
 
 def _inline_model_think_suffix(model_name: str) -> Optional[str]:
-    m = re.search(r"-think-(minimal|low|medium|high|off|none)$", (model_name or "").strip().lower())
+    m = re.search(r"-think-(minimal|low|medium|high|xhigh|off|none)$", (model_name or "").strip().lower())
     return _norm_effort(m.group(1)) if m else None
 
 
