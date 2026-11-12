@@ -2,7 +2,11 @@
 
 ### 0. 新增 `gemini-4-hydrogen`、`XHIGH` 第四思考档位与 64K 全模式输出适配
 - `vertexModels.json` 新增 `gemini-4-hydrogen`（自动支持 `-search` 后缀），`requirements.txt` 升级至官方要求的 `google-genai>=2.30.0` 并移除冗余依赖 `curl_cffi`。
-- **支持 Gemini 4 官方 `XHIGH` 档位与 64K 非流式/假流式上限**：`gemini-4-*` 全系开放 `low / medium / high / xhigh` 四档（控制台新增 `xhigh` 选项并支持 `-think-xhigh` 后缀，Gemini 3.x 自动向下兼容夹到 `high`）；`3.7+` 与 `4.x` 开启关闭/压制原生思考时统一发送最低合法档 `low`；放宽 Gemini 4 非流式与假流式 `32K` 旧上限至官方 `64K`（`65536`）。
+- **完整支持 Gemini 4 官方 `XHIGH` 档位（含工具调用场景）与 64K 全模式输出上限**：`gemini-4-*` 全系开放 `low / medium / high / xhigh` 四档（Express 与 Cookie 均统一按官方大写枚举 `"XHIGH"` 下发），并彻底修复原代码导致 `XHIGH` + 工具调用触发 `MALFORMED_RESPONSE` 的三处协议缺陷：
+  1. **修复历史工具消息 Part 顺序颠倒**：原代码在客户端剥离 `extra_content` 时把 `tool_parts`（`function_call`）排在了 `ordinary_parts`（`text`）之前，导致历史每一轮模型回复变成非法的 `[function_call, text]` 倒装结构，诱发 `XHIGH` 深思考模仿该倒装结构而被上游判为 `MALFORMED_RESPONSE`；现已严格修正为 `[ordinary_parts, tool_parts]` 因果顺序；
+  2. **客户端工具无损切换至 `parameters_json_schema`**：Express 通道不再将客户端 JSON Schema（如 Zod 的 `const` / `additionalProperties` / `anyOf`）塞入旧版 OpenAPI `parameters` 导致约束被静默丢弃，改用官方 `parameters_json_schema` 无损透传；
+  3. **禁止向 `FunctionCall` / `FunctionResponse` 注入伪造的 `call_xxx` ID**，保持历史 `FunctionCall` Part 与模型原始输出严格一致。
+- **修复 Express 真流式静默吞掉空回的 Bug（立即报错、不盲目重试）**：当未开启沙箱时上游返回 `MALFORMED_RESPONSE` 或空候选无正文，网关不再将其误判为正常完成并吐出空回复，而是立即返回明确报错（不执行无意义的重复重试）。
 - **根治工具思考签名错位漏接与长楼层刷屏（保留全历史哨兵保护防 `MALFORMED_RESPONSE`）**：
   - 实测确认 Gemini 4 在历史旧楼层存在大量无签名 `functionCall` 时会因内部状态机失步必现 `finish_reason=MALFORMED_RESPONSE`（仅吐 14 tokens 即中断）：现已完整恢复对全历史无签名工具调用（每步首个调用）自动补全 `skip_thought_signature_validator` 免校验哨兵的保护；
   - 修复同轮先输出思考/正文再发起工具调用时未将本轮签名绑定给工具、以及收尾块漏接签名的 Bug；新增 `NO_THOUGHT` 状态并将 `SignatureStore` 缓存扩容至 72 小时 / 20000 条，同时将多楼层哨兵提示合并为单行日志汇总，既保证 100% 正常生成又不刷屏。

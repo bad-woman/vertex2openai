@@ -72,7 +72,7 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
             sdk_supports_level = False
 
         if sdk_supports_level:
-            thinking_config["thinking_level"] = t["level"]
+            thinking_config["thinking_level"] = str(t["level"]).upper()
         else:
             print(f"⚠️ [推理配置] 当前 google-genai 版本 {genai_version_str} 不支持 thinking_level，已自动跳过该参数。")
 
@@ -202,8 +202,10 @@ class ExpressSDKUpstream(BaseUpstream):
                 print("🧠 [预填充兼容] 已按模型压制原生思考（可在控制台关闭），让预设思维链接管。")
 
         gen_config_dict = create_generation_config(request_obj)
-        thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
-                                                 prefill_active=prefill_active)
+        thinking_config = _build_thinking_config(
+            base_model_name, request_obj, is_image_model,
+            prefill_active=prefill_active,
+        )
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 
