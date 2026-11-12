@@ -624,11 +624,6 @@ def _convert_messages_to_contents(
     if native_tools:
         messages = sanitize_orphan_tool_turns(messages or [])
     require_sig = _requires_signature(model_name)
-    last_fresh_user_idx = -1
-    for u_i in range(len(messages) - 1, -1, -1):
-        if messages[u_i].role == "user":
-            last_fresh_user_idx = u_i
-            break
     tool_sig_fallback_cnt = [0]
     call_names = {}
     for message in messages or []:
@@ -638,7 +633,7 @@ def _convert_messages_to_contents(
             if tc_id and fn_name:
                 call_names[tc_id] = fn_name
 
-    for msg_idx, msg in enumerate(messages):
+    for msg in messages:
         role = msg.role
         content = msg.content
         if role == "system":
@@ -676,14 +671,13 @@ def _convert_messages_to_contents(
                 contents.append({"role": "model", "parts": [{"text": "\n".join(lines)}]})
                 continue
 
-            is_in_current_turn = (msg_idx > last_fresh_user_idx)
             call_parts = []
             for tool_index, tc in enumerate(tool_calls):
                 fn = (tc or {}).get("function") or {}
                 explicit_sig, _ = signature_from_extra(tc)
                 _, signature = resolve_tool_call_signature(
                     str((tc or {}).get("id") or ""),
-                    require_signature=(require_sig and is_in_current_turn and tool_index == 0),
+                    require_signature=(require_sig and tool_index == 0),
                     explicit_signature=explicit_sig,
                     explicit_unsigned=tool_index > 0,
                     fallback_counter=tool_sig_fallback_cnt,
@@ -1490,9 +1484,13 @@ async def _collect_full_response_once(
             if blocked_msg:
                 detail += f"；promptFeedback 拦截：{blocked_msg}"
             print(f"🔎 [Studio 诊断] 模型={base_model_name} 假流式无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
-            is_synth_retry = bool(synth_tool_name and not blocked_msg)
+            is_malformed = any(
+                r in str(finish_raw or "").upper()
+                for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+            )
+            is_synth_retry = bool((synth_tool_name or is_malformed) and not blocked_msg)
             return {
-                "kind": "retryable_error" if is_synth_retry else "empty_or_blocked",
+                "kind": "retryable_error" if is_synth_retry else "fatal_error",
                 "status_code": 400 if blocked_msg else 502,
                 "message": f"上游未返回图片或正文（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。已在运行日志记录原始响应样本。",
             }
@@ -1987,7 +1985,11 @@ class CookieProxyUpstream(BaseUpstream):
                         hint = (_THINKING_RUNAWAY_HINT if (got_thought and not strip_thoughts) else _NO_BODY_HINT)
                         print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
                         print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                        is_synth_retry = bool(synth_tool_name and not blocked_msg)
+                        is_malformed = any(
+                            r in str(finish_raw or "").upper()
+                            for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+                        )
+                        is_synth_retry = bool((synth_tool_name or is_malformed) and not blocked_msg)
                         raise CookieAttemptError(
                             400 if blocked_msg else 502,
                             f"上游{desc}（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。{hint}",
@@ -2229,7 +2231,11 @@ class CookieProxyUpstream(BaseUpstream):
                 hint = (_THINKING_RUNAWAY_HINT if (reasoning_text and not strip_thoughts) else _NO_BODY_HINT)
                 print(f"❌ [Studio 空正文报错] 模型={base_model_name} (项目={project_id}) | 上游{desc}（{detail}）| 建议：{hint}")
                 print(f"🔎 [Studio 诊断] 原始响应样本：\n{sampler.dump()}")
-                is_synth_retry = bool(synth_tool_name and not blocked_msg)
+                is_malformed = any(
+                    r in str(finish_raw or "").upper()
+                    for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+                )
+                is_synth_retry = bool((synth_tool_name or is_malformed) and not blocked_msg)
                 raise CookieAttemptError(
                     400 if blocked_msg else 502,
                     f"上游{desc}（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。{hint}",
