@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 
-from auth import get_api_key
 from express_key_manager import ExpressKeyManager
 from routes import models_api, chat_api
 
@@ -1266,10 +1265,6 @@ function syncKeysFromDom(){
     KEYS[i].enabled = row.querySelector('.k-enabled').checked;
   });
 }
-function collectKeys(){
-  syncKeysFromDom();
-  return KEYS.filter(function(r){return r.key;});
-}
 async function autoSaveExpressKeys(customMsg){
   syncKeysFromDom();
   var emptyRows = KEYS.filter(function(r){return !r.key;});
@@ -1503,7 +1498,7 @@ function renderCaps(){
     $('caps-summary').innerHTML = chip('🌐 作用域：全局默认', true) + chip('切换具体模型可查看其能力白名单');
     ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
-    $('think-note').textContent='全局默认：实际调用时会按目标模型支持的合法档位自动就近匹配（例如 Pro 模型无 minimal 时自动使用 low）。';
+    $('think-note').textContent='全局默认：选「自动」时采用模型官方原生默认档位；压制思考或选 minimal 时，3.7+ 及 4.x 全系模型最低自动发送 low。';
     $('image-note').textContent='全局默认：分辨率与宽高比仅在调用生图模型（-image / nano-banana）时生效。';
     $('sampling-note').textContent='全局默认：遇到已废弃采样参数的模型（如 Gemini 3.6+ / 4.x）会自动剥离以防报错。';
     return;
@@ -1529,7 +1524,7 @@ function renderCaps(){
   $('thinking_g3_level').disabled=!isLevel;
   $('wrap-g3level').style.opacity=isLevel?'1':'.4';
   var tn='';
-  if(cap.is_image) tn='生图模型思考档位：默认 high，支持在上方切换合法档位。';
+  if(cap.is_image) tn='生图模型思考档位：选「自动」即采用官方原生默认，亦可在上方手动指定档位。';
   else if(isLevel) tn='支持思考档位：' + (th.levels||[]).join(' / ') + ((th.levels && !th.levels.includes('minimal')) ? '（该模型最低合法档为 low，不支持 minimal）' : '（最低合法档为 minimal）') + '。';
   else tn='该模型不支持思考档位调节。';
   $('think-note').textContent=tn;
