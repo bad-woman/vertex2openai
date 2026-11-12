@@ -2,7 +2,7 @@
 模型能力矩阵（按家族识别 · Gemini 3.x / 4.x 及生图家族）
 
 用于决定：
-- 每个模型支持的思考档位（thinking_level）与合法档位白名单
+- 每个模型支持的思考档位（thinking_level）与合法档位白名单（3.7 及更新版本最低统一发送 low）
 - 可用的采样参数集合（避免把已废弃的参数发给模型导致 400）
 - 生图模型支持的宽高比与分辨率白名单
 - 是否要求最后一条消息为 user（Gemini 3.x / 4.x 强制，否则 400 → 触发预填充兼容）
@@ -31,7 +31,7 @@ _IMAGE_ARS = {
 
 _LEVEL_ORDER = ["minimal", "low", "medium", "high"]
 
-# 3.6 及更早的非 Pro 机型实测支持 MINIMAL；3.7 及更新机型最低为 LOW
+# 3.6 及更早的非 Pro 机型支持 MINIMAL；3.7 及更新机型（含 4.x 全系）最低统一发送 LOW
 _MINIMAL_MAX_VERSION = (3, 6)
 
 
@@ -67,7 +67,9 @@ def sort_levels(levels) -> list:
 
 
 def _strip_known_suffixes(name: str) -> str:
-    n = name.lower()
+    n = (name or "").strip().lower()
+    if "/" in n:
+        n = n.rsplit("/", 1)[-1]
     for suf in ("-search", "-1k", "-2k", "-4k", "-512"):
         if n.endswith(suf):
             n = n[: -len(suf)]
@@ -119,7 +121,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "is_image": True,
             "thinking_kind": "level",
             "thinking_levels": thinking_levels,
-            "default_level": "high",
+            "default_level": None,
             "allowed_sampling": set(),
             "image_aspect_ratios": _IMAGE_ARS,
             "image_sizes": sizes,
@@ -129,20 +131,14 @@ def get_profile(model_name: str) -> Dict[str, Any]:
 
     # ---- 文本 / 多模态（Gemini 3.x / 4.x）----
     m = re.search(r"gemini-(\d+)(?:\.(\d+))?", name)
-    major = int(m.group(1)) if m else 3
+    major = int(m.group(1)) if m else 4
     minor = int(m.group(2)) if (m and m.group(2)) else 0
-    is_pro = "pro" in name
+    is_pro = bool(re.search(r"(?:^|-)pro(?:$|-)", name))
     family = f"g{major}"
 
     levels = {"low", "medium", "high"}
     if _supports_minimal(major, minor, is_pro):
         levels = levels | {"minimal"}
-    if "flash-lite" in name and "minimal" in levels:
-        default_level = "minimal"
-    elif is_pro:
-        default_level = "high"
-    else:
-        default_level = "medium"
 
     allowed = set(SAMPLING_KEYS)
     allowed.discard("candidate_count")
@@ -155,7 +151,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         "is_image": False,
         "thinking_kind": "level",
         "thinking_levels": levels,
-        "default_level": default_level,
+        # default_level=None：选「自动」档位时不强塞猜测档位，直接交由 Google 上游采用官方原生默认思考强度
+        "default_level": None,
         "allowed_sampling": allowed,
         "sampling_advice": "deprecated" if temp_dep else "recommend_default",
         "supports_search": True,
@@ -187,6 +184,11 @@ def _effort(request: Any) -> Optional[str]:
     return _norm_effort(e)
 
 
+def _inline_model_think_suffix(model_name: str) -> Optional[str]:
+    m = re.search(r"-think-(minimal|low|medium|high|off|none)$", (model_name or "").strip().lower())
+    return _norm_effort(m.group(1)) if m else None
+
+
 def _extra(request: Any, key: str) -> Any:
     v = getattr(request, key, None)
     if v is None and getattr(request, "model_extra", None):
@@ -196,7 +198,11 @@ def _extra(request: Any, key: str) -> Any:
 
 def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
                      prefill_active: bool = False) -> Dict[str, Any]:
-    """计算思考配置：request（跟随请求）| off（关闭原生思考）| console（强制控制台档位）。"""
+    """计算思考配置：
+    - 压制思考 / 关闭原生思考：自动压到该模型支持的最低合法档位（<=3.6 非 Pro 为 minimal，3.7+ 及 4.x 全系为 low）；
+    - 客户端或控制台显式指定了档位（或带 -think-xxx 后缀）：夹到合法档位集合后下发；
+    - 自动模式（未压制且未显式指定档位）：不传 thinking_level，直接采用 Google 上游官方原生默认思考强度。
+    """
     prof = get_profile(model_name)
     if prof["thinking_kind"] is None:
         return {"mode": None}
@@ -206,10 +212,15 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
     if mode not in ("request", "off", "console"):
         mode = "request"
 
-    suppress = bool(mode == "off" or (prefill_active and settings.get("prefill_suppress_thinking", True)))
+    inline_lv = _inline_model_think_suffix(model_name)
+    suppress = bool(
+        mode == "off"
+        or inline_lv == "off"
+        or (prefill_active and settings.get("prefill_suppress_thinking", True) and mode != "console")
+    )
     ignore_client = bool(suppress or mode == "console")
 
-    req_effort = None if ignore_client else _effort(request)
+    req_effort = None if ignore_client else (_effort(request) or inline_lv)
     include_thoughts = not suppress
 
     levels = prof["thinking_levels"]
@@ -219,12 +230,14 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
             "level": _clamp_level("minimal", levels),
             "include_thoughts": False,
         }
-    level = req_effort or settings.get("thinking_g3_level") or prof.get("default_level", "high")
-    level = str(level).lower()
-    if level in ("off", "none"):
-        level = "minimal"
-    level = _clamp_level(level, levels)
-    return {"mode": "level", "level": level, "include_thoughts": include_thoughts}
+
+    explicit_level = req_effort or (settings.get("thinking_g3_level") or "").strip().lower() or None
+    if explicit_level:
+        if explicit_level in ("off", "none"):
+            explicit_level = "minimal"
+        return {"mode": "level", "level": _clamp_level(explicit_level, levels), "include_thoughts": include_thoughts}
+
+    return {"mode": "level", "level": None, "include_thoughts": include_thoughts}
 
 
 def apply_sampling_policy(profile: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -336,7 +349,6 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
     thinking: Dict[str, Any] = {"kind": prof["thinking_kind"]}
     if prof["thinking_kind"] == "level":
         thinking["levels"] = sort_levels(prof["thinking_levels"])
-        thinking["can_off"] = False
     return {
         "family": prof["family"],
         "is_image": prof["is_image"],
