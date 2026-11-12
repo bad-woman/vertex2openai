@@ -3,9 +3,7 @@ import re
 import json
 import time
 import uuid
-import random
 import httpx
-import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import config as app_config
 import model_capabilities as mc
@@ -19,7 +17,6 @@ from signature_store import (
 )
 from synthetic_wrapper import (
     LexicalState,
-    SyntheticSandboxSpec,
     analyze_synthetic_tail,
     build_sandbox_control_instruction,
     extract_raw_synthetic_text,
@@ -27,11 +24,10 @@ from synthetic_wrapper import (
     is_content_json_path,
     make_bad_woman_response_id,
     prefill_appears_repeated,
-    sanitize_synthetic_tail,
 )
 
 from google.genai import types
-from models import OpenAIMessage, ContentPartText, ContentPartImage, normalize_content_part
+from models import OpenAIMessage, normalize_content_part
 
 import io
 try:
@@ -1407,7 +1403,6 @@ def sanitize_orphan_tool_turns(messages: List[OpenAIMessage]) -> List[OpenAIMess
 def create_gemini_prompt(
     messages: List[OpenAIMessage],
     model_name: str = "",
-    sandbox_spec: Optional[SyntheticSandboxSpec] = None,
 ) -> List[types.Content]:
     """OpenAI 消息 → Gemini contents。"""
     print("🔄 [消息转换] 正在将 OpenAI 格式消息转换为 Gemini contents。")
