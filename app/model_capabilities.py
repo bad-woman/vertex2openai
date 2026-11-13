@@ -137,7 +137,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     family = f"g{major}"
 
     levels = {"low", "medium", "high"}
-    if major >= 4:
+    # 仅 gemini-4-hydrogen 支持 xhigh；4-argon / 4-carbon 等不支持，需保持在 high 内以便自动降级
+    if major >= 4 and "hydrogen" in name:
         levels = levels | {"xhigh"}
     if _supports_minimal(major, minor, is_pro):
         levels = levels | {"minimal"}
@@ -182,8 +183,13 @@ def _norm_effort(e: Optional[str]) -> Optional[str]:
 
 def _effort(request: Any) -> Optional[str]:
     e = getattr(request, "reasoning_effort", None)
-    if not e and getattr(request, "model_extra", None):
-        e = request.model_extra.get("reasoning_effort")
+    extra = getattr(request, "model_extra", None) or {}
+    if not e:
+        e = extra.get("reasoning_effort")
+    if not e:
+        reasoning = getattr(request, "reasoning", None) or extra.get("reasoning")
+        if isinstance(reasoning, dict):
+            e = reasoning.get("effort")
     return _norm_effort(e)
 
 
