@@ -476,9 +476,14 @@ def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[
             mode, allowed = "AUTO", None
     elif isinstance(tool_choice, dict):
         name = _normalized_tool_name(tool_choice)
-        mode = "ANY"
-        allowed = None if (name and _is_builtin_search_name(name)) else (
-            [name] if name else (function_names or None))
+        if name and _is_builtin_search_name(name):
+            mode, allowed = "ANY", None
+        elif name and name in function_names:
+            mode, allowed = "ANY", [name]
+        elif name:
+            mode, allowed = "AUTO", None
+        else:
+            mode, allowed = "ANY", (function_names or None)
     else:
         mode, allowed = "AUTO", None
 
@@ -954,6 +959,11 @@ def _build_batch_graphql_body(
     elif selected_declarations:
         variables["tools"] = [{"functionDeclarations": selected_declarations}]
         function_names = [item["name"] for item in selected_declarations]
+        variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names)
+    elif tools_disabled and declarations:
+        # 即使 tool_choice=none，历史若含工具轮次仍需保留声明并配合 mode=NONE 禁用本轮调用
+        variables["tools"] = [{"functionDeclarations": declarations}]
+        function_names = [item["name"] for item in declarations]
         variables["toolConfig"] = _build_tool_config(request.tool_choice, function_names)
     elif use_google_search:
         variables["tools"] = [{"googleSearch": {}}]
@@ -1964,6 +1974,9 @@ class CookieProxyUpstream(BaseUpstream):
                             if not has_yielded_to_client:
                                 yield _make_openai_chunk(response_id, model_display, role="assistant")
                                 has_yielded_to_client = True
+                            if prefill_text and not prefill_emitted:
+                                prefill_emitted = True
+                                yield _make_openai_chunk(response_id, model_display, content=prefill_text)
                             stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
                             stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
                             yield _make_openai_chunk(response_id, model_display, content=out)
@@ -1974,6 +1987,8 @@ class CookieProxyUpstream(BaseUpstream):
                             has_yielded_to_client = True
                         tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
                         tool_payload["index"] = tool_call_index
+                        if tool_call_index == 0:
+                            first_stream_tool_id = tool_payload["id"]
                         stream_part_order.append({"type": "tool_call", "index": tool_call_index})
                         yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
                         tool_call_index += 1
@@ -1995,7 +2010,7 @@ class CookieProxyUpstream(BaseUpstream):
                             is_auth_or_billing=False,
                         )
 
-                    if prefill_text and not prefill_emitted:
+                    if prefill_text and got_text and not prefill_emitted:
                         prefill_emitted = True
                         yield _make_openai_chunk(response_id, model_display, content=prefill_text)
                     tail = deduper.flush()
