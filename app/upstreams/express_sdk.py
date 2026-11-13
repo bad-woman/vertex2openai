@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from functools import partial
 from typing import Any, Optional, Tuple
 
@@ -95,19 +96,50 @@ def _prefill_log(mode: str, prefill_text: str) -> str:
 
 
 _ENDPOINT_LOGGED = False
+_CLIENT_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_CLIENT_CACHE_MAX = 64
 
 
-def create_express_genai_client(api_key: str, http_options: Any = None) -> Any:
-    """按 Google 官方 Gemini Enterprise Agent Platform (Express Mode) 规范初始化 genai.Client。
+def _client_cache_key(api_key: str, http_options: Any = None) -> tuple:
+    base_url = getattr(http_options, "base_url", None) or app_config.VERTEX_BASE_URL or ""
+    timeout = getattr(http_options, "timeout", None) or 0
+    return (
+        api_key,
+        str(base_url),
+        int(timeout) if isinstance(timeout, (int, float)) else 0,
+        str(app_config.PROXY_URL or ""),
+        str(app_config.SSL_CERT_FILE or ""),
+    )
+
+
+def create_express_genai_client(
+    api_key: str,
+    http_options: Any = None,
+    *,
+    use_cache: bool = True,
+) -> Any:
+    """按 Google 官方 Gemini Enterprise Agent Platform (Express Mode) 规范初始化或复用 genai.Client。
     优先使用官方最新参数 enterprise=True，若运行环境为较旧版 google-genai SDK 则自动回退至等价的 vertexai=True。
+    默认按 Key 与网络配置缓存复用底层 HTTP 连接池，避免每次请求或 429 重试重复建立连接与 TLS 握手。
     """
+    cache_key = _client_cache_key(api_key, http_options) if use_cache else None
+    if cache_key is not None and cache_key in _CLIENT_CACHE:
+        _CLIENT_CACHE.move_to_end(cache_key)
+        return _CLIENT_CACHE[cache_key]
+
     kwargs: dict[str, Any] = {"api_key": api_key}
     if http_options is not None:
         kwargs["http_options"] = http_options
     try:
-        return genai.Client(enterprise=True, **kwargs)
+        client = genai.Client(enterprise=True, **kwargs)
     except TypeError:
-        return genai.Client(vertexai=True, **kwargs)
+        client = genai.Client(vertexai=True, **kwargs)
+
+    if cache_key is not None:
+        _CLIENT_CACHE[cache_key] = client
+        while len(_CLIENT_CACHE) > _CLIENT_CACHE_MAX:
+            _CLIENT_CACHE.popitem(last=False)
+    return client
 
 
 def _log_resolved_endpoint(client: Any) -> None:
@@ -256,11 +288,13 @@ class ExpressSDKUpstream(BaseUpstream):
             "synthetic_tool_name": sandbox_spec.emit_tool_name if sandbox_spec.enabled else "",
         }, None
 
-    def build_key_call_spec(self, ctx: dict, key_record: dict) -> dict:
-        """为当前选中的 Express Key 构建专属 Client 与绑定了其 Project ID 的模型路径。"""
+    def build_key_call_spec(self, ctx: dict, key_record: dict, attempt: int = 0) -> dict:
+        """为当前选中的 Express Key 构建专属 Client 与绑定了其 Project ID 的模型路径。
+        当 attempt >= 1（进入重试）且同时存在长路径与默认短路径时，按奇偶轮次交替主备路径以分散网关路由。
+        """
         express_api_key = key_record["key"]
         base_model_name = ctx["base_model_name"]
-        model_to_call = resolve_express_model_path(
+        pinned_model = resolve_express_model_path(
             base_model_name, ctx["inj_settings"], key_project_id=key_record.get("project_id", "")
         )
         client_to_use = create_express_genai_client(
@@ -268,13 +302,21 @@ class ExpressSDKUpstream(BaseUpstream):
             http_options=get_http_options(),
         )
         _log_resolved_endpoint(client_to_use)
-        if model_to_call != base_model_name:
-            print(f"🌐 [上游端点] Key #{key_record.get('index', 0) + 1} 已钉定 location：{model_to_call}")
+
+        if pinned_model != base_model_name and attempt >= 1 and (attempt % 2 == 1):
+            model_to_call = base_model_name
+            fallback_model = pinned_model
+            print(f"🔀 [路由分散] Key #{key_record.get('index', 0) + 1} 第 {attempt} 次重试切换为默认短路径：{model_to_call}")
+        else:
+            model_to_call = pinned_model
+            fallback_model = base_model_name if pinned_model != base_model_name else None
+            if model_to_call != base_model_name:
+                print(f"🌐 [上游端点] Key #{key_record.get('index', 0) + 1} 已钉定 location：{model_to_call}")
 
         return {
             "client": client_to_use,
             "model_to_call": model_to_call,
-            "fallback_model": (base_model_name if model_to_call != base_model_name else None),
+            "fallback_model": fallback_model,
             "fallback_client_factory": (
                 lambda: create_express_genai_client(
                     api_key=express_api_key,
