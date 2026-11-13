@@ -1209,7 +1209,10 @@ class FunctionCallStreamAssembler:
 
         ready: List[Dict[str, Any]] = []
 
-        if self._pending is not None and fc_name and self._pending["name"] and fc_name != self._pending["name"]:
+        if self._pending is not None and (
+            (fc_name and self._pending["name"] and fc_name != self._pending["name"])
+            or (fc_id and self._pending.get("id") and fc_id != self._pending["id"])
+        ):
             ready.append(self._finalize_pending())
 
         if self._pending is None and fc_name and not has_partial and not fc_will_continue:
