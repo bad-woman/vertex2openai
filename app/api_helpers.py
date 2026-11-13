@@ -22,6 +22,7 @@ from runtime_state import app_state
 from schema_validation import SchemaValidationError, validate_request_schemas
 from logger import stats
 from synthetic_wrapper import (
+    _BUILTIN_SEARCH_NAMES,
     extract_synthetic_content,
     make_bad_woman_response_id,
 )
@@ -397,37 +398,57 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         types.SafetySetting(category="HARM_CATEGORY_JAILBREAK", threshold=safety_threshold)
     ]
 
-    tools_list = []
-    if request.tools:
-        function_declarations = []
-        for tool in request.tools:
-            if tool.get("type") == "function":
-                func_data = tool.get("function")
-                if func_data:
-                    declaration = {
-                        "name": func_data.get("name"),
-                        "description": func_data.get("description"),
-                    }
-                    parameters = func_data.get("parameters")
-                    if isinstance(parameters, dict):
-                        parameters = _strip_json_schema_meta(parameters)
-                        if not parameters:
-                            parameters = {"type": "object", "properties": {}}
-                    if parameters is not None:
-                        if _USE_PARAMS_JSON_SCHEMA:
-                            declaration["parameters_json_schema"] = parameters
-                        else:
-                            declaration["parameters"] = parameters
-                    declaration = {k: v for k, v in declaration.items() if v is not None}
-                    if declaration.get("name"):
-                        function_declarations.append(declaration)
-        if function_declarations:
-            tools_list.append({"function_declarations": function_declarations})
-
     settings = app_state.get_effective_settings(request.model)
     profile = mc.apply_sampling_policy(mc.get_profile(request.model), settings)
     is_image_model = profile["is_image"]
 
+    function_declarations = []
+    declared_search = False
+    for tool in (request.tools or []):
+        if not isinstance(tool, dict):
+            continue
+        t_type = str(tool.get("type") or "").strip().lower().replace("-", "_")
+        func_data = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if func_data is not None:
+            fn_name = str(func_data.get("name") or "").strip()
+        elif "function" not in tool and tool.get("name"):
+            func_data = tool
+            fn_name = str(tool.get("name") or "").strip()
+        else:
+            fn_name = ""
+
+        norm_name = fn_name.lower().replace("-", "_") if fn_name else ""
+        if t_type in _BUILTIN_SEARCH_NAMES or norm_name in _BUILTIN_SEARCH_NAMES:
+            declared_search = True
+            continue
+        if func_data is not None and fn_name and (t_type in ("", "function") or "function" in tool or "parameters" in tool):
+            declaration = {
+                "name": fn_name,
+                "description": func_data.get("description"),
+            }
+            parameters = func_data.get("parameters")
+            if isinstance(parameters, dict):
+                parameters = _strip_json_schema_meta(parameters)
+                if not parameters:
+                    parameters = {"type": "object", "properties": {}}
+            if parameters is not None:
+                if _USE_PARAMS_JSON_SCHEMA:
+                    declaration["parameters_json_schema"] = parameters
+                else:
+                    declaration["parameters"] = parameters
+            declaration = {k: v for k, v in declaration.items() if v is not None}
+            function_declarations.append(declaration)
+
+    choice = request.tool_choice
+    _tools_disabled = isinstance(choice, str) and choice.lower() == "none"
+    _choice_name = ""
+    if isinstance(choice, dict):
+        _choice_fn = choice.get("function") if isinstance(choice.get("function"), dict) else {}
+        _choice_name = str(_choice_fn.get("name") or choice.get("name") or "").strip()
+    _forced_search = bool(_choice_name and _choice_name.lower().replace("-", "_") in _BUILTIN_SEARCH_NAMES)
+
+    tools_list = []
+    active_function_names: list[str] = []
     if is_image_model:
         config["response_modalities"] = ["TEXT", "IMAGE"]
 
@@ -447,15 +468,8 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             image_config_args["aspect_ratio"] = target_ar
 
         config["image_config"] = types.ImageConfig(**image_config_args)
-        _search_names = {"google_search", "googlesearch", "web_search", "websearch", "search"}
-        _declared_search = any(
-            str(((tool.get("function") or {}).get("name") or "")).lower() in _search_names
-            for tool in (request.tools or []) if isinstance(tool, dict)
-        )
-        _tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
-        tools_list = ([{"google_search": {}}]
-                      if _declared_search and not _tools_disabled and profile.get("supports_search")
-                      else [])
+        if (declared_search or _forced_search) and not _tools_disabled and profile.get("supports_search"):
+            tools_list = [{"google_search": {}}]
 
         for key in ["response_mime_type", "response_schema", "response_logprobs", "logprobs"]:
             config.pop(key, None)
@@ -466,6 +480,14 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             config["top_p"] = settings["default_top_p"]
         if config.get("max_output_tokens") is None and settings.get("default_max_tokens") is not None:
             config["max_output_tokens"] = settings["default_max_tokens"]
+
+        if not _tools_disabled and _forced_search and profile.get("supports_search"):
+            tools_list.append({"google_search": {}})
+        elif function_declarations:
+            tools_list.append({"function_declarations": function_declarations})
+            active_function_names = [d["name"] for d in function_declarations]
+        elif not _tools_disabled and declared_search and profile.get("supports_search"):
+            tools_list.append({"google_search": {}})
 
     mc.sanitize_sampling(config, profile)
 
@@ -483,8 +505,8 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         config["tools"] = tools_list
 
     tool_config = None
-    if not is_image_model and (request.tool_choice or request.tools):
-        choice = request.tool_choice
+    # 仅在实际下发了 function_declarations 时才允许附带 function_calling_config，避免空 tools / 纯内置搜索触发 400
+    if not is_image_model and active_function_names:
         mode = None
         allowed_functions = None
         if isinstance(choice, str):
@@ -495,11 +517,12 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                 mode = "AUTO"
             elif c_low == "required":
                 mode = "ANY"
-        elif isinstance(choice, dict) and choice.get("type") == "function":
-            func_name = choice.get("function", {}).get("name")
-            if func_name:
+        elif isinstance(choice, dict):
+            if _choice_name and _choice_name in active_function_names:
                 mode = "ANY"
-                allowed_functions = [func_name]
+                allowed_functions = [_choice_name]
+            elif _choice_name and not _forced_search:
+                mode = "AUTO"
         if mode:
             config_dict = {"mode": mode}
             if allowed_functions:
@@ -814,6 +837,47 @@ def is_gemini_response_valid(response: Any, synthetic_tool_name: str = "") -> bo
     return False
 
 
+def _format_assembled_tool_call(
+    call_dict: Dict[str, Any],
+    tc_index: int,
+    indexer: Optional["ToolCallIndexer"] = None,
+    candidate_index: int = 0,
+) -> Dict[str, Any]:
+    """将聚合后的 function_call 转为 OpenAI tool_calls 增量对象，并同步签名与部分顺序。"""
+    from message_processing import build_tool_call_id, thought_signature_extra
+    from signature_store import SignatureState
+
+    fake_fc = types.FunctionCall(
+        id=call_dict.get("id"),
+        name=call_dict.get("name") or "unknown",
+        args=call_dict.get("args") or {},
+    )
+    fake_part = types.Part(
+        function_call=fake_fc,
+        thought_signature=call_dict.get("thought_signature"),
+    )
+    tc: Dict[str, Any] = {
+        "index": tc_index,
+        "id": build_tool_call_id(
+            fake_fc, fake_part,
+            missing_state=(SignatureState.UNSIGNED_FOLLOWER
+                           if tc_index > 0 else SignatureState.NO_THOUGHT)),
+        "type": "function",
+        "function": {
+            "name": fake_fc.name,
+            "arguments": json.dumps(fake_fc.args, ensure_ascii=False) if fake_fc.args is not None else "{}",
+        },
+    }
+    if indexer and tc_index == 0:
+        indexer._first_tool_ids[candidate_index] = tc["id"]
+    extra = thought_signature_extra(call_dict.get("thought_signature"))
+    if extra:
+        tc["extra_content"] = extra
+    if indexer:
+        indexer.record_tool_call(candidate_index, tc_index)
+    return tc
+
+
 class ToolCallIndexer:
     """一次流式响应内，为 tool_calls 分配稳定递增的 index，聚合分片函数参数，并实时拆包合成传输工具。"""
 
@@ -963,35 +1027,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
         def _emit_assembled_call(call_dict: Dict[str, Any]) -> None:
             tc_index = indexer.next_index(candidate_index) if indexer else len(tool_call_deltas)
-            fake_fc = types.FunctionCall(
-                id=call_dict.get("id"),
-                name=call_dict.get("name") or "unknown",
-                args=call_dict.get("args") or {},
-            )
-            fake_part = types.Part(
-                function_call=fake_fc,
-                thought_signature=call_dict.get("thought_signature"),
-            )
-            tc = {
-                "index": tc_index,
-                "id": build_tool_call_id(
-                    fake_fc, fake_part,
-                    missing_state=(SignatureState.UNSIGNED_FOLLOWER
-                                   if tc_index > 0 else SignatureState.NO_THOUGHT)),
-                "type": "function",
-                "function": {
-                    "name": fake_fc.name,
-                    "arguments": json.dumps(fake_fc.args, ensure_ascii=False) if fake_fc.args is not None else "{}",
-                },
-            }
-            if indexer and tc_index == 0:
-                indexer._first_tool_ids[candidate_index] = tc["id"]
-            extra = thought_signature_extra(call_dict.get("thought_signature"))
-            if extra:
-                tc["extra_content"] = extra
+            tc = _format_assembled_tool_call(call_dict, tc_index, indexer=indexer, candidate_index=candidate_index)
             part_order.append({"type": "tool_call", "index": tc_index})
-            if indexer:
-                indexer.record_tool_call(candidate_index, tc_index)
             tool_call_deltas.append(tc)
 
         if hasattr(candidate, "content") and hasattr(candidate.content, "parts") and candidate.content.parts:
@@ -1673,7 +1710,27 @@ async def execute_unified_completion(
                                             print(f"🛑 [抗截断保护] 检测到 {model_to_call} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
                                             break
 
-                                    rem_synth = tool_indexer.flush_synthetic_tail(0)
+                                    rem_calls = tool_indexer.flush_function_calls(0)
+                                    rem_synth_parts = []
+                                    _tail_synth = tool_indexer.flush_synthetic_tail(0)
+                                    if _tail_synth:
+                                        rem_synth_parts.append(_tail_synth)
+                                    rem_tool_deltas = []
+                                    for c_item in rem_calls:
+                                        if synth_tool_name and c_item.get("name") == synth_tool_name:
+                                            _extra_synth = extract_synthetic_content(
+                                                c_item.get("args"),
+                                                emit_tool_name=synth_tool_name,
+                                                prefill_text=prefill_text,
+                                            )
+                                            if _extra_synth:
+                                                rem_synth_parts.append(_extra_synth)
+                                        else:
+                                            tc_idx = tool_indexer.next_index(0)
+                                            rem_tool_deltas.append(
+                                                _format_assembled_tool_call(c_item, tc_idx, indexer=tool_indexer, candidate_index=0)
+                                            )
+                                    rem_synth = "".join(rem_synth_parts)
                                     if rem_synth:
                                         if deduper is not None:
                                             rem_synth = deduper.feed(rem_synth)
@@ -1724,6 +1781,29 @@ async def execute_unified_completion(
                                                 "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
                                             }
                                             yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+
+                                    if rem_tool_deltas:
+                                        first_flush_tc = not has_yielded_output
+                                        if not has_yielded_output:
+                                            has_yielded_output = True
+                                            print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                        delta_tc: Dict[str, Any] = {"tool_calls": rem_tool_deltas, "content": None}
+                                        if first_flush_tc:
+                                            delta_tc["role"] = "assistant"
+                                        _ord_meta, _ord_order = tool_indexer.topology(0)
+                                        if _ord_order:
+                                            _g_extra: Dict[str, Any] = {"part_order": _ord_order}
+                                            if _ord_meta:
+                                                _g_extra["ordinary_parts"] = _ord_meta
+                                            delta_tc["extra_content"] = {"google": _g_extra}
+                                        _eof_tc_chunk = {
+                                            "id": response_id_for_stream,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": exp_req_obj.model,
+                                            "choices": [{"index": 0, "delta": delta_tc, "finish_reason": None}],
+                                        }
+                                        yield f"data: {json.dumps(_eof_tc_chunk, ensure_ascii=False)}\n\n"
 
                                     # 真流式全量空回拦截：无论是否开启沙箱，只要模型未产出任何有效正文/思考/工具调用，绝不把空壳当成功发出，立即报错（非沙箱模式不盲目重试）！
                                     if not has_yielded_output:
