@@ -288,13 +288,11 @@ class ExpressSDKUpstream(BaseUpstream):
             "synthetic_tool_name": sandbox_spec.emit_tool_name if sandbox_spec.enabled else "",
         }, None
 
-    def build_key_call_spec(self, ctx: dict, key_record: dict, attempt: int = 0) -> dict:
-        """为当前选中的 Express Key 构建专属 Client 与绑定了其 Project ID 的模型路径。
-        当 attempt >= 1（进入重试）且同时存在长路径与默认短路径时，按奇偶轮次交替主备路径以分散网关路由。
-        """
+    def build_key_call_spec(self, ctx: dict, key_record: dict) -> dict:
+        """为当前选中的 Express Key 构建专属 Client 与绑定了其 Project ID 的模型路径。"""
         express_api_key = key_record["key"]
         base_model_name = ctx["base_model_name"]
-        pinned_model = resolve_express_model_path(
+        model_to_call = resolve_express_model_path(
             base_model_name, ctx["inj_settings"], key_project_id=key_record.get("project_id", "")
         )
         client_to_use = create_express_genai_client(
@@ -302,21 +300,13 @@ class ExpressSDKUpstream(BaseUpstream):
             http_options=get_http_options(),
         )
         _log_resolved_endpoint(client_to_use)
-
-        if pinned_model != base_model_name and attempt >= 1 and (attempt % 2 == 1):
-            model_to_call = base_model_name
-            fallback_model = pinned_model
-            print(f"🔀 [路由分散] Key #{key_record.get('index', 0) + 1} 第 {attempt} 次重试切换为默认短路径：{model_to_call}")
-        else:
-            model_to_call = pinned_model
-            fallback_model = base_model_name if pinned_model != base_model_name else None
-            if model_to_call != base_model_name:
-                print(f"🌐 [上游端点] Key #{key_record.get('index', 0) + 1} 已钉定 location：{model_to_call}")
+        if model_to_call != base_model_name:
+            print(f"🌐 [上游端点] Key #{key_record.get('index', 0) + 1} 已钉定 location：{model_to_call}")
 
         return {
             "client": client_to_use,
             "model_to_call": model_to_call,
-            "fallback_model": fallback_model,
+            "fallback_model": (base_model_name if model_to_call != base_model_name else None),
             "fallback_client_factory": (
                 lambda: create_express_genai_client(
                     api_key=express_api_key,
