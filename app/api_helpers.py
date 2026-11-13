@@ -1,6 +1,8 @@
 import json
 import time
 import math
+import random
+import uuid
 import asyncio
 import httpx
 import re
@@ -1476,12 +1478,35 @@ async def execute_unified_completion(
             return False
 
     max_retries, backoff_sec = get_retry_settings()
+    is_image_request = mc.get_profile(request_obj.model)["is_image"]
+
+    def _build_retry_gen_config(base_config: Dict[str, Any], attempt: int) -> Dict[str, Any]:
+        """首次请求 (attempt=0) 100% 原样返回以命中隐式缓存；
+        进入重试 (attempt>=1) 时在副本的 system_instruction 最开头注入极短随机注释微扰，打碎前缀哈希粘性路由。
+        """
+        if attempt <= 0:
+            return base_config
+        if is_image_request and "system_instruction" not in base_config:
+            return base_config
+        cfg = dict(base_config)
+        salt = f"<!-- r{attempt}-{uuid.uuid4().hex[:6]} -->\n"
+        orig_sys = cfg.get("system_instruction")
+        if isinstance(orig_sys, str) and orig_sys:
+            cfg["system_instruction"] = salt + orig_sys
+        elif orig_sys is None:
+            cfg["system_instruction"] = salt.strip()
+        return cfg
+
+    def _jitter_backoff(base_sec: float) -> float:
+        """当退避时间 >= 1s 时施加 [0.80, 1.24] 随机错峰抖动，避免整 5s 齐射撞车。"""
+        if base_sec < 1.0:
+            return base_sec
+        return round(base_sec * random.uniform(0.80, 1.24), 2)
 
     # ============================================================
     # 分支一：流式请求（包含真流式与假流式，支持跨 Key / 跨通道无缝切换）
     # ============================================================
     if request_obj.stream:
-        is_image_request = mc.get_profile(request_obj.model)["is_image"]
         fake_stream_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
 
         try:
@@ -1526,12 +1551,12 @@ async def execute_unified_completion(
                 # ---------- 1A. 当前轮次使用 Express Key ----------
                 if target["channel"] == "express":
                     ctx, actual_prompt, _ = await _get_express_ctx()
-                    spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
+                    spec = express_upstream.build_key_call_spec(ctx, target["key_record"], attempt=attempt)
                     current_client = spec["client"]
                     model_to_call = spec["model_to_call"]
                     fallback_model = spec["fallback_model"]
                     fallback_client_factory = spec["fallback_client_factory"]
-                    gen_config_dict = ctx["gen_config_dict"]
+                    gen_config_dict = _build_retry_gen_config(ctx["gen_config_dict"], attempt)
                     prefill_text = ctx["prefill_text"]
                     exp_req_obj = ctx["request_obj"]
                     synth_tool_name = ctx.get("synthetic_tool_name", "")
@@ -1640,6 +1665,7 @@ async def execute_unified_completion(
                         sampler = _RawSampler()
                         try:
                             for _pin_try in range(2):
+                                stream_gen_obj = None
                                 try:
                                     stream_gen_obj = await current_client.aio.models.generate_content_stream(
                                         model=model_to_call,
@@ -1859,6 +1885,12 @@ async def execute_unified_completion(
                                         current_client = fallback_client_factory()
                                         continue
                                     raise
+                                finally:
+                                    if stream_gen_obj is not None and hasattr(stream_gen_obj, "aclose"):
+                                        try:
+                                            await stream_gen_obj.aclose()
+                                        except Exception:
+                                            pass
                         except asyncio.CancelledError:
                             print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
                             raise
@@ -1925,16 +1957,17 @@ async def execute_unified_completion(
                             print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {request_obj.model}。")
                             return
                         stats.add_retry()
+                        wait_target = _jitter_backoff(backoff_sec)
                         print(
                             f"⚠️ [自动重试] 流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
-                            f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {backoff_sec}s 后将切换至 [{next_target['label']}] | "
+                            f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
                             f"原因: {err_formatted[:1500]}"
                         )
                         waited = 0.0
                         hb_acc = 0.0
                         hb_step_target = outer_keep_alive_interval if (fake_stream_on or is_image_request) else 3.0
-                        while waited < backoff_sec:
-                            step = min(0.5, backoff_sec - waited)
+                        while waited < wait_target:
+                            step = min(0.5, wait_target - waited)
                             await asyncio.sleep(step)
                             waited += step
                             hb_acc += step
@@ -1981,12 +2014,12 @@ async def execute_unified_completion(
         # ---------- 2A. 当前轮次使用 Express Key ----------
         if target["channel"] == "express":
             ctx, actual_prompt, _ = await _get_express_ctx()
-            spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
+            spec = express_upstream.build_key_call_spec(ctx, target["key_record"], attempt=attempt)
             current_client = spec["client"]
             model_to_call = spec["model_to_call"]
             fallback_model = spec["fallback_model"]
             fallback_client_factory = spec["fallback_client_factory"]
-            gen_config_dict = ctx["gen_config_dict"]
+            gen_config_dict = _build_retry_gen_config(ctx["gen_config_dict"], attempt)
             prefill_text = ctx["prefill_text"]
             exp_req_obj = ctx["request_obj"]
             synth_tool_name = ctx.get("synthetic_tool_name", "")
@@ -2109,14 +2142,15 @@ async def execute_unified_completion(
                     content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
                 )
             stats.add_retry()
+            wait_target = _jitter_backoff(backoff_sec)
             print(
                 f"⚠️ [自动重试] 非流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
-                f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {backoff_sec}s 后将切换至 [{next_target['label']}] | "
+                f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
                 f"原因: {err_formatted[:1500]}"
             )
             waited = 0.0
-            while waited < backoff_sec:
-                step = min(0.5, backoff_sec - waited)
+            while waited < wait_target:
+                step = min(0.5, wait_target - waited)
                 await asyncio.sleep(step)
                 waited += step
                 if await _client_gone():
