@@ -696,7 +696,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                   <option value="low">low（轻量思考）</option>
                   <option value="medium">medium（均衡思考）</option>
                   <option value="high">high（深度思考）</option>
-                  <option value="xhigh">xhigh（超高思考 · Gemini 4）</option>
+                  <option value="xhigh">xhigh（超高思考 · 仅 4-hydrogen，其余降级 high）</option>
                 </select>
               </div>
               <div>
@@ -1499,7 +1499,7 @@ function renderCaps(){
     $('caps-summary').innerHTML = chip('🌐 作用域：全局默认', true) + chip('切换具体模型可查看其能力白名单');
     ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
-    $('think-note').textContent='全局默认：选「自动」时采用模型官方原生默认档位；压制思考或选 minimal 时，3.7+ 及 4.x 全系模型最低自动发送 low。';
+    $('think-note').textContent='全局默认：选「自动」时采用模型官方原生默认档位；压制思考或选 minimal 时，3.7+ 及 4.x 全系最低自动发送 low；仅 4-hydrogen 支持 xhigh，其余模型选或传入 xhigh 时自动降级为 high。';
     $('image-note').textContent='全局默认：分辨率与宽高比仅在调用生图模型（-image / nano-banana）时生效。';
     $('sampling-note').textContent='全局默认：遇到已废弃采样参数的模型（如 Gemini 3.6+ / 4.x）会自动剥离以防报错。';
     return;
@@ -1526,7 +1526,7 @@ function renderCaps(){
   $('wrap-g3level').style.opacity=isLevel?'1':'.4';
   var tn='';
   if(cap.is_image) tn='生图模型思考档位：选「自动」即采用官方原生默认，亦可在上方手动指定档位。';
-  else if(isLevel) tn='支持思考档位：' + (th.levels||[]).join(' / ') + ((th.levels && !th.levels.includes('minimal')) ? '（该模型最低合法档为 low，不支持 minimal）' : '（最低合法档为 minimal）') + '。';
+  else if(isLevel){ var lvs=th.levels||[]; var bounds=[]; bounds.push(!lvs.includes('minimal')?'最低合法档为 low（不支持 minimal）':'最低合法档为 minimal'); if(!lvs.includes('xhigh')) bounds.push('不支持 xhigh（自动降级 high）'); tn='支持思考档位：' + lvs.join(' / ') + '（' + bounds.join('；') + '）。'; }
   else tn='该模型不支持思考档位调节。';
   $('think-note').textContent=tn;
 
