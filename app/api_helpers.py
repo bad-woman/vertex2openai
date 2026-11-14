@@ -26,7 +26,9 @@ from logger import stats
 from synthetic_wrapper import (
     _BUILTIN_SEARCH_NAMES,
     extract_synthetic_content,
+    is_stream_fc_args_unsupported_error,
     make_bad_woman_response_id,
+    strip_stream_fc_args_from_config,
 )
 
 
@@ -214,6 +216,37 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
     status_tag = f" [{status_str}]" if status_str and status_str not in clean_msg else ""
     formatted = f"【{diag}】{status_tag} {clean_msg}"
     return code, formatted
+
+
+def extract_retry_after_seconds(err: Any, msg: str = "") -> Optional[float]:
+    """从上游 429 / 503 异常响应头或 RetryInfo 中提取 Google 明确返回的短建议秒数（仅在短于控制台设定秒数时作参考，不强制长阻塞）。"""
+    resp = getattr(err, "response", None)
+    headers = getattr(resp, "headers", None) if resp is not None else getattr(err, "headers", None)
+    if headers and hasattr(headers, "get"):
+        ra = headers.get("retry-after") or headers.get("Retry-After")
+        if ra is not None:
+            try:
+                val = float(str(ra).strip())
+                if 0 < val <= 60:
+                    return val
+            except (TypeError, ValueError):
+                pass
+
+    raw_pool = f"{msg} {getattr(err, 'details', '')} {err}"
+    for pat in (
+        r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"',
+        r"'retryDelay'\s*:\s*'(\d+(?:\.\d+)?)s'",
+        r"retry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds)\b",
+    ):
+        m = re.search(pat, raw_pool, re.IGNORECASE)
+        if m:
+            try:
+                val = float(m.group(1))
+                if 0 < val <= 60:
+                    return val
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _describe_empty_gemini_response(response_obj: Any, model_to_call: str) -> str:
@@ -493,15 +526,14 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
 
     mc.sanitize_sampling(config, profile)
 
-    if re.search(r"(?:^|/)gemini-4-", (request.model or "").lower()) and config.get("max_output_tokens"):
-        # Gemini 4 官方支持流式与非流式单轮标准 64K (65536) 输出；Express SDK >= 2.30.0 超过 64K 时原生支持自动 Long Decode
+    if config.get("max_output_tokens") is not None and not is_image_model:
         _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
-        if _fake_on and not is_image_model:
-            try:
-                if int(config["max_output_tokens"]) > 65536:
-                    config["max_output_tokens"] = 65536
-            except (TypeError, ValueError):
-                pass
+        _is_real_stream = bool(getattr(request, "stream", False) and not _fake_on)
+        _clamped_max = mc.clamp_max_output_tokens(request.model or "", config["max_output_tokens"], is_real_stream=_is_real_stream)
+        if _clamped_max is not None:
+            config["max_output_tokens"] = _clamped_max
+        else:
+            config.pop("max_output_tokens", None)
 
     if tools_list:
         config["tools"] = tools_list
@@ -810,32 +842,48 @@ def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
-def is_gemini_response_valid(response: Any, synthetic_tool_name: str = "") -> bool:
+def is_gemini_response_valid(
+    response: Any,
+    synthetic_tool_name: str = "",
+    prefill_text: str = "",
+) -> bool:
     if response is None:
         return False
-    if hasattr(response, "text") and isinstance(response.text, str) and response.text.strip():
-        return True
     if hasattr(response, "candidates") and response.candidates:
+        saw_synthetic_call = False
+        has_valid_real_part = False
         for cand in response.candidates:
-            if hasattr(cand, "text") and isinstance(cand.text, str) and cand.text.strip():
-                return True
             if hasattr(cand, "content") and hasattr(cand.content, "parts") and cand.content.parts:
                 for part in cand.content.parts:
                     fc = getattr(part, "function_call", None)
                     if fc is not None:
                         if synthetic_tool_name and getattr(fc, "name", "") == synthetic_tool_name:
-                            if extract_synthetic_content(
-                                getattr(fc, "args", None), emit_tool_name=synthetic_tool_name
-                            ).strip():
+                            saw_synthetic_call = True
+                            extracted = extract_synthetic_content(
+                                getattr(fc, "args", None),
+                                emit_tool_name=synthetic_tool_name,
+                                prefill_text=prefill_text,
+                            )
+                            if extracted.strip() or (prefill_text and extracted):
                                 return True
                             continue
                         return True
-                    if getattr(part, "inline_data", None) is not None:
+                    if getattr(part, "inline_data", None) is not None or getattr(part, "file_data", None) is not None:
                         return True
                     if hasattr(part, "text") and isinstance(getattr(part, "text", None), str) and getattr(part, "text", "").strip():
                         if getattr(part, "thought", None) is True:
                             continue
-                        return True
+                        has_valid_real_part = True
+            elif not synthetic_tool_name and hasattr(cand, "text") and isinstance(cand.text, str) and cand.text.strip():
+                has_valid_real_part = True
+        if saw_synthetic_call:
+            # 命中了合成工具但提取正文为空且无真实工具调用：判定为无效以触发自动重试，防止多嘴普通文本被覆盖为空白回复
+            return False
+        if has_valid_real_part:
+            return True
+        return False
+    if hasattr(response, "text") and isinstance(response.text, str) and response.text.strip():
+        return True
     return False
 
 
@@ -893,6 +941,7 @@ class ToolCallIndexer:
         self._assemblers: Dict[int, Any] = {}
         self._pending_images: Dict[int, list[bytes]] = {}
         self._first_tool_ids: Dict[int, str] = {}
+        self._extra_emitted: set[int] = set()
 
     def record_image_bytes(self, candidate_index: int, img_bytes: bytes) -> None:
         if img_bytes:
@@ -952,6 +1001,10 @@ class ToolCallIndexer:
         asm = self._assemblers.get(candidate_index)
         return asm.flush_synthetic_tail() if asm else ""
 
+    def pop_synth_signature(self, candidate_index: int = 0) -> Optional[bytes]:
+        asm = self._assemblers.get(candidate_index)
+        return asm.pop_synth_signature() if asm else None
+
     def flush_function_calls(self, candidate_index: int = 0) -> List[Dict[str, Any]]:
         asm = self._assemblers.get(candidate_index)
         return asm.flush() if asm else []
@@ -972,11 +1025,51 @@ class ToolCallIndexer:
 
     def record_ordinary_part(self, candidate_index: int, metadata: dict) -> int:
         items = self._ordinary_parts.setdefault(candidate_index, [])
+        orders = self._part_order.setdefault(candidate_index, [])
+        kind = metadata.get("kind")
+        # 合并相邻的同类型（text / thought）普通增量块，避免上千个碎字典撑大收尾拓扑与下一轮历史解析开销
+        if (
+            items
+            and orders
+            and orders[-1].get("type") == "ordinary"
+            and orders[-1].get("index") == len(items) - 1
+            and kind in ("text", "thought")
+            and items[-1].get("kind") == kind
+            and not (items[-1].get("thought_signature") and metadata.get("thought_signature"))
+        ):
+            prev = items[-1]
+            add_txt = metadata.get("text") or ""
+            if add_txt:
+                prev["text"] = (prev.get("text") or "") + add_txt
+            if metadata.get("thought_signature") and not prev.get("thought_signature"):
+                prev["thought_signature"] = metadata["thought_signature"]
+            return len(items) - 1
+
         index = len(items)
-        items.append(metadata)
-        self._part_order.setdefault(candidate_index, []).append(
-            {"type": "ordinary", "index": index})
+        items.append(dict(metadata))
+        orders.append({"type": "ordinary", "index": index})
         return index
+
+    def build_google_extra(self, candidate_index: int = 0) -> Dict[str, Any]:
+        """构建精简后的单次收尾/工具拓扑元数据（仅在收尾帧或工具调用帧发送唯一一次）。"""
+        metadata_to_emit, order_to_emit = self.topology(candidate_index)
+        google_extra: Dict[str, Any] = {}
+        for item in reversed(metadata_to_emit):
+            if item.get("thought_signature"):
+                google_extra["thought_signature"] = item["thought_signature"]
+                google_extra["thought_signature_part"] = item.get("kind")
+                break
+        if metadata_to_emit:
+            google_extra["ordinary_parts"] = metadata_to_emit
+        if self.has_tool_calls(candidate_index) and order_to_emit:
+            google_extra["part_order"] = order_to_emit
+        return google_extra
+
+    def mark_extra_emitted(self, candidate_index: int = 0) -> None:
+        self._extra_emitted.add(candidate_index)
+
+    def has_emitted_extra(self, candidate_index: int = 0) -> bool:
+        return candidate_index in self._extra_emitted
 
     def topology(self, candidate_index: int = 0) -> tuple[list, list]:
         return (
@@ -1105,12 +1198,17 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
         if indexer is not None and (openai_finish_reason or indexer.has_synthetic_halted(candidate_index)):
             tail_synth = indexer.flush_synthetic_tail(candidate_index)
-            if tail_synth:
-                synthetic_text_deltas.append(tail_synth)
-                metadata = ordinary_part_metadata("text", tail_synth, None)
+            tail_sig = indexer.pop_synth_signature(candidate_index)
+            if tail_synth or tail_sig:
+                if tail_synth:
+                    synthetic_text_deltas.append(tail_synth)
+                metadata = ordinary_part_metadata("text", tail_synth, tail_sig)
                 ordinary_index = indexer.record_ordinary_part(candidate_index, metadata)
                 part_order.append({"type": "ordinary", "index": ordinary_index})
                 ordinary_metadata.append(metadata)
+                if tail_sig:
+                    ordinary_signature = tail_sig
+                    ordinary_signature_kind = "text"
             if indexer.has_synthetic_halted(candidate_index) and not indexer.has_tool_calls(candidate_index):
                 openai_finish_reason = "stop"
 
@@ -1141,31 +1239,35 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         elif not reasoning_text and openai_finish_reason is None:
             delta_payload["content"] = ""
 
-        google_extra = {}
-        if indexer:
-            metadata_to_emit, order_to_emit = indexer.topology(candidate_index)
-        else:
-            metadata_to_emit, order_to_emit = ordinary_metadata, part_order
-
-        cumulative_signature = None
-        cumulative_signature_kind = None
-        for item in reversed(metadata_to_emit):
-            if item.get("thought_signature"):
-                cumulative_signature = item["thought_signature"]
-                cumulative_signature_kind = item.get("kind")
-                break
-        if cumulative_signature:
-            google_extra["thought_signature"] = cumulative_signature
-            google_extra["thought_signature_part"] = cumulative_signature_kind
-        elif ordinary_signature:
-            google_extra.update((thought_signature_extra(
-                ordinary_signature, ordinary_signature_kind) or {}).get("google", {}))
-        if metadata_to_emit:
-            google_extra["ordinary_parts"] = metadata_to_emit
-        if order_to_emit:
-            google_extra["part_order"] = order_to_emit
-        if google_extra:
-            delta_payload["extra_content"] = {"google": google_extra}
+        # 仅在收尾帧 (openai_finish_reason is not None) 或携带真实工具调用帧发送唯一一次拓扑扩展，
+        # 彻底杜绝普通流式 token 帧每帧重复背负累积全文导致的 O(N^2) 响应体膨胀与酒馆越写越卡！
+        should_emit_extra = bool(openai_finish_reason is not None or tool_call_deltas)
+        if should_emit_extra:
+            if indexer is not None:
+                google_extra = indexer.build_google_extra(candidate_index)
+                if not google_extra.get("thought_signature") and ordinary_signature:
+                    google_extra.update((thought_signature_extra(
+                        ordinary_signature, ordinary_signature_kind) or {}).get("google", {}))
+                if google_extra:
+                    delta_payload["extra_content"] = {"google": google_extra}
+                    if openai_finish_reason is not None:
+                        indexer.mark_extra_emitted(candidate_index)
+            else:
+                google_extra = {}
+                for item in reversed(ordinary_metadata):
+                    if item.get("thought_signature"):
+                        google_extra["thought_signature"] = item["thought_signature"]
+                        google_extra["thought_signature_part"] = item.get("kind")
+                        break
+                if not google_extra.get("thought_signature") and ordinary_signature:
+                    google_extra.update((thought_signature_extra(
+                        ordinary_signature, ordinary_signature_kind) or {}).get("google", {}))
+                if ordinary_metadata:
+                    google_extra["ordinary_parts"] = ordinary_metadata
+                if tool_call_deltas and part_order:
+                    google_extra["part_order"] = part_order
+                if google_extra:
+                    delta_payload["extra_content"] = {"google": google_extra}
 
     if not delta_payload and openai_finish_reason is None:
         delta_payload["content"] = ""
@@ -1174,7 +1276,7 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
         "id": response_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name,
         "choices": [{"index": candidate_index, "delta": delta_payload, "finish_reason": openai_finish_reason}]
     }
-    return f"data: {json.dumps(chunk_data)}\n\n"
+    return f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
 
 
 async def _chunk_openai_response_dict_for_sse(
@@ -1200,10 +1302,7 @@ async def _chunk_openai_response_dict_for_sse(
             payload = {"id": resp_id, "object": "chat.completion.chunk", "created": created_time,
                        "model": model_name, "choices": [{"index": choice_idx, "delta": delta,
                                                          "finish_reason": None}]}
-            return f"data: {json.dumps(payload)}\n\n"
-
-        if message.get("extra_content") is not None:
-            yield _sse({"extra_content": message["extra_content"]})
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         reasoning_content = message.get("reasoning_content", "")
         actual_content = message.get("content")
@@ -1213,7 +1312,7 @@ async def _chunk_openai_response_dict_for_sse(
 
         if actual_content is not None:
             content_to_chunk = actual_content
-            if "![Image](data:image/" in content_to_chunk:
+            if "![Image](data:image/" in content_to_chunk or "![Generated Image](data:" in content_to_chunk:
                 chunk_size = max(1, len(content_to_chunk))
             else:
                 chunk_size = max(1, math.ceil(len(content_to_chunk) / 10)) if content_to_chunk else 1
@@ -1243,7 +1342,10 @@ async def _chunk_openai_response_dict_for_sse(
             }]})
             await asyncio.sleep(0.01)
 
-        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': {}, 'finish_reason': final_finish_reason}]})}\n\n"
+        fin_delta: Dict[str, Any] = {}
+        if message.get("extra_content") is not None:
+            fin_delta["extra_content"] = message["extra_content"]
+        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': fin_delta, 'finish_reason': final_finish_reason}]}, ensure_ascii=False)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -1479,29 +1581,41 @@ async def execute_unified_completion(
 
     max_retries, backoff_sec = get_retry_settings()
     is_image_request = mc.get_profile(request_obj.model)["is_image"]
+    tried_target_ids_in_cycle: set[str] = set()
 
-    def _build_retry_gen_config(base_config: Dict[str, Any], attempt: int) -> Dict[str, Any]:
-        """首次请求 (attempt=0) 100% 原样返回以命中隐式缓存；
-        进入重试 (attempt>=1) 时在副本的 system_instruction 最开头注入极短随机注释微扰，打碎前缀哈希粘性路由。
+    def _compute_smart_retry_wait(
+        base_sec: float,
+        target_cur: dict,
+        target_nxt: dict,
+        upstream_retry_after: Optional[float] = None,
+    ) -> float:
+        """两档退避等待策略（适配快速模式公共池高频 429）：
+        - 情况 A：切换到本轮周期内尚未试过的另一把可用凭证时，仅等 0.3~0.6s 立即换号敲门；
+        - 情况 B：单凭证原地重试，或所有可用凭证已试满一整轮准备进入下一轮敲门时，
+          清空本轮已试集合，并按控制台 retry_backoff_seconds（施加 0.8~1.2 随机抖动）退避等待
+          （若上游明确给出了更短的 Retry-After 秒数则优先参考）。
         """
-        if attempt <= 0:
-            return base_config
-        if is_image_request and "system_instruction" not in base_config:
-            return base_config
-        cfg = dict(base_config)
-        salt = f"<!-- r{attempt}-{uuid.uuid4().hex[:6]} -->\n"
-        orig_sys = cfg.get("system_instruction")
-        if isinstance(orig_sys, str) and orig_sys:
-            cfg["system_instruction"] = salt + orig_sys
-        elif orig_sys is None:
-            cfg["system_instruction"] = salt.strip()
-        return cfg
+        nonlocal tried_target_ids_in_cycle
+        if target_cur:
+            tried_target_ids_in_cycle.add(target_cur["id"])
 
-    def _jitter_backoff(base_sec: float) -> float:
-        """当退避时间 >= 1s 时施加 [0.80, 1.24] 随机错峰抖动，避免整 5s 齐射撞车。"""
-        if base_sec < 1.0:
-            return base_sec
-        return round(base_sec * random.uniform(0.80, 1.24), 2)
+        switching_to_fresh_target = bool(
+            target_nxt
+            and target_cur
+            and target_nxt["id"] != target_cur["id"]
+            and target_nxt["id"] not in tried_target_ids_in_cycle
+        )
+        if switching_to_fresh_target:
+            return round(random.uniform(0.30, 0.60), 2)
+
+        # 所有存活凭证均已轮试完一圈（或仅配置了单个凭证）：重置本轮集合，执行完整周期退避
+        tried_target_ids_in_cycle.clear()
+        effective_base = float(base_sec)
+        if upstream_retry_after is not None and 0.5 <= upstream_retry_after < effective_base:
+            effective_base = upstream_retry_after
+        if effective_base < 1.0:
+            return round(effective_base, 2)
+        return round(effective_base * random.uniform(0.80, 1.20), 2)
 
     # ============================================================
     # 分支一：流式请求（包含真流式与假流式，支持跨 Key / 跨通道无缝切换）
@@ -1545,6 +1659,7 @@ async def execute_unified_completion(
                 attempt_failed = False
                 err_code = 500
                 err_formatted = ""
+                err_retry_after: Optional[float] = None
                 is_retryable = False
                 is_auth_or_billing = False
 
@@ -1556,7 +1671,7 @@ async def execute_unified_completion(
                     model_to_call = spec["model_to_call"]
                     fallback_model = spec["fallback_model"]
                     fallback_client_factory = spec["fallback_client_factory"]
-                    gen_config_dict = _build_retry_gen_config(ctx["gen_config_dict"], attempt)
+                    gen_config_dict = ctx["gen_config_dict"]
                     prefill_text = ctx["prefill_text"]
                     exp_req_obj = ctx["request_obj"]
                     synth_tool_name = ctx.get("synthetic_tool_name", "")
@@ -1579,12 +1694,14 @@ async def execute_unified_completion(
                                     pass
 
                         try:
+                            raw_gemini_response = None
+                            unary_cfg = strip_stream_fc_args_from_config(gen_config_dict)
                             for _pin_try in range(2):
                                 api_call_task = asyncio.create_task(
                                     current_client.aio.models.generate_content(
                                         model=model_to_call,
                                         contents=actual_prompt,
-                                        config=gen_config_dict,
+                                        config=unary_cfg,
                                     )
                                 )
                                 elapsed_hb = 0.0
@@ -1623,7 +1740,11 @@ async def execute_unified_completion(
                                 print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
                                 raise ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
 
-                            if not is_gemini_response_valid(raw_gemini_response, synthetic_tool_name=synth_tool_name):
+                            if not is_gemini_response_valid(
+                                raw_gemini_response,
+                                synthetic_tool_name=synth_tool_name,
+                                prefill_text=prefill_text,
+                            ):
                                 print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                                 err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
                                 if synth_tool_name:
@@ -1653,6 +1774,7 @@ async def execute_unified_completion(
                         except Exception as e_fake:
                             attempt_failed = True
                             err_code, err_formatted = extract_upstream_error(e_fake)
+                            err_retry_after = extract_retry_after_seconds(e_fake, err_formatted)
                             is_auth_or_billing = is_express_auth_or_billing_error(e_fake, err_code)
                             is_retryable = is_retryable_exception(e_fake)
 
@@ -1664,13 +1786,15 @@ async def execute_unified_completion(
                         stream_start_ts = time.time()
                         sampler = _RawSampler()
                         try:
-                            for _pin_try in range(2):
+                            active_stream_cfg = gen_config_dict
+                            for _pin_try in range(3):
                                 stream_gen_obj = None
+                                received_any_stream_chunk = False
                                 try:
                                     stream_gen_obj = await current_client.aio.models.generate_content_stream(
                                         model=model_to_call,
                                         contents=actual_prompt,
-                                        config=gen_config_dict,
+                                        config=active_stream_cfg,
                                     )
                                     tool_indexer = ToolCallIndexer(
                                         synthetic_tool_name=synth_tool_name,
@@ -1683,6 +1807,7 @@ async def execute_unified_completion(
                                     final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
 
                                     async for chunk_item_call in stream_gen_obj:
+                                        received_any_stream_chunk = True
                                         last_stream_chunk_obj = chunk_item_call
                                         sampler.add(extract_gemini_chunk_debug_dict(chunk_item_call))
                                         if getattr(chunk_item_call, "usage_metadata", None):
@@ -1739,6 +1864,10 @@ async def execute_unified_completion(
                                     rem_calls = tool_indexer.flush_function_calls(0)
                                     rem_synth_parts = []
                                     _tail_synth = tool_indexer.flush_synthetic_tail(0)
+                                    _tail_sig = tool_indexer.pop_synth_signature(0)
+                                    if _tail_synth or _tail_sig:
+                                        from message_processing import ordinary_part_metadata as _ord_meta_fn
+                                        tool_indexer.record_ordinary_part(0, _ord_meta_fn("text", _tail_synth, _tail_sig))
                                     if _tail_synth:
                                         rem_synth_parts.append(_tail_synth)
                                     rem_tool_deltas = []
@@ -1750,6 +1879,10 @@ async def execute_unified_completion(
                                                 prefill_text=prefill_text,
                                             )
                                             if _extra_synth:
+                                                from message_processing import ordinary_part_metadata as _ord_meta_fn
+                                                tool_indexer.record_ordinary_part(
+                                                    0, _ord_meta_fn("text", _extra_synth, c_item.get("thought_signature"))
+                                                )
                                                 rem_synth_parts.append(_extra_synth)
                                         else:
                                             tc_idx = tool_indexer.next_index(0)
@@ -1757,14 +1890,14 @@ async def execute_unified_completion(
                                                 _format_assembled_tool_call(c_item, tc_idx, indexer=tool_indexer, candidate_index=0)
                                             )
                                     rem_synth = "".join(rem_synth_parts)
-                                    if rem_synth:
-                                        if deduper is not None:
+                                    if rem_synth or _tail_sig:
+                                        if rem_synth and deduper is not None:
                                             rem_synth = deduper.feed(rem_synth)
-                                        if rem_synth:
-                                            if not has_yielded_output:
+                                        if rem_synth or _tail_sig:
+                                            if rem_synth and not has_yielded_output:
                                                 has_yielded_output = True
                                                 print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
-                                            if not prefill_emitted:
+                                            if rem_synth and not prefill_emitted:
                                                 prefill_emitted = True
                                                 _pf = {
                                                     "id": response_id_for_stream,
@@ -1774,14 +1907,18 @@ async def execute_unified_completion(
                                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
                                                 }
                                                 yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
-                                            _rem_chunk = {
-                                                "id": response_id_for_stream,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": exp_req_obj.model,
-                                                "choices": [{"index": 0, "delta": {"content": rem_synth}, "finish_reason": None}],
-                                            }
-                                            yield f"data: {json.dumps(_rem_chunk, ensure_ascii=False)}\n\n"
+                                            _rem_delta: Dict[str, Any] = {}
+                                            if rem_synth:
+                                                _rem_delta["content"] = rem_synth
+                                            if _rem_delta and has_yielded_output:
+                                                _rem_chunk = {
+                                                    "id": response_id_for_stream,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": exp_req_obj.model,
+                                                    "choices": [{"index": 0, "delta": _rem_delta, "finish_reason": None}],
+                                                }
+                                                yield f"data: {json.dumps(_rem_chunk, ensure_ascii=False)}\n\n"
 
                                     if deduper is not None and not deduper.done:
                                         tail = deduper.flush()
@@ -1816,12 +1953,10 @@ async def execute_unified_completion(
                                         delta_tc: Dict[str, Any] = {"tool_calls": rem_tool_deltas, "content": None}
                                         if first_flush_tc:
                                             delta_tc["role"] = "assistant"
-                                        _ord_meta, _ord_order = tool_indexer.topology(0)
-                                        if _ord_order:
-                                            _g_extra: Dict[str, Any] = {"part_order": _ord_order}
-                                            if _ord_meta:
-                                                _g_extra["ordinary_parts"] = _ord_meta
-                                            delta_tc["extra_content"] = {"google": _g_extra}
+                                        _g_tc = tool_indexer.build_google_extra(0)
+                                        if _g_tc:
+                                            delta_tc["extra_content"] = {"google": _g_tc}
+                                            tool_indexer.mark_extra_emitted(0)
                                         _eof_tc_chunk = {
                                             "id": response_id_for_stream,
                                             "object": "chat.completion.chunk",
@@ -1842,14 +1977,32 @@ async def execute_unified_completion(
 
                                     if has_yielded_output and not emitted_finish_reason:
                                         _fin_reason = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
+                                        _fin_delta_eof: Dict[str, Any] = {}
+                                        if not tool_indexer.has_emitted_extra(0):
+                                            _g_eof = tool_indexer.build_google_extra(0)
+                                            if _g_eof:
+                                                _fin_delta_eof["extra_content"] = {"google": _g_eof}
+                                                tool_indexer.mark_extra_emitted(0)
                                         _fin_chunk = {
                                             "id": response_id_for_stream,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": exp_req_obj.model,
-                                            "choices": [{"index": 0, "delta": {}, "finish_reason": _fin_reason}],
+                                            "choices": [{"index": 0, "delta": _fin_delta_eof, "finish_reason": _fin_reason}],
                                         }
                                         yield f"data: {json.dumps(_fin_chunk, ensure_ascii=False)}\n\n"
+                                    elif has_yielded_output and not tool_indexer.has_emitted_extra(0):
+                                        _g_late = tool_indexer.build_google_extra(0)
+                                        if _g_late.get("thought_signature"):
+                                            tool_indexer.mark_extra_emitted(0)
+                                            _sig_chunk = {
+                                                "id": response_id_for_stream,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": exp_req_obj.model,
+                                                "choices": [{"index": 0, "delta": {"extra_content": {"google": _g_late}}, "finish_reason": None}],
+                                            }
+                                            yield f"data: {json.dumps(_sig_chunk, ensure_ascii=False)}\n\n"
 
                                     if final_p_tk > 0 or final_c_tk > 0:
                                         stats.add_tokens(final_p_tk, final_c_tk)
@@ -1871,6 +2024,19 @@ async def execute_unified_completion(
                                     print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                                     return
                                 except Exception as e_pin_stream:
+                                    _stripped_s_cfg = strip_stream_fc_args_from_config(active_stream_cfg)
+                                    if (
+                                        not has_yielded_output
+                                        and not received_any_stream_chunk
+                                        and _stripped_s_cfg is not active_stream_cfg
+                                        and is_stream_fc_args_unsupported_error(e_pin_stream)
+                                    ):
+                                        print(
+                                            f"⚠️ [抗截断兼容] 模型 {model_to_call} 不支持 stream_function_call_arguments，"
+                                            "已自动剥离分片参数标志并保持 compose_reply 重试。"
+                                        )
+                                        active_stream_cfg = _stripped_s_cfg
+                                        continue
                                     if (
                                         _pin_try == 0
                                         and not has_yielded_output
@@ -1896,6 +2062,7 @@ async def execute_unified_completion(
                             raise
                         except Exception as e_stream_call:
                             err_code, err_formatted = extract_upstream_error(e_stream_call)
+                            err_retry_after = extract_retry_after_seconds(e_stream_call, err_formatted)
                             if has_yielded_output:
                                 stats.add_error()
                                 print(f"❌ [Express 流式中断报错] 凭证=[{target['label']}] | 模型={request_obj.model} | HTTP {err_code} | {err_formatted[:2000]}")
@@ -1923,6 +2090,7 @@ async def execute_unified_completion(
                     except Exception as e_cookie:
                         err_code = getattr(e_cookie, "status_code", None) or getattr(e_cookie, "code", None) or 500
                         err_formatted = getattr(e_cookie, "message", None) or str(e_cookie)
+                        err_retry_after = extract_retry_after_seconds(e_cookie, err_formatted)
                         if has_yielded_output:
                             stats.add_error()
                             print(f"❌ [Studio 流式中断报错] 凭证=[{target['label']}] | 模型={request_obj.model} | {err_formatted[:2000]}")
@@ -1957,7 +2125,9 @@ async def execute_unified_completion(
                             print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {request_obj.model}。")
                             return
                         stats.add_retry()
-                        wait_target = _jitter_backoff(backoff_sec)
+                        wait_target = _compute_smart_retry_wait(
+                            backoff_sec, target, next_target, err_retry_after
+                        )
                         print(
                             f"⚠️ [自动重试] 流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
                             f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
@@ -2008,6 +2178,7 @@ async def execute_unified_completion(
 
         err_code = 500
         err_formatted = ""
+        err_retry_after: Optional[float] = None
         is_retryable = False
         is_auth_or_billing = False
 
@@ -2019,7 +2190,7 @@ async def execute_unified_completion(
             model_to_call = spec["model_to_call"]
             fallback_model = spec["fallback_model"]
             fallback_client_factory = spec["fallback_client_factory"]
-            gen_config_dict = _build_retry_gen_config(ctx["gen_config_dict"], attempt)
+            gen_config_dict = ctx["gen_config_dict"]
             prefill_text = ctx["prefill_text"]
             exp_req_obj = ctx["request_obj"]
             synth_tool_name = ctx.get("synthetic_tool_name", "")
@@ -2029,12 +2200,13 @@ async def execute_unified_completion(
             try:
                 response_obj_call = None
                 sampler = _RawSampler()
+                unary_cfg = strip_stream_fc_args_from_config(gen_config_dict)
                 for _pin_try in range(2):
                     call_task = asyncio.create_task(
                         current_client.aio.models.generate_content(
                             model=model_to_call,
                             contents=actual_prompt,
-                            config=gen_config_dict,
+                            config=unary_cfg,
                         )
                     )
                     try:
@@ -2079,7 +2251,11 @@ async def execute_unified_completion(
                     print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
                     raise ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
 
-                if not is_gemini_response_valid(response_obj_call, synthetic_tool_name=synth_tool_name):
+                if not is_gemini_response_valid(
+                    response_obj_call,
+                    synthetic_tool_name=synth_tool_name,
+                    prefill_text=prefill_text,
+                ):
                     print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                     err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
                     if synth_tool_name:
@@ -2103,6 +2279,7 @@ async def execute_unified_completion(
                 raise
             except Exception as e_call:
                 err_code, err_formatted = extract_upstream_error(e_call)
+                err_retry_after = extract_retry_after_seconds(e_call, err_formatted)
                 is_auth_or_billing = is_express_auth_or_billing_error(e_call, err_code)
                 is_retryable = is_retryable_exception(e_call)
 
@@ -2116,6 +2293,7 @@ async def execute_unified_completion(
             except Exception as e_cookie:
                 err_code = getattr(e_cookie, "status_code", None) or getattr(e_cookie, "code", None) or 500
                 err_formatted = getattr(e_cookie, "message", None) or str(e_cookie)
+                err_retry_after = extract_retry_after_seconds(e_cookie, err_formatted)
                 is_auth_or_billing = bool(getattr(e_cookie, "is_auth_or_billing", False))
                 is_retryable = bool(getattr(e_cookie, "is_retryable", False))
 
@@ -2142,7 +2320,9 @@ async def execute_unified_completion(
                     content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
                 )
             stats.add_retry()
-            wait_target = _jitter_backoff(backoff_sec)
+            wait_target = _compute_smart_retry_wait(
+                backoff_sec, target, next_target, err_retry_after
+            )
             print(
                 f"⚠️ [自动重试] 非流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
                 f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
