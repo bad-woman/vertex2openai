@@ -22,6 +22,7 @@ from synthetic_wrapper import (
     extract_raw_synthetic_text,
     extract_synthetic_content,
     is_content_json_path,
+    is_done_json_path,
     make_bad_woman_response_id,
     prefill_appears_repeated,
 )
@@ -985,6 +986,7 @@ class FunctionCallStreamAssembler:
         self.synthetic_halted: bool = False
         self._synth_eof_sealed: bool = False
         self._pending_is_synthetic: bool = False
+        self._saw_synth_partial: bool = False
         self._last_synth_path: str = ""
         self._synth_signature: Optional[bytes] = None
         self._turn_signature: Optional[bytes] = None
@@ -1022,8 +1024,17 @@ class FunctionCallStreamAssembler:
     def has_pending(self) -> bool:
         return self._pending is not None
 
+    def pop_synth_signature(self) -> Optional[bytes]:
+        """取出尚未随增量发出的合成工具思考签名（用于短回复在 flush_synthetic_tail 收尾时无损补挂签名）。"""
+        sig = self._synth_signature
+        self._synth_signature = None
+        return sig
+
     def flush_synthetic_tail(self) -> str:
         """冲刷合成工具滑动尾窗中剩余的文本（流结束时调用，执行 EOF 级词法感知修剪）。"""
+        self._saw_synth_partial = False
+        self._pending_is_synthetic = False
+        self._last_synth_path = ""
         if not self._synth_tail_buf:
             return ""
         raw = self._synth_tail_buf
@@ -1066,11 +1077,15 @@ class FunctionCallStreamAssembler:
         if self.synthetic_tool_name:
             if fc_name == self.synthetic_tool_name:
                 is_synth = True
-            elif not fc_name and self._pending_is_synthetic:
+            elif not fc_name and (self._pending_is_synthetic or self._synth_eof_sealed or self.synthetic_halted):
                 is_synth = True
 
         if is_synth:
             if self.synthetic_halted or self._synth_eof_sealed:
+                if thought_signature:
+                    self._synth_signature = thought_signature
+                    self._turn_signature = thought_signature
+                self._pending_is_synthetic = bool(fc_will_continue)
                 return [], "", None
 
             ready_real: List[Dict[str, Any]] = []
@@ -1088,6 +1103,7 @@ class FunctionCallStreamAssembler:
             has_args = isinstance(fc_args, dict) and len(fc_args) > 0
             has_partial = isinstance(fc_partial, list) and len(fc_partial) > 0
             synth_deltas: List[str] = []
+            saw_done_signal = False
 
             if has_partial:
                 for parg in fc_partial:
@@ -1099,12 +1115,16 @@ class FunctionCallStreamAssembler:
                     path_str = str(raw_path or "").strip() or self._last_synth_path
                     if path_str:
                         self._last_synth_path = path_str
+                    tokens = _parse_json_path_tokens(path_str)
+                    if is_done_json_path(tokens, path_str):
+                        saw_done_signal = True
+                        continue
                     has_val, val, _ = _extract_partial_arg_value(parg)
                     if has_val and isinstance(val, str) and val:
-                        tokens = _parse_json_path_tokens(path_str)
                         if is_content_json_path(tokens, path_str) or not tokens:
                             synth_deltas.append(val)
-            elif has_args:
+                            self._saw_synth_partial = True
+            elif has_args and not self._saw_synth_partial:
                 raw_extracted = extract_raw_synthetic_text(fc_args, emit_tool_name=self.synthetic_tool_name)
                 if raw_extracted:
                     synth_deltas.append(raw_extracted)
@@ -1113,11 +1133,12 @@ class FunctionCallStreamAssembler:
             if incoming_text:
                 self._synth_tail_buf += incoming_text
 
-            self._ensure_lex_seeded(force=(not fc_will_continue))
+            self._ensure_lex_seeded(force=(not fc_will_continue or saw_done_signal))
 
-            if not fc_will_continue:
-                # 合成工具本轮调用正常收敛结束：执行 EOF 级尾锚定词法修剪（不断流，保留后续 usage/tool_calls）
+            if not fc_will_continue or saw_done_signal:
+                # 合成工具本轮调用正常收敛结束（或已收到协议层 $.done 闭合信号）：执行 EOF 级尾锚定词法修剪（不断流，保留后续 usage/tool_calls）
                 self._last_synth_path = ""
+                self._saw_synth_partial = False
                 clean_buf, trimmed, _ = analyze_synthetic_tail(
                     self._synth_tail_buf,
                     emit_tool_name=self.synthetic_tool_name,
@@ -1126,7 +1147,7 @@ class FunctionCallStreamAssembler:
                 )
                 self._synth_tail_buf = ""
                 self._lex_state.feed(clean_buf)
-                if trimmed:
+                if trimmed or saw_done_signal:
                     self._synth_eof_sealed = True
                 sig_to_emit = self._synth_signature
                 self._synth_signature = None
@@ -1149,6 +1170,7 @@ class FunctionCallStreamAssembler:
             if halted:
                 self.synthetic_halted = True
                 self._pending_is_synthetic = False
+                self._saw_synth_partial = False
                 self._last_synth_path = ""
                 self._synth_tail_buf = ""
                 self._ensure_lex_seeded(force=True)
