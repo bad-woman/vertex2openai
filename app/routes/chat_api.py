@@ -94,6 +94,8 @@ async def _abort_placeholder(buf, stream_id: str, message: str, code: int = 500)
 async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest, api_key: str):
     stream_id, id_src = compute_stream_id(
         fastapi_request.headers, api_key or "", _request_fingerprint(request_obj))
+    start = _resume_start_seq(fastapi_request)
+    has_explicit_resume_cursor = (start > 0)
 
     buf, is_new = await resumable_store.create_if_absent(
         stream_id, model=request_obj.model, kind="stream")
@@ -102,12 +104,12 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
         or buf.fully_delivered
         or buf.status == "error"
         or (buf.done and not buf.has_model_output)
+        or (buf.done and buf.saw_midstream_error and not has_explicit_resume_cursor)
     ):
         await resumable_store.drop(stream_id)
         buf, is_new = await resumable_store.create_if_absent(
             stream_id, model=request_obj.model, kind="stream")
     if not is_new:
-        start = _resume_start_seq(fastapi_request)
         print(f"↩️ [续传命中] {stream_id}（{id_src}）：直接重放/续传，不再请求上游。")
         return StreamingResponse(
             sse_from_buffer(buf, start, fastapi_request=fastapi_request),
@@ -136,7 +138,6 @@ async def _resumable_stream(fastapi_request: Request, request_obj: OpenAIRequest
     resumable_store.register_pump(stream_id, pump_task)
     print(f"📦 [续传缓冲] {stream_id}（{id_src}）：后台泵已启动，支持弱网断线续传与首包前取消止损。")
 
-    start = _resume_start_seq(fastapi_request)
     return StreamingResponse(
         sse_from_buffer(buf, start, fastapi_request=fastapi_request),
         media_type="text/event-stream",
