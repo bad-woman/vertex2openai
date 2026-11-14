@@ -192,13 +192,18 @@ def build_emit_tool_declaration(
     emit_tool_name: str,
     for_cookie: bool = False,
 ) -> Dict[str, Any]:
-    """构建通用单字段 content 传输工具声明：
-    1. 全局固定官方标准描述，保证命中 Vertex 隐式前缀缓存并明确生命周期终止条件；
-    2. Express 模式使用 parameters_json_schema + additionalProperties: False；
-    3. Cookie 模式使用标准 parameters（不含 additionalProperties，防止 batchGraphql 校验拒绝）。
+    """构建有序双必填字段 (content + done) 抗截断传输工具声明：
+    1. 全局静态固定描述与 Schema，100% 保证命中 Vertex 隐式前缀缓存；
+    2. 协议级带外收敛：受限解码器（FSM）要求模型在写完 content 后必须闭合双引号去填写 `, "done": true}`，
+       为模型注意力提供确定性的结构出口台阶，从根源消除在一元 generateContent / 假流式 / 真流式下把外层容器括号幻觉进 content 或卡死未闭合的问题；
+    3. Express 模式使用 parameters_json_schema + propertyOrdering + additionalProperties: False；
+    4. Cookie 模式使用标准 parameters + propertyOrdering: ["content", "done"]（不含布尔型 additionalProperties，兼容 batchGraphql）。
     """
-    desc = "Deliver the complete user-visible reply as text; end the call when the requested content is complete."
-    content_desc = "The requested reply itself, preserving its language, sections, formatting and markup."
+    desc = "Deliver the complete user-visible reply as text, then set done to true to end the call."
+    content_desc = (
+        "The complete user-visible reply itself, preserving its language, code blocks, sections, formatting and markup."
+    )
+    done_desc = "Set to true immediately after content ends to finalize and close the call."
     base_schema: Dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -206,11 +211,17 @@ def build_emit_tool_declaration(
                 "type": "string",
                 "description": content_desc,
             },
+            "done": {
+                "type": "boolean",
+                "description": done_desc,
+            },
         },
-        "required": ["content"],
+        "required": ["content", "done"],
+        "propertyOrdering": ["content", "done"],
     }
     if not for_cookie and _SDK_SUPPORTS_PARAMS_JSON_SCHEMA:
-        json_schema = dict(base_schema)
+        json_schema = {k: v for k, v in base_schema.items() if k != "propertyOrdering"}
+        json_schema["propertyOrdering"] = ["content", "done"]
         json_schema["additionalProperties"] = False
         return {
             "name": emit_tool_name,
@@ -231,26 +242,26 @@ def build_sandbox_control_instruction(
     is_keep_turn: bool = False,
     has_callable_client_tools: bool = False,
 ) -> str:
-    """构建通用传输格式指令（含 0.13.1 防工具自检与防尾部重复填充约束）。"""
+    """构建通用传输格式指令（配合 content + done 双字段收敛约束，防工具自检与防尾部重复填充）。"""
     target_text = "only the new continuation text" if has_prefill else "the entire user-visible answer"
     if has_callable_client_tools:
         transport_head = (
             f"Transport format for this reply: put all user-visible text, if any, in exactly one call of {emit_tool_name}; "
-            f"its content string holds {target_text}, preserving all requested formatting, markup, language and sections. "
-            f"{emit_tool_name} only transports text and performs no external action. "
+            f"its content string holds {target_text} (preserving all requested formatting, code blocks, markup, language and sections), "
+            f"then set done to true. {emit_tool_name} only transports text and performs no external action. "
             f"Call the other tools whenever the task needs them, with or without {emit_tool_name}."
         )
     else:
         transport_head = (
             f"Transport format for this reply: call {emit_tool_name} exactly once. "
-            f"Put {target_text} in its content string, preserving all requested formatting, markup, language and sections. "
-            f"The function only transports text and performs no external action."
+            f"Put {target_text} in its content string (preserving all requested formatting, code blocks, markup, language and sections), "
+            f"then set done to true. The function only transports text and performs no external action."
         )
 
     transport_tail = (
         " This transport does not change the task. Do not add unsolicited commentary about this transport, "
-        "tool selection or serialization. Once the requested content is complete, end the call without repeating "
-        "finished content or adding filler. Preserve repetition explicitly requested by the task."
+        "tool selection or serialization. Once the requested content is complete, close the content string and set done to true "
+        "immediately without repeating finished content or adding filler. Preserve repetition explicitly requested by the task."
     )
     transport_line = transport_head + transport_tail
 
@@ -265,6 +276,72 @@ def build_sandbox_control_instruction(
         return f"{cot_line}\n{transport_line}"
 
     return transport_line
+
+
+def supports_stream_fc_args(model_name: str, check_sdk: bool = True) -> bool:
+    """按 Google Vertex AI 官方规范判断模型与 SDK 是否支持 streamFunctionCallArguments。
+    官方文档明确：Gemini 3+ / 4+ 文本模型（含 3.5-flash-lite）均支持，唯独 gemini-3.1-flash-lite 与生图模型不支持；
+    且该参数仅可用于流式接口 streamGenerateContent，不可传入一元 generateContent。
+    """
+    if check_sdk and not _SDK_SUPPORTS_STREAM_FC_ARGS:
+        return False
+    prof = mc.get_profile(model_name or "")
+    return bool(prof.get("supports_stream_fc_args", False) and not prof.get("is_image", False))
+
+
+def strip_stream_fc_args_from_config(gen_config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """返回剥离了 stream_function_call_arguments 的配置字典副本（供一元 generate_content 或不支持该特性的模型降级使用）。"""
+    if not isinstance(gen_config_dict, dict):
+        return gen_config_dict
+    tc = gen_config_dict.get("tool_config")
+    if not isinstance(tc, dict):
+        return gen_config_dict
+    fcc = tc.get("function_calling_config")
+    if not isinstance(fcc, dict) or (
+        "stream_function_call_arguments" not in fcc and "streamFunctionCallArguments" not in fcc
+    ):
+        return gen_config_dict
+    new_fcc = {
+        k: v
+        for k, v in fcc.items()
+        if k not in ("stream_function_call_arguments", "streamFunctionCallArguments")
+    }
+    new_tc = dict(tc)
+    new_tc["function_calling_config"] = new_fcc
+    new_cfg = dict(gen_config_dict)
+    new_cfg["tool_config"] = new_tc
+    return new_cfg
+
+
+def is_stream_fc_args_unsupported_error(err: Any) -> bool:
+    """识别上游返回的“不支持 stream_function_call_arguments”协议错误（用于无损剥离该标志重试，同时保留抗截断工具）。"""
+    s = f"{getattr(err, 'status', '')} {getattr(err, 'message', '')} {err}".lower()
+    has_field_hint = any(
+        k in s
+        for k in (
+            "stream_function_call_arguments",
+            "streamfunctioncallarguments",
+            "streaming function call",
+            "partial_args",
+            "partialargs",
+        )
+    )
+    if not has_field_hint:
+        return False
+    return any(
+        r in s
+        for r in (
+            "not supported",
+            "unsupported",
+            "unknown field",
+            "unknown name",
+            "unrecognized",
+            "invalid argument",
+            "invalid_argument",
+            "cannot",
+            "only supported",
+        )
+    )
 
 
 def inject_express_gen_config(
@@ -293,8 +370,8 @@ def inject_express_gen_config(
     fc_cfg: Dict[str, Any] = {"mode": "ANY"}
     if not spec.real_tool_names:
         fc_cfg["allowed_function_names"] = [spec.emit_tool_name]
-        if enable_stream_fc_args and _SDK_SUPPORTS_STREAM_FC_ARGS:
-            fc_cfg["stream_function_call_arguments"] = True
+    if enable_stream_fc_args and _SDK_SUPPORTS_STREAM_FC_ARGS:
+        fc_cfg["stream_function_call_arguments"] = True
 
     gen_config_dict["tool_config"] = {"function_calling_config": fc_cfg}
 
@@ -1035,8 +1112,12 @@ def _unwrap_nested_json_if_needed(text: str, emit_tool_name: str = DEFAULT_SYNTH
             parsed = json.loads(s)
             if isinstance(parsed, dict) and parsed:
                 keys = set(parsed.keys())
-                # 情况 1: 纯单键 {"content": "..."} 双重序列化
-                if keys == {"content"} and isinstance(parsed.get("content"), str) and parsed["content"]:
+                # 情况 1: 纯单键 {"content": "..."} 或双键 {"content": "...", "done": true} 双重序列化
+                if (
+                    keys in ({"content"}, {"content", "done"})
+                    and isinstance(parsed.get("content"), str)
+                    and parsed["content"]
+                ):
                     return parsed["content"]
                 # 情况 2: 显式携带合成工具名的自包装对象 {"name": "compose_reply", "arguments": ...}
                 p_name = str(parsed.get("name") or parsed.get("tool") or "").strip()
@@ -1098,3 +1179,10 @@ def is_content_json_path(path_tokens: List[Any], raw_path: str = "") -> bool:
         return str(path_tokens[0]) in CONTENT_KEYS
     low = (raw_path or "").lower()
     return any(k in low for k in CONTENT_KEYS)
+
+
+def is_done_json_path(path_tokens: List[Any], raw_path: str = "") -> bool:
+    if path_tokens:
+        return str(path_tokens[0]).lower() in ("done", "is_finished")
+    low = (raw_path or "").strip().lower()
+    return low in ("$.done", ".done", "done", "$.is_finished", ".is_finished", "is_finished")
