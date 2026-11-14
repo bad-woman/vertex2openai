@@ -126,6 +126,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
             "image_aspect_ratios": _IMAGE_ARS,
             "image_sizes": sizes,
             "supports_search": True,
+            "supports_stream_fc_args": False,
+            "max_nonstream_output_tokens": None,
             "requires_user_last_turn": True,
         }
 
@@ -149,6 +151,11 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     temp_dep = _temp_deprecated(name)
     if temp_dep:
         allowed -= {"temperature", "top_p", "top_k"}
+    supports_sfc = bool(major >= 3 and not (major == 3 and minor == 1 and "flash-lite" in name))
+    # Gemini 4 非流式/假流式输出上限：仅 4-hydrogen 支持 64K (65536)，4-argon / 4-carbon 等最高为 32K (32768)
+    max_nonstream_tokens: Optional[int] = None
+    if major >= 4:
+        max_nonstream_tokens = 65536 if "hydrogen" in name else 32768
     return {
         "family": family,
         "is_image": False,
@@ -159,6 +166,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         "allowed_sampling": allowed,
         "sampling_advice": "deprecated" if temp_dep else "recommend_default",
         "supports_search": True,
+        "supports_stream_fc_args": supports_sfc,
+        "max_nonstream_output_tokens": max_nonstream_tokens,
         "requires_user_last_turn": True,
     }
 
@@ -349,6 +358,33 @@ def validate_aspect_ratio(model_name: str, ar: Optional[str]) -> Optional[str]:
         return None
     norm = str(ar).replace("：", ":").strip()
     return norm if norm in prof["image_aspect_ratios"] else None
+
+
+def clamp_max_output_tokens(
+    model_name: str,
+    max_tokens: Any,
+    is_real_stream: bool,
+) -> Optional[int]:
+    """按模型家族与真实传输模式安全夹紧 max_output_tokens：
+    - 真流式（streamGenerateContent）：保持原值（Gemini 4 全系流式支持 64K，SDK >= 2.30.0 超 64K 自动 Long Decode）；
+    - 非流式与假流式（底层调用一元 generateContent）：
+        • gemini-4-hydrogen 最高 65536 (64K)；
+        • gemini-4-argon / gemini-4-carbon 等其他 4.x 最高 32768 (32K)，防止酒馆拉满 64K 触发上游 400 或未闭合截断。
+    """
+    if max_tokens is None:
+        return None
+    try:
+        val = int(max_tokens)
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    if not is_real_stream:
+        prof = get_profile(model_name)
+        cap = prof.get("max_nonstream_output_tokens")
+        if isinstance(cap, int) and val > cap:
+            return cap
+    return val
 
 
 def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -84,7 +84,7 @@ def is_error_frame(text: str) -> bool:
         delta = (choices[0] or {}).get("delta") or {}
         content = delta.get("content") or ""
         if isinstance(content, str) and any(
-            tag in content for tag in ("[Studio 错误]", "[Studio 权限错误]", "[Studio 提示] 上游")
+            tag in content for tag in ("[Studio 错误]", "[Studio API 错误]", "[Studio 权限错误]", "[Studio 提示] 上游")
         ):
             return True
     return False
@@ -139,7 +139,10 @@ class ResumableBuffer:
         self.payload: Optional[dict] = None
         self.status_code: int = 200
         self.fully_delivered = False
+        self.delivered_at: Optional[float] = None
         self.has_model_output = False
+        self.saw_midstream_error = False
+        self.byte_size: int = 0
         self.readers = 0
         self.last_reader_left_at: Optional[float] = None
         self._cond = asyncio.Condition()
@@ -149,6 +152,7 @@ class ResumableBuffer:
             if is_model_output:
                 self.has_model_output = True
             self.events.append(frame)
+            self.byte_size += len(frame.encode("utf-8", errors="ignore"))
             self._cond.notify_all()
             return len(self.events) - 1
 
@@ -159,6 +163,10 @@ class ResumableBuffer:
             self.error = error
             if payload is not None:
                 self.payload = payload
+                try:
+                    self.byte_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                except Exception:
+                    pass
             if status_code is not None:
                 self.status_code = status_code
             self.finished_at = time.time()
@@ -227,7 +235,8 @@ class ResumableBuffer:
 
     def mark_delivered(self) -> None:
         self.fully_delivered = True
-        self.last_access = time.time()
+        self.delivered_at = time.time()
+        self.last_access = self.delivered_at
 
     def meta(self) -> dict:
         return {
@@ -237,10 +246,12 @@ class ResumableBuffer:
             "status": self.status,
             "error": self.error,
             "events": len(self.events),
+            "bytes": self.byte_size,
             "next": len(self.events),
             "done": self.done,
             "fully_delivered": self.fully_delivered,
             "has_model_output": self.has_model_output,
+            "saw_midstream_error": self.saw_midstream_error,
             "readers": self.readers,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
@@ -300,7 +311,13 @@ class ResumableStore:
 
     def register_pump(self, stream_id: str, task: asyncio.Task) -> None:
         self._pumps[stream_id] = task
-        task.add_done_callback(lambda _t, sid=stream_id: self._pumps.pop(sid, None))
+
+        def _cleanup_done(done_task: asyncio.Task, sid: str = stream_id) -> None:
+            # 仅当当前注册表中的任务仍是自己时才移除，防止新请求覆盖同 stream_id 后被旧任务的回调误删！
+            if self._pumps.get(sid) is done_task:
+                self._pumps.pop(sid, None)
+
+        task.add_done_callback(_cleanup_done)
 
     def cancel_all_pumps(self) -> None:
         for task in list(self._pumps.values()):
@@ -310,15 +327,22 @@ class ResumableStore:
 
     async def _evict_locked(self) -> None:
         limit = max_streams()
-        if len(self._buffers) <= limit:
+        max_total_bytes = 64 * 1024 * 1024  # 64MB 全局内存软顶保护（防超大图生图 base64 驻留撑爆容器）
+        total_bytes = sum(b.byte_size for b in self._buffers.values())
+        if len(self._buffers) <= limit and total_bytes <= max_total_bytes:
             return
-        finished = sorted((b for b in self._buffers.values() if b.done and b.readers == 0),
-                          key=lambda x: x.finished_at or x.created_at)
+        # 优先淘汰「客户端已完整签收 (fully_delivered)」的已完成缓冲，其次再淘汰尚未签收的旧已完成缓冲
+        finished = sorted(
+            (b for b in self._buffers.values() if b.done and b.readers == 0),
+            key=lambda x: (0 if x.fully_delivered else 1, x.finished_at or x.created_at),
+        )
         for buf in finished:
-            if len(self._buffers) <= limit:
+            if len(self._buffers) <= limit and total_bytes <= max_total_bytes:
                 return
             self._cancel_pump_locked(buf.id)
-            self._buffers.pop(buf.id, None)
+            removed_buf = self._buffers.pop(buf.id, None)
+            if removed_buf is not None:
+                total_bytes -= removed_buf.byte_size
         while len(self._buffers) > limit:
             oldest = min(self._buffers.values(), key=lambda x: x.created_at)
             self._cancel_pump_locked(oldest.id)
@@ -337,6 +361,11 @@ class ResumableStore:
                     self._cancel_pump_locked(sid)
                     self._buffers.pop(sid, None)
                     removed += 1
+                elif buf.done and buf.fully_delivered and (now - (buf.delivered_at or ref)) > min(ttl, 60.0):
+                    # 客户端已完整收完 [DONE] 的缓冲无需傻留 30 分钟，60 秒后自动释放内存
+                    self._cancel_pump_locked(sid)
+                    self._buffers.pop(sid, None)
+                    removed += 1
                 elif buf.done and (now - ref) > ttl:
                     self._cancel_pump_locked(sid)
                     self._buffers.pop(sid, None)
@@ -347,7 +376,7 @@ class ResumableStore:
                     removed += 1
             await self._evict_locked()
         if removed:
-            print(f"🧹 [续传缓冲] 已清理 {removed} 个过期响应缓冲。")
+            print(f"🧹 [续传缓冲] 已清理 {removed} 个过期或已签收的响应缓冲。")
         return removed
 
     async def sweeper_loop(self, interval: float = 60.0) -> None:
@@ -410,6 +439,7 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
             err_frame = is_error_frame(text)
             if err_frame:
                 saw_error = True
+                buf.saw_midstream_error = True
             is_real_output = is_real_output_frame(text)
             await buf.append(frame_with_id(buf.next_seq, text), is_model_output=is_real_output)
 
@@ -420,15 +450,22 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
             await buf.finish("error", error="上游返回错误响应，未产出有效内容。")
             await resumable_store.drop(buf.id)
             print(f"⚠️ [续传缓冲] {buf.id} 上游返回错误且无有效内容，已清除该缓冲以便下次重试重新请求。")
+        elif saw_error:
+            # 半截断流报错：保留缓冲供携带 Last-Event-ID 的断线重连拉完剩余帧，但标记 saw_midstream_error 以便酒馆全新重Roll时重新请求上游
+            await buf.finish("done", error="流式传输中途发生中断或错误。")
+            print(f"⚠️ [续传缓冲] {buf.id} 流中途发生错误（已保留已产出的 {len(buf.events)} 帧供续传，全新重试将自动重请求上游）。")
         else:
             await buf.finish("done")
-            print(f"📦 [续传缓冲] {buf.id} 上游已读完，共 {len(buf.events)} 个事件已完整落缓冲。")
+            print(f"📦 [续传缓冲] {buf.id} 上游已读完，共 {len(buf.events)} 个事件（{buf.byte_size / 1024:.1f} KB）已落缓冲。")
     except asyncio.CancelledError:
         await buf.finish("error", error="上游读取任务已取消。")
-        await resumable_store.drop(buf.id)
+        async with resumable_store._lock:
+            if resumable_store._buffers.get(buf.id) is buf:
+                resumable_store._buffers.pop(buf.id, None)
         raise
     except Exception as e:
         msg = f"{type(e).__name__} - {e}"
+        buf.saw_midstream_error = True
         print(f"❌ [续传缓冲] {buf.id} 上游读取失败：{msg}")
         err = {"error": {"message": str(e)[:1024], "type": "upstream_error", "code": 500}}
         await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
@@ -449,8 +486,11 @@ async def _cancel_if_abandoned(buf: ResumableBuffer, grace_seconds: float = 1.5)
     try:
         await asyncio.sleep(grace_seconds)
         if buf.readers <= 0 and not buf.done and not buf.has_model_output:
-            print(f"🛑 [客户端取消] {buf.id} 前端已断开且尚未产出内容，立即终止后台上游请求与重试。")
-            await resumable_store.drop(buf.id)
+            async with resumable_store._lock:
+                if resumable_store._buffers.get(buf.id) is buf:
+                    print(f"🛑 [客户端取消] {buf.id} 前端已断开且尚未产出内容，立即终止后台上游请求与重试。")
+                    resumable_store._cancel_pump_locked(buf.id)
+                    resumable_store._buffers.pop(buf.id, None)
     except asyncio.CancelledError:
         pass
     except Exception:

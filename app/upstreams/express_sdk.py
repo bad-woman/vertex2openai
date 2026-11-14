@@ -25,7 +25,7 @@ import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
-from synthetic_wrapper import create_sandbox_spec, inject_express_gen_config
+from synthetic_wrapper import create_sandbox_spec, inject_express_gen_config, supports_stream_fc_args
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool]:
@@ -256,10 +256,12 @@ class ExpressSDKUpstream(BaseUpstream):
         if sandbox_spec.enabled:
             _fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
             _real_stream = bool(request_obj.stream and not _fake_on and not is_image_model)
-            inject_express_gen_config(gen_config_dict, sandbox_spec, enable_stream_fc_args=_real_stream)
+            _use_stream_fc = bool(_real_stream and supports_stream_fc_args(base_model_name))
+            inject_express_gen_config(gen_config_dict, sandbox_spec, enable_stream_fc_args=_use_stream_fc)
+            _mode_label = "真流式" if _real_stream else ("假流式·原生一元" if request_obj.stream else "非流式·原生一元")
             print(
-                f"🛡️ [抗截断] Express 通道已启用工具传输 | 工具={sandbox_spec.emit_tool_name}"
-                + (" | 流式参数分片=已启用" if _real_stream else "")
+                f"🛡️ [抗截断] Express 通道已启用工具传输 | 工具={sandbox_spec.emit_tool_name} | 模式={_mode_label}"
+                + (" | 流式参数分片=已启用" if _use_stream_fc else "")
             )
 
         prompt_func = partial(
