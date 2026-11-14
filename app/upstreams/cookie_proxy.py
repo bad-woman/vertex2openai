@@ -51,6 +51,7 @@ from synthetic_wrapper import (
     create_sandbox_spec,
     extract_synthetic_content,
     make_bad_woman_response_id,
+    supports_stream_fc_args,
 )
 
 from cookie_auth import (
@@ -493,6 +494,22 @@ def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[
     return {"functionCallingConfig": config}
 
 
+def _stream_fc_args_error(error_msg: str) -> bool:
+    lower = (error_msg or "").lower()
+    stream_terms = (
+        "streamfunctioncallarguments",
+        "stream_function_call_arguments",
+        "streaming function call",
+        "partialargs",
+        "partial_args",
+    )
+    reject_terms = (
+        "unsupported", "not supported", "unknown field", "unknown name", "unrecognized",
+        "invalid argument", "invalid value", "cannot use", "not enabled", "only supported",
+    )
+    return any(term in lower for term in stream_terms) and any(term in lower for term in reject_terms)
+
+
 def _native_tool_error(error_msg: str) -> bool:
     lower = (error_msg or "").lower()
     tool_terms = ("functiondeclaration", "function declaration", "functioncallingconfig",
@@ -813,6 +830,7 @@ async def build_batch_graphql_body_async(
     force_search: bool = False,
     native_tools: bool = True,
     sandbox_spec: Optional[SyntheticSandboxSpec] = None,
+    enable_stream_fc_args: bool = False,
 ) -> dict:
     return await asyncio.to_thread(
         _build_batch_graphql_body,
@@ -823,6 +841,7 @@ async def build_batch_graphql_body_async(
         force_search,
         native_tools,
         sandbox_spec,
+        enable_stream_fc_args,
     )
 
 
@@ -834,6 +853,7 @@ def _build_batch_graphql_body(
     force_search: bool = False,
     native_tools: bool = True,
     sandbox_spec: Optional[SyntheticSandboxSpec] = None,
+    enable_stream_fc_args: bool = False,
 ) -> dict:
     contents, system_text = _convert_messages_to_contents(
         request.messages, model_name=model_name, native_tools=native_tools
@@ -876,12 +896,11 @@ def _build_batch_graphql_body(
             if mv is None:
                 mv = settings.get("default_max_tokens")
             if mv is not None:
-                if re.search(r"(?:^|/)gemini-4-", (model_name or "").lower()):
-                    try:
-                        mv = min(int(mv), 65536)
-                    except (TypeError, ValueError):
-                        pass
-                gen_config["maxOutputTokens"] = mv
+                _fake_on_c = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
+                _is_real_stream_c = bool(getattr(request, "stream", False) and not _fake_on_c)
+                _clamped_mv = mc.clamp_max_output_tokens(model_name or "", mv, is_real_stream=_is_real_stream_c)
+                if _clamped_mv is not None:
+                    gen_config["maxOutputTokens"] = _clamped_mv
 
         thinking_config = _build_thinking_config(model_name, request, prefill_active=prefill_active)
         if thinking_config:
@@ -952,6 +971,8 @@ def _build_batch_graphql_body(
         fc_cfg: Dict[str, Any] = {"mode": "ANY"}
         if not sandbox_spec.real_tool_names:
             fc_cfg["allowedFunctionNames"] = [sandbox_spec.emit_tool_name]
+        if enable_stream_fc_args and supports_stream_fc_args(model_name, check_sdk=False):
+            fc_cfg["streamFunctionCallArguments"] = True
         variables["tools"] = [{"functionDeclarations": base_decls}]
         variables["toolConfig"] = {
             "functionCallingConfig": fc_cfg,
@@ -1088,6 +1109,11 @@ def _extract_from_results(obj: dict):
     if "error" in obj:
         yield ("error", obj["error"])
         return
+    if isinstance(obj.get("errors"), list) and obj["errors"]:
+        for top_err in obj["errors"]:
+            yield ("error", top_err)
+        if not obj.get("results"):
+            return
 
     results = obj.get("results", [])
     for result in results:
@@ -1200,6 +1226,36 @@ def _record_studio_usage(usage_meta: dict | None) -> dict:
 
 # ========== OpenAI SSE 格式化 ==========
 
+def _append_merged_ordinary_meta(
+    ordinary_list: list,
+    order_list: list,
+    metadata: dict,
+) -> int:
+    """合并相邻同类型（text / thought）普通增量块，消除流式上千碎字典膨胀，并仅在收尾时发出唯一一次。"""
+    kind = metadata.get("kind")
+    if (
+        ordinary_list
+        and order_list
+        and order_list[-1].get("type") == "ordinary"
+        and order_list[-1].get("index") == len(ordinary_list) - 1
+        and kind in ("text", "thought")
+        and ordinary_list[-1].get("kind") == kind
+        and not (ordinary_list[-1].get("thought_signature") and metadata.get("thought_signature"))
+    ):
+        prev = ordinary_list[-1]
+        add_txt = metadata.get("text") or ""
+        if add_txt:
+            prev["text"] = (prev.get("text") or "") + add_txt
+        if metadata.get("thought_signature") and not prev.get("thought_signature"):
+            prev["thought_signature"] = metadata["thought_signature"]
+        return len(ordinary_list) - 1
+
+    idx = len(ordinary_list)
+    ordinary_list.append(dict(metadata))
+    order_list.append({"type": "ordinary", "index": idx})
+    return idx
+
+
 def _make_openai_chunk(
     response_id: str,
     model: str,
@@ -1297,6 +1353,9 @@ async def _execute_stream_request_generator_once(
                     yield "cookie_error", formatted_err + hint
                     return
 
+                if _stream_fc_args_error(clean_msg):
+                    yield "stream_fc_args_unsupported", formatted_err
+                    return
                 if _native_tool_error(clean_msg):
                     yield "native_tool_unsupported", formatted_err
                     return
@@ -1320,6 +1379,9 @@ async def _execute_stream_request_generator_once(
                         diag = _diagnose_studio_error(clean_msg, 200)
                         formatted_err = f"{diag} — {clean_msg}"
 
+                        if _stream_fc_args_error(clean_msg) and not has_content:
+                            yield "stream_fc_args_unsupported", formatted_err
+                            return
                         if _native_tool_error(clean_msg) and not has_content:
                             yield "native_tool_unsupported", formatted_err
                             return
@@ -1349,6 +1411,29 @@ async def _execute_stream_request_generator_once(
             yield "api_error_text", f"连接中断 ({err_msg})"
 
 
+def _strip_stream_fc_args_in_graphql_body(body: dict) -> Optional[dict]:
+    """剥离 batchGraphql 请求体中的 streamFunctionCallArguments（供模型或接口不支持分片参数时无损保留 compose_reply 重试）。"""
+    if not isinstance(body, dict):
+        return None
+    vars_dict = body.get("variables")
+    if not isinstance(vars_dict, dict):
+        return None
+    tc = vars_dict.get("toolConfig")
+    if not isinstance(tc, dict):
+        return None
+    fcc = tc.get("functionCallingConfig")
+    if not isinstance(fcc, dict) or "streamFunctionCallArguments" not in fcc:
+        return None
+    new_fcc = {k: v for k, v in fcc.items() if k != "streamFunctionCallArguments"}
+    new_tc = dict(tc)
+    new_tc["functionCallingConfig"] = new_fcc
+    new_vars = dict(vars_dict)
+    new_vars["toolConfig"] = new_tc
+    new_body = dict(body)
+    new_body["variables"] = new_vars
+    return new_body
+
+
 async def _execute_stream_request_generator(
     client: httpx.AsyncClient,
     headers: dict,
@@ -1357,22 +1442,42 @@ async def _execute_stream_request_generator(
     fallback_body: Any = None,
     fallback_state: Optional[dict] = None,
 ) -> AsyncGenerator[tuple[str, Any], None]:
-    async for status, data in _execute_stream_request_generator_once(client, headers, body, sampler):
-        if status != "native_tool_unsupported":
+    active_body = body
+    for _step in range(3):
+        retry_mode = None
+        last_err_data = None
+        async for status, data in _execute_stream_request_generator_once(client, headers, active_body, sampler):
+            if status == "stream_fc_args_unsupported":
+                stripped = _strip_stream_fc_args_in_graphql_body(active_body)
+                if stripped is not None:
+                    print("⚠️ [Studio 抗截断兼容] 上游不支持 streamFunctionCallArguments，已自动剥离分片参数标志并保持 compose_reply 重试。")
+                    active_body = stripped
+                    retry_mode = "stripped_sfc"
+                    break
+                status = "native_tool_unsupported"
+            if status == "native_tool_unsupported":
+                last_err_data = data
+                retry_mode = "fallback_no_tools"
+                break
             yield status, data
+
+        if retry_mode == "stripped_sfc":
             continue
-        if fallback_body is None:
-            yield "fatal_error", data
+        if retry_mode == "fallback_no_tools":
+            if fallback_body is None:
+                yield "fatal_error", last_err_data
+                return
+            if fallback_state is not None:
+                fallback_state["latched"] = True
+            resolved_fallback = fallback_body() if callable(fallback_body) else fallback_body
+            if hasattr(resolved_fallback, "__await__"):
+                resolved_fallback = await resolved_fallback
+            print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
+            async for fallback_status, fallback_data in _execute_stream_request_generator_once(
+                client, headers, resolved_fallback, sampler
+            ):
+                yield fallback_status, fallback_data
             return
-        if fallback_state is not None:
-            fallback_state["latched"] = True
-        resolved_fallback = fallback_body() if callable(fallback_body) else fallback_body
-        if hasattr(resolved_fallback, "__await__"):
-            resolved_fallback = await resolved_fallback
-        print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；本次及后续重试固定降级为文本工具观测。")
-        async for fallback_status, fallback_data in _execute_stream_request_generator_once(
-                client, headers, resolved_fallback, sampler):
-            yield fallback_status, fallback_data
         return
 
 
@@ -1381,139 +1486,169 @@ async def _collect_full_response_once(
     fastapi_request, prefill_active: bool = False,
     force_search: bool = False, strip_thoughts: bool = False,
     sandbox_spec: Optional[SyntheticSandboxSpec] = None,
+    fallback_body: Any = None,
 ) -> dict:
-    """单次取回 batchGraphql 完整响应（供假流式与生图使用，重试交由外层统一调度器）。"""
+    """流式取回 batchGraphql 完整响应（供假流式与生图使用）：
+    采用 client.stream 边收边喂给 FunctionCallStreamAssembler，遇到闭合死循环时毫秒级主动断流止损，
+    且即便撞上 max_output_tokens 未闭合外层 JSON，也能完整保住已流式接收的全部正文。
+    """
     if await fastapi_request.is_disconnected():
         return {"kind": "cancelled", "message": "客户端已断开连接。"}
     try:
-        body = await build_batch_graphql_body_async(
-            project_id, base_model_name, request_obj,
-            prefill_active=prefill_active, force_search=force_search,
-            sandbox_spec=sandbox_spec,
-        )
-        req_headers = build_headers(_get_cookie_string()) or headers
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
-
-        if response.status_code != 200:
-            clean_msg = _extract_clean_error_message(response.text)
-            diag = _diagnose_studio_error(clean_msg, response.status_code)
-            is_auth = (
-                response.status_code in (401, 403)
-                or _is_cookie_expired_error(clean_msg)
-                or _is_project_error(clean_msg)
+        async def _collect_full_response_once_impl() -> dict:
+            if await fastapi_request.is_disconnected():
+                return {"kind": "cancelled", "message": "客户端已断开连接。"}
+            body = await build_batch_graphql_body_async(
+                project_id, base_model_name, request_obj,
+                prefill_active=prefill_active, force_search=force_search,
+                sandbox_spec=sandbox_spec, enable_stream_fc_args=False,
             )
-            hint = _get_auth_or_project_hint(clean_msg, response.status_code) if is_auth else ""
-            is_ret = (not is_auth) and (
-                response.status_code in (429, 500, 502, 503, 504) or _is_retryable_error(clean_msg)
-            )
-            return {
-                "kind": "cookie_error" if is_auth else ("retryable_error" if is_ret else "fatal_error"),
-                "status_code": response.status_code,
-                "message": f"HTTP {response.status_code}（{diag}）：{clean_msg}{hint}",
-            }
+            req_headers = build_headers(_get_cookie_string()) or headers
+            fb_latched = False
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
+                if (sandbox_spec and sandbox_spec.enabled or fallback_body is not None) and _native_tool_error_response(
+                    response.status_code, response.text
+                ) and fallback_body is not None:
+                    fb_latched = True
+                    resolved_fb = fallback_body() if callable(fallback_body) else fallback_body
+                    if hasattr(resolved_fb, "__await__"):
+                        resolved_fb = await resolved_fb
+                    print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；已自动剥离控制指令并降级为纯文本观测。")
+                    response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fb)
 
-        full_text, reasoning_text, retry_error, fatal_error, auth_error, usage_meta = "", "", None, None, None, None
-        finish_raw, blocked_msg = None, None
-        safety_html = ""
-        sampler = _RawSampler()
-        synth_tool_name = sandbox_spec.emit_tool_name if (sandbox_spec and sandbox_spec.enabled) else ""
-        synth_prefill = sandbox_spec.prefill_text if sandbox_spec else ""
-        fc_assembler = FunctionCallStreamAssembler(
-            synthetic_tool_name=synth_tool_name, prefill_text=synth_prefill
-        )
-        synth_text = ""
-
-        class _F:
-            def __init__(self, t):
-                self._t = t
-            async def aiter_text(self):
-                yield self._t
-
-        pending_img_bytes: list[bytes] = []
-        async for obj in _iter_json_objects(_F(response.text)):
-            sampler.add(obj)
-            for et, data in _extract_from_results(obj):
-                if et == "text":
-                    full_text += data
-                elif et == "thought":
-                    reasoning_text += data
-                elif et == "image":
-                    img_md = data["markdown"] if isinstance(data, dict) else str(data)
-                    img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
-                    if img_b:
-                        pending_img_bytes.append(img_b)
-                    full_text += img_md
-                elif et == "thought_signature":
-                    sig_b = _signature_bytes_from_wire(data.get("value"))
-                    if sig_b and pending_img_bytes:
-                        for ib in pending_img_bytes:
-                            if not image_signature_store.get(ib):
-                                image_signature_store.put(ib, sig_b)
-                elif et == "function_call":
-                    _, s_delta, _ = fc_assembler.feed_with_synthetic(data)
-                    if s_delta:
-                        synth_text += s_delta
-                elif et == "finish":
-                    finish_raw = data
-                elif et == "safety":
-                    safety_html = _safety_html_if_enabled(data)
-                elif et == "blocked":
-                    blocked_msg = data
-                elif et == "usage":
-                    usage_meta = data
-                elif et == "error":
-                    clean_em = _extract_clean_error_message(data)
-                    diag = _diagnose_studio_error(clean_em, 200)
-                    if (_is_cookie_expired_error(clean_em) or _is_project_error(clean_em)) and not full_text.strip():
-                        hint = _get_auth_or_project_hint(clean_em, 200)
-                        auth_error = f"{diag} — {clean_em}{hint}"
-                        break
-                    if _is_retryable_error(clean_em) and not full_text.strip():
-                        retry_error = f"{diag} — {clean_em}"
-                        break
-                    fatal_error = f"{diag} — {clean_em}"
-
-        tail_text = fc_assembler.flush_synthetic_tail()
-        if tail_text:
-            synth_text += tail_text
-        for c_item in fc_assembler.flush():
-            if synth_tool_name and c_item.get("name") == synth_tool_name:
-                synth_text += extract_synthetic_content(
-                    c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=synth_prefill
+            if response.status_code != 200:
+                clean_msg = _extract_clean_error_message(response.text)
+                diag = _diagnose_studio_error(clean_msg, response.status_code)
+                is_auth = (
+                    response.status_code in (401, 403)
+                    or _is_cookie_expired_error(clean_msg)
+                    or _is_project_error(clean_msg)
                 )
-        if synth_text:
-            full_text = synth_text
+                hint = _get_auth_or_project_hint(clean_msg, response.status_code) if is_auth else ""
+                is_ret = (not is_auth) and (
+                    response.status_code in (429, 500, 502, 503, 504) or _is_retryable_error(clean_msg)
+                )
+                return {
+                    "kind": "cookie_error" if is_auth else ("retryable_error" if is_ret else "fatal_error"),
+                    "status_code": response.status_code,
+                    "message": f"HTTP {response.status_code}（{diag}）：{clean_msg}{hint}",
+                }
 
-        if auth_error and not full_text.strip():
-            return {"kind": "cookie_error", "status_code": 403, "message": auth_error}
-        if retry_error and not full_text.strip():
-            return {"kind": "retryable_error", "status_code": 503, "message": retry_error}
-        if fatal_error and not full_text.strip():
-            return {"kind": "fatal_error", "status_code": 400, "message": fatal_error}
+            full_text, reasoning_text, retry_error, fatal_error, auth_error, usage_meta = "", "", None, None, None, None
+            finish_raw, blocked_msg = None, None
+            safety_html = ""
+            sampler = _RawSampler()
+            synth_tool_name = (
+                sandbox_spec.emit_tool_name
+                if (sandbox_spec and sandbox_spec.enabled and not fb_latched)
+                else ""
+            )
+            synth_prefill = sandbox_spec.prefill_text if sandbox_spec else ""
+            fc_assembler = FunctionCallStreamAssembler(
+                synthetic_tool_name=synth_tool_name, prefill_text=synth_prefill
+            )
+            synth_text = ""
 
-        if not full_text.strip():
-            detail = f"finishReason={finish_raw or '无'}"
-            if blocked_msg:
-                detail += f"；promptFeedback 拦截：{blocked_msg}"
-            print(f"🔎 [Studio 诊断] 模型={base_model_name} 假流式无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
-            is_synth_retry = bool(synth_tool_name and not blocked_msg)
+            class _F:
+                def __init__(self, t):
+                    self._t = t
+                async def aiter_text(self):
+                    yield self._t
+
+            pending_img_bytes: list[bytes] = []
+            async for obj in _iter_json_objects(_F(response.text)):
+                sampler.add(obj)
+                for et, data in _extract_from_results(obj):
+                    if et == "text":
+                        if fc_assembler.synthetic_hit:
+                            continue
+                        full_text += data
+                    elif et == "thought":
+                        reasoning_text += data
+                    elif et == "image":
+                        img_md = data["markdown"] if isinstance(data, dict) else str(data)
+                        img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
+                        if img_b:
+                            pending_img_bytes.append(img_b)
+                        full_text += img_md
+                    elif et == "thought_signature":
+                        sig_b = _signature_bytes_from_wire(data.get("value"))
+                        if sig_b:
+                            fc_assembler.note_turn_signature(sig_b)
+                        if sig_b and pending_img_bytes:
+                            for ib in pending_img_bytes:
+                                if not image_signature_store.get(ib):
+                                    image_signature_store.put(ib, sig_b)
+                    elif et == "function_call":
+                        _, s_delta, _ = fc_assembler.feed_with_synthetic(
+                            data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
+                        )
+                        if s_delta:
+                            synth_text += s_delta
+                    elif et == "finish":
+                        finish_raw = data
+                    elif et == "safety":
+                        safety_html = _safety_html_if_enabled(data)
+                    elif et == "blocked":
+                        blocked_msg = data
+                    elif et == "usage":
+                        usage_meta = data
+                    elif et == "error":
+                        clean_em = _extract_clean_error_message(data)
+                        diag = _diagnose_studio_error(clean_em, 200)
+                        if (_is_cookie_expired_error(clean_em) or _is_project_error(clean_em)) and not full_text.strip() and not synth_text.strip():
+                            hint = _get_auth_or_project_hint(clean_em, 200)
+                            auth_error = f"{diag} — {clean_em}{hint}"
+                            break
+                        if _is_retryable_error(clean_em) and not full_text.strip() and not synth_text.strip():
+                            retry_error = f"{diag} — {clean_em}"
+                            break
+                        fatal_error = f"{diag} — {clean_em}"
+
+            tail_text = fc_assembler.flush_synthetic_tail()
+            if tail_text:
+                synth_text += tail_text
+            for c_item in fc_assembler.flush():
+                if synth_tool_name and c_item.get("name") == synth_tool_name:
+                    synth_text += extract_synthetic_content(
+                        c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=synth_prefill
+                    )
+            if synth_text or fc_assembler.synthetic_hit:
+                full_text = synth_text
+
+            has_valid_body = bool(full_text.strip() or (synth_prefill and full_text))
+            if auth_error and not has_valid_body:
+                return {"kind": "cookie_error", "status_code": 403, "message": auth_error}
+            if retry_error and not has_valid_body:
+                return {"kind": "retryable_error", "status_code": 503, "message": retry_error}
+            if fatal_error and not has_valid_body:
+                return {"kind": "fatal_error", "status_code": 400, "message": fatal_error}
+
+            if not has_valid_body:
+                detail = f"finishReason={finish_raw or '无'}"
+                if blocked_msg:
+                    detail += f"；promptFeedback 拦截：{blocked_msg}"
+                print(f"🔎 [Studio 诊断] 模型={base_model_name} 假流式无正文（{detail}）。原始响应样本：\n{sampler.dump()}")
+                is_synth_retry = bool(synth_tool_name and not blocked_msg)
+                return {
+                    "kind": "retryable_error" if is_synth_retry else "fatal_error",
+                    "status_code": 400 if blocked_msg else 502,
+                    "message": f"上游未返回图片或正文（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。已在运行日志记录原始响应样本。",
+                }
+
+            if fatal_error:
+                full_text += f"\n\n[Studio 中途报错] {fatal_error}"
+
             return {
-                "kind": "retryable_error" if is_synth_retry else "fatal_error",
-                "status_code": 400 if blocked_msg else 502,
-                "message": f"上游未返回图片或正文（{detail}，{'将自动重试' if is_synth_retry else '不可重试'}）。已在运行日志记录原始响应样本。",
+                "kind": "ok",
+                "full_text": full_text + safety_html,
+                "reasoning_text": "" if strip_thoughts else reasoning_text,
+                "finish_reason": _map_finish_reason(finish_raw),
+                "usage_meta": usage_meta,
             }
 
-        if fatal_error:
-            full_text += f"\n\n[Studio 中途报错] {fatal_error}"
-
-        return {
-            "kind": "ok",
-            "full_text": full_text + safety_html,
-            "reasoning_text": "" if strip_thoughts else reasoning_text,
-            "finish_reason": _map_finish_reason(finish_raw),
-            "usage_meta": usage_meta,
-        }
+        return await _collect_full_response_once_impl()
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1651,6 +1786,32 @@ class CookieProxyUpstream(BaseUpstream):
         is_image = _profile["is_image"]
         fake_stream_enabled = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
 
+        async def _build_clean_fallback_body(latch_dict: Optional[dict] = None) -> dict:
+            """当模型/协议完全拒绝原生函数 Schema 降级为纯文本时，重新基于 orig_clean_msgs 构建请求体，
+            彻底剥离 compose_reply 控制指令，防止模型在无工具状态下把正文裸写成 JSON 字符串。"""
+            if latch_dict is not None:
+                latch_dict["latched"] = True
+            fb_req = request_obj
+            if sandbox_spec.enabled and orig_clean_msgs is not None:
+                fb_msgs = orig_clean_msgs
+                if _prefill_mode != "off":
+                    _clean_fb_msgs, _, _ = apply_prefill_compat(
+                        orig_clean_msgs,
+                        _prefill_mode,
+                        allow_model_last=not _profile["requires_user_last_turn"],
+                        instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
+                        cot_guard=not _profile["is_image"],
+                        synthetic_tool_name="",
+                        has_callable_client_tools=False,
+                    )
+                    fb_msgs = _clean_fb_msgs
+                fb_req = request_obj.model_copy(update={"messages": fb_msgs})
+            return await build_batch_graphql_body_async(
+                project_id, base_model_name, fb_req,
+                prefill_active=prefill_active, force_search=force_builtin_search,
+                native_tools=False, sandbox_spec=None, enable_stream_fc_args=False,
+            )
+
         # ---------- 1. 假流式（生图或开启假流式） ----------
         if is_stream and (is_image or (fake_stream_enabled and not native_custom_tools)):
             async def studio_fake_stream_once():
@@ -1663,12 +1824,17 @@ class CookieProxyUpstream(BaseUpstream):
                     hb_interval = 1.0
                 hb_interval = max(0.5, hb_interval)
 
+                fake_fb = (
+                    (lambda: _build_clean_fallback_body())
+                    if (native_custom_tools or sandbox_spec.enabled)
+                    else None
+                )
                 collect_task = asyncio.create_task(
                     _collect_full_response_once(
                         project_id, base_model_name, request_obj, headers, client_kwargs,
                         fastapi_request, prefill_active=prefill_active,
                         force_search=force_builtin_search, strip_thoughts=strip_thoughts,
-                        sandbox_spec=sandbox_spec,
+                        sandbox_spec=sandbox_spec, fallback_body=fake_fb,
                     )
                 )
                 try:
@@ -1738,32 +1904,13 @@ class CookieProxyUpstream(BaseUpstream):
                 body = await build_batch_graphql_body_async(
                     project_id, base_model_name, request_obj,
                     prefill_active=prefill_active, force_search=force_builtin_search,
-                    native_tools=True, sandbox_spec=sandbox_spec,
+                    native_tools=True, sandbox_spec=sandbox_spec, enable_stream_fc_args=True,
                 )
-                fallback_body = None
-                if native_custom_tools or sandbox_spec.enabled:
-                    async def fallback_body():
-                        native_fallback_state["latched"] = True
-                        fb_req = request_obj
-                        if sandbox_spec.enabled and orig_clean_msgs is not None:
-                            fb_msgs = orig_clean_msgs
-                            if _prefill_mode != "off":
-                                _clean_fb_msgs, _, _ = apply_prefill_compat(
-                                    orig_clean_msgs,
-                                    _prefill_mode,
-                                    allow_model_last=not _profile["requires_user_last_turn"],
-                                    instruction_template=_prefill_tpl(_inj_settings.get("prefill_instruction", ""), _profile["is_image"]),
-                                    cot_guard=not _profile["is_image"],
-                                    synthetic_tool_name="",
-                                    has_callable_client_tools=False,
-                                )
-                                fb_msgs = _clean_fb_msgs
-                            fb_req = request_obj.model_copy(update={"messages": fb_msgs})
-                        return await build_batch_graphql_body_async(
-                            project_id, base_model_name, fb_req,
-                            prefill_active=prefill_active, force_search=force_builtin_search,
-                            native_tools=False, sandbox_spec=None,
-                        )
+                fallback_body = (
+                    (lambda: _build_clean_fallback_body(native_fallback_state))
+                    if (native_custom_tools or sandbox_spec.enabled)
+                    else None
+                )
                 req_headers = build_headers(_get_cookie_string()) or headers
                 if debug_outbound:
                     from api_helpers import print_outbound_debug_report
@@ -1800,175 +1947,194 @@ class CookieProxyUpstream(BaseUpstream):
                     pending_stream_imgs: list[bytes] = []
                     first_stream_tool_id: Optional[str] = None
 
-                    async for status, data in _execute_stream_request_generator(
-                        client, req_headers, body, sampler=sampler, fallback_body=fallback_body,
-                    ):
-                        if not has_yielded_to_client and await fastapi_request.is_disconnected():
-                            return
-
-                        if status == "thought":
-                            got_thought = True
-                            if strip_thoughts:
-                                now_ts = time.time()
-                                if now_ts - last_hb_ts >= 2.0:
-                                    last_hb_ts = now_ts
-                                    yield _sse_heartbeat()
-                                continue
-
-                        if status == "function_call":
-                            completed_calls, synth_delta, synth_sig = fc_assembler.feed_with_synthetic(
-                                data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
-                            )
-                            if synth_delta:
-                                if not has_yielded_to_client:
-                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
-                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                    has_yielded_to_client = True
-                                if prefill_text and not prefill_emitted:
-                                    prefill_emitted = True
-                                    yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                                got_text = True
-                                out = deduper.feed(synth_delta)
-                                if out:
-                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                    stream_ordinary_metadata.append(ordinary_part_metadata("text", out, synth_sig))
-                                    yield _make_openai_chunk(response_id, model_display, content=out)
-                            elif synth_sig and stream_ordinary_metadata:
-                                stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(synth_sig)
-                            for c_item in completed_calls:
-                                if not has_yielded_to_client:
-                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
-                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                    has_yielded_to_client = True
-                                tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
-                                tool_payload["index"] = tool_call_index
-                                if tool_call_index == 0:
-                                    first_stream_tool_id = tool_payload["id"]
-                                stream_part_order.append({"type": "tool_call", "index": tool_call_index})
-                                yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
-                                tool_call_index += 1
-                                got_tool_call = True
-                            if fc_assembler.synthetic_halted:
-                                print(f"🛑 [Studio 抗截断保护] 检测到 {base_model_name} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
-                                break
-
-                        elif status == "thought_signature":
-                            signature = _signature_bytes_from_wire(data.get("value"))
-                            if signature:
-                                fc_assembler.note_turn_signature(signature)
-                                if first_stream_tool_id:
-                                    rec_chk = signature_store.get_record(first_stream_tool_id)
-                                    if rec_chk is None or rec_chk.state is not SignatureState.SIGNED:
-                                        signature_store.put_record(
-                                            first_stream_tool_id, SignatureRecord(SignatureState.SIGNED, signature)
-                                        )
-                            if signature and pending_stream_imgs:
-                                for ib in pending_stream_imgs:
-                                    if not image_signature_store.get(ib):
-                                        image_signature_store.put(ib, signature)
-                            extra = thought_signature_extra(signature, data.get("part_kind"))
-                            if extra:
-                                if stream_ordinary_metadata:
-                                    stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(signature)
-                                elif data.get("part_kind") == "signature_only":
-                                    stream_part_order.append({"type": "ordinary", "index": 0})
-                                    stream_ordinary_metadata.append(
-                                        ordinary_part_metadata("signature_only", "", signature))
-                                google = extra.setdefault("google", {})
-                                if stream_ordinary_metadata:
-                                    google["ordinary_parts"] = list(stream_ordinary_metadata)
-                                if got_tool_call:
-                                    google["part_order"] = list(stream_part_order)
-                                if has_yielded_to_client:
-                                    yield _make_openai_chunk(response_id, model_display, extra_content=extra)
-
-                        elif status in ("text", "thought", "image", "api_error_text"):
-                            if status == "text" and fc_assembler.synthetic_hit:
-                                continue
-                            if status == "api_error_text" and not has_yielded_to_client:
-                                err_str = str(data)
-                                is_auth = _is_cookie_expired_error(err_str) or _is_project_error(err_str)
-                                is_ret = (not is_auth) and (
-                                    _is_retryable_error(err_str) or err_str.startswith("连接中断")
-                                )
-                                raise CookieAttemptError(
-                                    403 if is_auth else (503 if is_ret else 400),
-                                    err_str,
-                                    is_retryable=is_ret,
-                                    is_auth_or_billing=is_auth,
-                                )
-                            if not has_yielded_to_client:
-                                print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
-                                yield _make_openai_chunk(response_id, model_display, role="assistant")
-                                has_yielded_to_client = True
+                    stream_gen = _execute_stream_request_generator(
+                        client, req_headers, body, sampler=sampler,
+                        fallback_body=fallback_body, fallback_state=native_fallback_state,
+                    )
+                    try:
+                        async for status, data in stream_gen:
+                            if not has_yielded_to_client and await fastapi_request.is_disconnected():
+                                return
+                            if native_fallback_state["latched"] and fc_assembler.synthetic_tool_name:
+                                fc_assembler.synthetic_tool_name = ""
 
                             if status == "thought":
-                                stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                stream_ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
-                                yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
-                            elif status == "api_error_text":
-                                print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:2000]}")
-                                yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
-                            elif status == "image":
-                                img_md = data["markdown"] if isinstance(data, dict) else str(data)
-                                img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
-                                if img_b:
-                                    pending_stream_imgs.append(img_b)
-                                if prefill_text and not prefill_emitted:
-                                    prefill_emitted = True
-                                    yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                                got_text = True
-                                stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                stream_ordinary_metadata.append(ordinary_part_metadata("text", img_md, None))
-                                yield _make_openai_chunk(response_id, model_display, content=img_md)
-                            else:
-                                if prefill_text and not prefill_emitted:
-                                    prefill_emitted = True
-                                    yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                                got_text = True
-                                out = deduper.feed(data)
-                                if out:
-                                    stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                                    stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
-                                    yield _make_openai_chunk(response_id, model_display, content=out)
+                                got_thought = True
+                                if strip_thoughts:
+                                    now_ts = time.time()
+                                    if now_ts - last_hb_ts >= 2.0:
+                                        last_hb_ts = now_ts
+                                        yield _sse_heartbeat()
+                                    continue
 
-                        elif status == "finish":
-                            finish_raw = data
-                        elif status == "safety":
-                            _sh = _safety_html_if_enabled(data)
-                            if _sh:
-                                yield _make_openai_chunk(response_id, model_display, content=_sh)
-                        elif status == "usage":
-                            usage_meta = data
-                        elif status == "blocked":
-                            blocked_msg = data
-
-                        elif status == "cookie_error":
-                            if not has_yielded_to_client:
-                                raise CookieAttemptError(403, str(data), is_retryable=False, is_auth_or_billing=True)
-                            stats.add_error()
-                            yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
-                            yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
-                            yield "data: [DONE]\n\n"
-                            return
-
-                        elif status in ("retryable_error", "fatal_error"):
-                            if not has_yielded_to_client:
-                                raise CookieAttemptError(
-                                    503 if status == "retryable_error" else 400,
-                                    str(data),
-                                    is_retryable=(status == "retryable_error"),
-                                    is_auth_or_billing=False,
+                            if status == "function_call":
+                                completed_calls, synth_delta, synth_sig = fc_assembler.feed_with_synthetic(
+                                    data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
                                 )
-                            stats.add_error()
-                            yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
-                            yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
-                            yield "data: [DONE]\n\n"
-                            return
+                                if synth_delta:
+                                    if not has_yielded_to_client:
+                                        print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
+                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                        has_yielded_to_client = True
+                                    if prefill_text and not prefill_emitted:
+                                        prefill_emitted = True
+                                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                                    got_text = True
+                                    out = deduper.feed(synth_delta)
+                                    if out:
+                                        _append_merged_ordinary_meta(
+                                            stream_ordinary_metadata,
+                                            stream_part_order,
+                                            ordinary_part_metadata("text", out, synth_sig),
+                                        )
+                                        yield _make_openai_chunk(response_id, model_display, content=out)
+                                elif synth_sig and stream_ordinary_metadata:
+                                    stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(synth_sig)
+                                for c_item in completed_calls:
+                                    if not has_yielded_to_client:
+                                        print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
+                                        yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                        has_yielded_to_client = True
+                                    tool_payload = _openai_tool_call(response_id, tool_call_index, c_item)
+                                    tool_payload["index"] = tool_call_index
+                                    if tool_call_index == 0:
+                                        first_stream_tool_id = tool_payload["id"]
+                                    stream_part_order.append({"type": "tool_call", "index": tool_call_index})
+                                    yield _make_openai_chunk(response_id, model_display, tool_calls=[tool_payload])
+                                    tool_call_index += 1
+                                    got_tool_call = True
+                                if fc_assembler.synthetic_halted:
+                                    print(f"🛑 [Studio 抗截断保护] 检测到 {base_model_name} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
+                                    break
+
+                            elif status == "thought_signature":
+                                signature = _signature_bytes_from_wire(data.get("value"))
+                                if signature:
+                                    fc_assembler.note_turn_signature(signature)
+                                    if first_stream_tool_id:
+                                        rec_chk = signature_store.get_record(first_stream_tool_id)
+                                        if rec_chk is None or rec_chk.state is not SignatureState.SIGNED:
+                                            signature_store.put_record(
+                                                first_stream_tool_id, SignatureRecord(SignatureState.SIGNED, signature)
+                                            )
+                                if signature and pending_stream_imgs:
+                                    for ib in pending_stream_imgs:
+                                        if not image_signature_store.get(ib):
+                                            image_signature_store.put(ib, signature)
+                                if signature:
+                                    if stream_ordinary_metadata:
+                                        stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(signature)
+                                    elif data.get("part_kind") == "signature_only":
+                                        _append_merged_ordinary_meta(
+                                            stream_ordinary_metadata,
+                                            stream_part_order,
+                                            ordinary_part_metadata("signature_only", "", signature),
+                                        )
+
+                            elif status in ("text", "thought", "image", "api_error_text"):
+                                if status == "text" and fc_assembler.synthetic_hit:
+                                    continue
+                                if status == "api_error_text" and not has_yielded_to_client:
+                                    err_str = str(data)
+                                    is_auth = _is_cookie_expired_error(err_str) or _is_project_error(err_str)
+                                    is_ret = (not is_auth) and (
+                                        _is_retryable_error(err_str) or err_str.startswith("连接中断")
+                                    )
+                                    raise CookieAttemptError(
+                                        403 if is_auth else (503 if is_ret else 400),
+                                        err_str,
+                                        is_retryable=is_ret,
+                                        is_auth_or_billing=is_auth,
+                                    )
+                                if not has_yielded_to_client:
+                                    print(f"⚡ [Studio] {base_model_name} | 连接建立，正在实时流式输出...")
+                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                    has_yielded_to_client = True
+
+                                if status == "thought":
+                                    _append_merged_ordinary_meta(
+                                        stream_ordinary_metadata,
+                                        stream_part_order,
+                                        ordinary_part_metadata("thought", data, None),
+                                    )
+                                    yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
+                                elif status == "api_error_text":
+                                    print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:2000]}")
+                                    yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
+                                elif status == "image":
+                                    img_md = data["markdown"] if isinstance(data, dict) else str(data)
+                                    img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
+                                    if img_b:
+                                        pending_stream_imgs.append(img_b)
+                                    if prefill_text and not prefill_emitted:
+                                        prefill_emitted = True
+                                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                                    got_text = True
+                                    _append_merged_ordinary_meta(
+                                        stream_ordinary_metadata,
+                                        stream_part_order,
+                                        ordinary_part_metadata("text", img_md, None),
+                                    )
+                                    yield _make_openai_chunk(response_id, model_display, content=img_md)
+                                else:
+                                    if prefill_text and not prefill_emitted:
+                                        prefill_emitted = True
+                                        yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                                    got_text = True
+                                    out = deduper.feed(data)
+                                    if out:
+                                        _append_merged_ordinary_meta(
+                                            stream_ordinary_metadata,
+                                            stream_part_order,
+                                            ordinary_part_metadata("text", out, None),
+                                        )
+                                        yield _make_openai_chunk(response_id, model_display, content=out)
+
+                            elif status == "finish":
+                                finish_raw = data
+                            elif status == "safety":
+                                _sh = _safety_html_if_enabled(data)
+                                if _sh:
+                                    yield _make_openai_chunk(response_id, model_display, content=_sh)
+                            elif status == "usage":
+                                usage_meta = data
+                            elif status == "blocked":
+                                blocked_msg = data
+
+                            elif status == "cookie_error":
+                                if not has_yielded_to_client:
+                                    raise CookieAttemptError(403, str(data), is_retryable=False, is_auth_or_billing=True)
+                                stats.add_error()
+                                yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
+                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            elif status in ("retryable_error", "fatal_error"):
+                                if not has_yielded_to_client:
+                                    raise CookieAttemptError(
+                                        503 if status == "retryable_error" else 400,
+                                        str(data),
+                                        is_retryable=(status == "retryable_error"),
+                                        is_auth_or_billing=False,
+                                    )
+                                stats.add_error()
+                                yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
+                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                yield "data: [DONE]\n\n"
+                                return
+
+                    finally:
+                        if hasattr(stream_gen, "aclose"):
+                            try:
+                                await stream_gen.aclose()
+                            except Exception:
+                                pass
 
                     rem_synth = fc_assembler.flush_synthetic_tail()
-                    if rem_synth:
-                        out = deduper.feed(rem_synth) if deduper else rem_synth
+                    rem_sig = fc_assembler.pop_synth_signature()
+                    if rem_synth or rem_sig:
+                        out = deduper.feed(rem_synth) if (deduper and rem_synth) else rem_synth
                         if out:
                             got_text = True
                             if not has_yielded_to_client:
@@ -1977,11 +2143,36 @@ class CookieProxyUpstream(BaseUpstream):
                             if prefill_text and not prefill_emitted:
                                 prefill_emitted = True
                                 yield _make_openai_chunk(response_id, model_display, content=prefill_text)
-                            stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                            stream_ordinary_metadata.append(ordinary_part_metadata("text", out, None))
+                            _append_merged_ordinary_meta(
+                                stream_ordinary_metadata,
+                                stream_part_order,
+                                ordinary_part_metadata("text", out, rem_sig),
+                            )
                             yield _make_openai_chunk(response_id, model_display, content=out)
+                        elif rem_sig and stream_ordinary_metadata:
+                            stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(rem_sig)
 
                     for c_item in fc_assembler.flush():
+                        if synth_tool_name and not native_fallback_state["latched"] and c_item.get("name") == synth_tool_name:
+                            _extra_s = extract_synthetic_content(
+                                c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=prefill_text
+                            )
+                            _out_s = deduper.feed(_extra_s) if (deduper and _extra_s) else _extra_s
+                            if _out_s:
+                                got_text = True
+                                if not has_yielded_to_client:
+                                    yield _make_openai_chunk(response_id, model_display, role="assistant")
+                                    has_yielded_to_client = True
+                                if prefill_text and not prefill_emitted:
+                                    prefill_emitted = True
+                                    yield _make_openai_chunk(response_id, model_display, content=prefill_text)
+                                _append_merged_ordinary_meta(
+                                    stream_ordinary_metadata,
+                                    stream_part_order,
+                                    ordinary_part_metadata("text", _out_s, c_item.get("thought_signature")),
+                                )
+                                yield _make_openai_chunk(response_id, model_display, content=_out_s)
+                            continue
                         if not has_yielded_to_client:
                             yield _make_openai_chunk(response_id, model_display, role="assistant")
                             has_yielded_to_client = True
@@ -2015,25 +2206,38 @@ class CookieProxyUpstream(BaseUpstream):
                         yield _make_openai_chunk(response_id, model_display, content=prefill_text)
                     tail = deduper.flush()
                     if tail:
-                        stream_part_order.append({"type": "ordinary", "index": len(stream_ordinary_metadata)})
-                        stream_ordinary_metadata.append(ordinary_part_metadata("text", tail, None))
+                        _append_merged_ordinary_meta(
+                            stream_ordinary_metadata,
+                            stream_part_order,
+                            ordinary_part_metadata("text", tail, None),
+                        )
                         yield _make_openai_chunk(response_id, model_display, content=tail)
 
-                    if got_tool_call and stream_ordinary_metadata:
-                        google = {
-                            "ordinary_parts": list(stream_ordinary_metadata),
-                            "part_order": list(stream_part_order),
-                        }
-                        last_signed = next((item for item in reversed(stream_ordinary_metadata)
-                                            if item.get("thought_signature")), None)
-                        if last_signed:
-                            google["thought_signature"] = last_signed["thought_signature"]
-                            google["thought_signature_part"] = last_signed["kind"]
-                        yield _make_openai_chunk(
-                            response_id, model_display, extra_content={"google": google})
+                    final_extra = None
+                    if stream_ordinary_metadata:
+                        last_signed = next(
+                            (item for item in reversed(stream_ordinary_metadata) if item.get("thought_signature")),
+                            None,
+                        )
+                        if got_tool_call or last_signed:
+                            google: Dict[str, Any] = {"ordinary_parts": list(stream_ordinary_metadata)}
+                            if got_tool_call:
+                                google["part_order"] = list(stream_part_order)
+                            if last_signed:
+                                google["thought_signature"] = last_signed["thought_signature"]
+                                google["thought_signature_part"] = last_signed["kind"]
+                            final_extra = {"google": google}
+
                     yield _make_openai_chunk(
-                        response_id, model_display,
-                        finish_reason="tool_calls" if got_tool_call else _map_finish_reason(finish_raw))
+                        response_id,
+                        model_display,
+                        extra_content=final_extra,
+                        finish_reason=(
+                            "tool_calls"
+                            if got_tool_call
+                            else ("stop" if fc_assembler.synthetic_halted else _map_finish_reason(finish_raw))
+                        ),
+                    )
 
                     usage = _record_studio_usage(usage_meta)
                     if want_usage:
@@ -2047,12 +2251,12 @@ class CookieProxyUpstream(BaseUpstream):
 
             return StreamingResponse(stream_generator_once(), media_type="text/event-stream")
 
-        # ---------- 3. 非流式 ----------
+        # ---------- 3. 非流式（整包 POST 返回） ----------
         try:
             body = await build_batch_graphql_body_async(
                 project_id, base_model_name, request_obj,
                 prefill_active=prefill_active, force_search=force_builtin_search,
-                native_tools=True, sandbox_spec=sandbox_spec,
+                native_tools=True, sandbox_spec=sandbox_spec, enable_stream_fc_args=False,
             )
             req_headers = build_headers(_get_cookie_string()) or headers
             if debug_outbound:
@@ -2089,12 +2293,8 @@ class CookieProxyUpstream(BaseUpstream):
 
                 if (native_custom_tools or sandbox_spec.enabled) and _native_tool_error_response(response.status_code, response.text):
                     synth_tool_name = ""
-                    resolved_fallback = await build_batch_graphql_body_async(
-                        project_id, base_model_name, request_obj,
-                        prefill_active=prefill_active, force_search=force_builtin_search,
-                        native_tools=False, sandbox_spec=None,
-                    )
-                    print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；已自动降级为文本工具观测。")
+                    resolved_fallback = await _build_clean_fallback_body()
+                    print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；已自动剥离控制指令并降级为文本工具观测。")
                     response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback)
 
             if response.status_code != 200:
@@ -2140,28 +2340,33 @@ class CookieProxyUpstream(BaseUpstream):
                         if fc_assembler.synthetic_hit:
                             continue
                         full_text += data
-                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                        ordinary_metadata.append(ordinary_part_metadata("text", data, None))
+                        _append_merged_ordinary_meta(
+                            ordinary_metadata, part_order, ordinary_part_metadata("text", data, None)
+                        )
                     elif event_type == "thought":
                         reasoning_text += data
-                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                        ordinary_metadata.append(ordinary_part_metadata("thought", data, None))
+                        _append_merged_ordinary_meta(
+                            ordinary_metadata, part_order, ordinary_part_metadata("thought", data, None)
+                        )
                     elif event_type == "image":
                         img_md = data["markdown"] if isinstance(data, dict) else str(data)
                         img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
                         if img_b:
                             pending_nonstream_imgs.append(img_b)
                         full_text += img_md
-                        part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                        ordinary_metadata.append(ordinary_part_metadata("text", img_md, None))
+                        _append_merged_ordinary_meta(
+                            ordinary_metadata, part_order, ordinary_part_metadata("text", img_md, None)
+                        )
                     elif event_type == "function_call":
                         completed_calls, s_delta, s_sig = fc_assembler.feed_with_synthetic(
                             data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
                         )
-                        if s_delta:
-                            synth_text += s_delta
-                            part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                            ordinary_metadata.append(ordinary_part_metadata("text", s_delta, s_sig))
+                        if s_delta or s_sig:
+                            if s_delta:
+                                synth_text += s_delta
+                            _append_merged_ordinary_meta(
+                                ordinary_metadata, part_order, ordinary_part_metadata("text", s_delta, s_sig)
+                            )
                             if s_sig:
                                 message_extra = thought_signature_extra(s_sig, "text")
                         for c_item in completed_calls:
@@ -2188,8 +2393,11 @@ class CookieProxyUpstream(BaseUpstream):
                             if ordinary_metadata:
                                 ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(sig)
                             elif data.get("part_kind") == "signature_only":
-                                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                                ordinary_metadata.append(ordinary_part_metadata("signature_only", "", sig))
+                                _append_merged_ordinary_meta(
+                                    ordinary_metadata,
+                                    part_order,
+                                    ordinary_part_metadata("signature_only", "", sig),
+                                )
                     elif event_type == "finish":
                         finish_raw = data
                     elif event_type == "safety":
@@ -2211,22 +2419,36 @@ class CookieProxyUpstream(BaseUpstream):
                         fatal_error = f"{diag} — {clean_em}"
 
             tail_synth = fc_assembler.flush_synthetic_tail()
-            if tail_synth:
-                synth_text += tail_synth
-                part_order.append({"type": "ordinary", "index": len(ordinary_metadata)})
-                ordinary_metadata.append(ordinary_part_metadata("text", tail_synth, None))
+            tail_sig = fc_assembler.pop_synth_signature()
+            if tail_synth or tail_sig:
+                if tail_synth:
+                    synth_text += tail_synth
+                _append_merged_ordinary_meta(
+                    ordinary_metadata, part_order, ordinary_part_metadata("text", tail_synth, tail_sig)
+                )
+                if tail_sig:
+                    message_extra = thought_signature_extra(tail_sig, "text")
             for c_item in fc_assembler.flush():
                 if synth_tool_name and c_item.get("name") == synth_tool_name:
-                    synth_text += extract_synthetic_content(
+                    extra_s = extract_synthetic_content(
                         c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=prefill_text
                     )
+                    if extra_s:
+                        synth_text += extra_s
+                        _append_merged_ordinary_meta(
+                            ordinary_metadata,
+                            part_order,
+                            ordinary_part_metadata("text", extra_s, c_item.get("thought_signature")),
+                        )
                     continue
                 part_order.append({"type": "tool_call", "index": len(tool_calls)})
                 tool_calls.append(_openai_tool_call(response_id, len(tool_calls), c_item))
-            if synth_text:
+            if synth_text or fc_assembler.synthetic_hit:
                 full_text = synth_text
+                if fc_assembler.synthetic_hit and not synth_text:
+                    ordinary_metadata = [m for m in ordinary_metadata if m.get("kind") != "text"]
 
-            got_text = bool(full_text.strip())
+            got_text = bool(full_text.strip() or (prefill_text and full_text))
             got_output = got_text or bool(tool_calls)
 
             if not got_output:
@@ -2256,7 +2478,11 @@ class CookieProxyUpstream(BaseUpstream):
                 full_text += f"\n\n[Studio 中途报错] {fatal_error}"
             if prefill_text and got_text:
                 full_text = prefill_text + strip_prefill_overlap(prefill_text, full_text)
-            finish_reason = "tool_calls" if tool_calls else _map_finish_reason(finish_raw)
+            finish_reason = (
+                "tool_calls"
+                if tool_calls
+                else ("stop" if fc_assembler.synthetic_halted else _map_finish_reason(finish_raw))
+            )
             elapsed = time.time() - start_time
             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
 
