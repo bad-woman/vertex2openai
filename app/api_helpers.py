@@ -1,3 +1,4 @@
+import html
 import json
 import time
 import math
@@ -22,7 +23,7 @@ import config as app_config
 import model_capabilities as mc
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, validate_request_schemas
-from logger import stats
+from logger import stats, call_recorder
 from synthetic_wrapper import (
     _BUILTIN_SEARCH_NAMES,
     extract_synthetic_content,
@@ -801,14 +802,32 @@ def print_outbound_debug_report(
     print("\n".join(lines))
 
 
-def _extract_usage(resp: Any) -> tuple[int, int, int]:
+def _extract_usage_detail(resp: Any) -> tuple[int, int, int, int]:
+    """从 Gemini 响应对象提取精确的 (输入Tokens, 原生思考Tokens, 正文输出Tokens, 总Tokens)。"""
     um = getattr(resp, "usage_metadata", None)
     if not um:
-        return 0, 0, 0
-    p_tk = getattr(um, "prompt_token_count", 0) or 0
-    c_tk = getattr(um, "candidates_token_count", 0) or 0
-    t_tk = getattr(um, "total_token_count", None) or (p_tk + c_tk)
-    return p_tk, c_tk, t_tk
+        return 0, 0, 0, 0
+    p_tk = int(getattr(um, "prompt_token_count", 0) or 0)
+    out_tk = int(getattr(um, "candidates_token_count", 0) or 0)
+    raw_th = getattr(um, "thoughts_token_count", None)
+    if raw_th is None:
+        raw_th = getattr(um, "thought_token_count", None)
+    tool_p_tk = int(getattr(um, "tool_use_prompt_token_count", 0) or 0)
+    raw_tot = getattr(um, "total_token_count", None)
+    if raw_th is not None:
+        th_tk = int(raw_th or 0)
+    elif raw_tot and int(raw_tot) > (p_tk + out_tk + tool_p_tk):
+        th_tk = int(raw_tot) - p_tk - out_tk - tool_p_tk
+    else:
+        th_tk = 0
+    comp_tk = th_tk + out_tk
+    t_tk = int(raw_tot) if raw_tot else (p_tk + comp_tk)
+    return p_tk, th_tk, out_tk, t_tk
+
+
+def _extract_usage(resp: Any) -> tuple[int, int, int]:
+    p_tk, th_tk, out_tk, t_tk = _extract_usage_detail(resp)
+    return p_tk, (th_tk + out_tk), t_tk
 
 
 def _record_usage(resp: Any) -> dict:
@@ -818,13 +837,21 @@ def _record_usage(resp: Any) -> dict:
         value = getattr(traffic_type, "value", None) or str(traffic_type)
         print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
 
-    p_tk, c_tk, t_tk = _extract_usage(resp)
-    if p_tk or c_tk:
-        stats.add_tokens(p_tk, c_tk)
-        print(f"💰 [算力消耗统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+    p_tk, th_tk, out_tk, t_tk = _extract_usage_detail(resp)
+    comp_tk = th_tk + out_tk
+    if p_tk or comp_tk:
+        stats.add_tokens(p_tk, comp_tk)
+        print(f"💰 [算力消耗统计] 输入: {p_tk} | 思考: {th_tk} | 正文: {out_tk} | 总计: {t_tk} Tokens")
     else:
         stats.add_success()
-    return {"prompt_tokens": p_tk, "completion_tokens": c_tk, "total_tokens": t_tk}
+    res: Dict[str, Any] = {
+        "prompt_tokens": p_tk,
+        "completion_tokens": comp_tk,
+        "total_tokens": t_tk,
+        "thoughts_tokens": th_tk,
+        "output_tokens": out_tk,
+    }
+    return res
 
 
 def wants_usage(request_obj: Any) -> bool:
@@ -1437,6 +1464,405 @@ def _emit_credential_invalid_warning(target: dict, err_code: int, err_formatted:
     return user_tip
 
 
+def _short_cred_name(target: Optional[dict]) -> str:
+    if not target:
+        return "—"
+    if target.get("channel") == "express":
+        rec = target.get("key_record") or {}
+        return f"Key #{rec.get('index', 0) + 1}"
+    return "🍪 Cookie"
+
+
+def _format_thinking_for_record(tk_dict: Optional[dict]) -> tuple[str, str, bool]:
+    """返回 (展示文案, 徽章样式 muted|accent|apricot, 是否流式回传原生思考)。"""
+    if not tk_dict or tk_dict.get("mode") is None:
+        return "无", "muted", False
+    inc = bool(tk_dict.get("include_thoughts", True))
+    lv = str(tk_dict.get("level") or "").strip().upper()
+    if not inc:
+        return (f"压制 ({lv})" if lv else "压制"), "muted", False
+    if lv == "XHIGH":
+        return "🧠 XHIGH", "apricot", True
+    if lv:
+        return lv, "accent", True
+    return "自动", "accent", True
+
+
+def _chunk_has_model_token(chunk: Any, include_thoughts: bool = True) -> tuple[bool, bool]:
+    """检测上游流式 chunk 是否包含实际生成的模型 token（精确测量真实首字响应 TTFT，不受 96 字滑窗影响）。"""
+    cands = getattr(chunk, "candidates", None) or []
+    has_tok = False
+    has_thought = False
+    for cand in cands:
+        parts = getattr(getattr(cand, "content", None), "parts", None) or []
+        for p in parts:
+            is_th = getattr(p, "thought", None) is True
+            txt = getattr(p, "text", None)
+            if is_th:
+                if txt:
+                    has_thought = True
+                    if include_thoughts:
+                        has_tok = True
+            elif txt:
+                has_tok = True
+            else:
+                fc = getattr(p, "function_call", None)
+                if fc is not None and (
+                    getattr(fc, "name", None)
+                    or getattr(fc, "args", None)
+                    or getattr(fc, "partial_args", None)
+                ):
+                    has_tok = True
+                elif getattr(p, "inline_data", None) is not None or getattr(p, "file_data", None) is not None:
+                    has_tok = True
+    return has_tok, has_thought
+
+
+class CallTraceTracker:
+    """单次聊天请求的生命周期指标追踪器（幂等写入 CallRecorder，零重复记账）。"""
+
+    def __init__(self, request_obj: OpenAIRequest, primary_channel: str):
+        self.created_wall = time.time()
+        self.start_mono = time.monotonic()
+        self.primary_channel = primary_channel
+        self.finalized = False
+
+        raw_model = str(getattr(request_obj, "model", "") or "unknown").strip()
+        base_m = raw_model
+        while True:
+            low_m = base_m.lower()
+            if low_m.endswith("-search"):
+                base_m = base_m[: -len("-search")]
+                continue
+            m_th = re.search(r"-think-(?:minimal|low|medium|high|xhigh|off|none)$", low_m)
+            if m_th:
+                base_m = base_m[: m_th.start()]
+                continue
+            break
+        self.model_display = base_m or raw_model
+        prof = mc.get_profile(self.model_display)
+        self.is_image = bool(prof.get("is_image", False))
+        self.is_stream_req = bool(getattr(request_obj, "stream", False))
+        fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
+
+        eff_settings = app_state.get_effective_settings(self.model_display)
+        # 粗略预判末尾是否为 assistant 预填充（后续 Express ctx 或 Cookie telemetry 会用精确结果覆盖）
+        msgs = getattr(request_obj, "messages", None) or []
+        rough_prefill = bool(
+            msgs
+            and str(getattr(msgs[-1], "role", "") or "") == "assistant"
+            and eff_settings.get("prefill_mode", "smart") != "off"
+        )
+        tk_init = mc.resolve_thinking(raw_model, request_obj, eff_settings, prefill_active=rough_prefill)
+        self.thinking_label, self.think_style, self.include_thoughts = _format_thinking_for_record(tk_init)
+
+        self.sandbox = bool(eff_settings.get("synthetic_sandbox_enabled", False) and not self.is_image)
+        self.prefill = rough_prefill
+        self.search = bool(raw_model.lower().endswith("-search"))
+        self.tool_calls = False
+
+        if self.is_image:
+            self.mode_label = "🖼️ 生图假流" if self.is_stream_req else "🖼️ 生图非流"
+            self.mode_class = "pill-accent" if self.is_stream_req else "pill-sky"
+            self.is_unary = True
+        elif not self.is_stream_req:
+            self.mode_label = "📦 非流式"
+            self.mode_class = "pill-sky"
+            self.is_unary = True
+        elif fake_on:
+            self.mode_label = "💓 假流式"
+            self.mode_class = "pill-accent"
+            self.is_unary = True
+        else:
+            self.mode_label = "⚡ 真流式"
+            self.mode_class = "pill-mint"
+            self.is_unary = False
+
+        self.retries = 0
+        self.retry_wait_total = 0.0
+        self.unique_creds: List[str] = []
+        self.failed_steps: List[str] = []
+        self.last_cred_short: str = ""
+
+    def sync_from_express_ctx(self, ctx: Optional[dict]) -> None:
+        if not ctx:
+            return
+        self.model_display = ctx.get("base_model_name") or self.model_display
+        self.sandbox = bool(ctx.get("synthetic_tool_name"))
+        self.prefill = bool(ctx.get("prefill_active", False))
+        self.search = bool(ctx.get("has_search", False))
+        tk_res = ctx.get("thinking_resolved")
+        if tk_res is not None:
+            self.thinking_label, self.think_style, self.include_thoughts = _format_thinking_for_record(tk_res)
+
+    def sync_from_cookie_telemetry(self, tel: Optional[dict]) -> None:
+        if not tel:
+            return
+        if tel.get("base_model"):
+            self.model_display = tel["base_model"]
+        if "sandbox" in tel:
+            self.sandbox = bool(tel["sandbox"])
+        if "prefill" in tel:
+            self.prefill = bool(tel["prefill"])
+        if "search" in tel:
+            self.search = bool(tel["search"])
+        if tel.get("thinking_resolved") is not None:
+            self.thinking_label, self.think_style, self.include_thoughts = _format_thinking_for_record(
+                tel["thinking_resolved"]
+            )
+        if "is_unary" in tel:
+            self.is_unary = bool(tel["is_unary"])
+        if tel.get("mode_label"):
+            self.mode_label = tel["mode_label"]
+            if "真流式" in self.mode_label:
+                self.mode_class = "pill-mint"
+            elif "假流" in self.mode_label:
+                self.mode_class = "pill-accent"
+            else:
+                self.mode_class = "pill-sky"
+
+    def note_attempt_start(self, target: dict) -> None:
+        short = _short_cred_name(target)
+        self.last_cred_short = short
+        if short not in self.unique_creds:
+            self.unique_creds.append(short)
+
+    def note_attempt_failure(self, target: dict, err_code: int, wait_sec: Optional[float] = None) -> None:
+        short = _short_cred_name(target)
+        if wait_sec is not None:
+            self.retries += 1
+            self.retry_wait_total += wait_sec
+            self.failed_steps.append(f"{html.escape(short)} (HTTP {err_code}，等 {wait_sec:.2f}s)")
+        else:
+            self.failed_steps.append(f"{html.escape(short)} (HTTP {err_code})")
+
+    def _build_time_strs(self) -> tuple[str, str]:
+        lt = time.localtime(self.created_wall)
+        return time.strftime("%H:%M:%S", lt), time.strftime("%Y-%m-%d %H:%M:%S", lt)
+
+    def finalize_success(
+        self,
+        target: dict,
+        *,
+        is_cookie: bool = False,
+        ttft: Optional[float] = None,
+        gen_time: float = 0.0,
+        saw_thought_stream: bool = False,
+        finish_reason: str = "stop",
+        has_tool_calls: bool = False,
+        has_usage: bool = False,
+        p_tk: int = 0,
+        th_tk: int = 0,
+        out_tk: int = 0,
+        out_chars: int = 0,
+    ) -> None:
+        if self.finalized:
+            return
+        self.finalized = True
+        total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
+        short_cred = _short_cred_name(target)
+        if target.get("channel") != self.primary_channel:
+            cred_note = "跨通道兜底"
+        elif is_cookie:
+            cred_note = "Cookie 模式"
+        else:
+            note = str((target.get("key_record") or {}).get("note") or "").strip()
+            cred_note = note[:16] if note else "标准模式"
+
+        is_trunc = (str(finish_reason or "").lower() == "length")
+        if is_trunc:
+            badge_type = "trunc"
+        elif self.retries > 0:
+            badge_type = "retry_ok"
+        else:
+            badge_type = "ok"
+
+        clean_ttft = round(float(ttft), 2) if (not self.is_unary and ttft is not None and ttft >= 0) else None
+        clean_gen = round(max(0.0, float(gen_time)), 2)
+
+        tps: Optional[float] = None
+        tps_approx = False
+        if has_usage:
+            if not self.is_unary:
+                streamed_tk = (th_tk + out_tk) if (self.include_thoughts and saw_thought_stream) else out_tk
+                if clean_gen >= 0.12 and streamed_tk > 0:
+                    tps = round(streamed_tk / clean_gen, 1)
+                    tps_approx = False
+                elif (th_tk + out_tk) > 0 and ((clean_ttft or 0.0) + clean_gen) >= 0.1:
+                    tps = round((th_tk + out_tk) / ((clean_ttft or 0.0) + clean_gen), 1)
+                    tps_approx = True
+            else:
+                tot_gen_tk = th_tk + out_tk
+                if clean_gen >= 0.1 and tot_gen_tk > 0:
+                    tps = round(tot_gen_tk / clean_gen, 1)
+                    tps_approx = True
+
+        # 组装清晰安全的展开详情
+        parts_det: List[str] = []
+        if self.failed_steps:
+            chain_str = " → ".join(self.failed_steps + [f"<b>{html.escape(short_cred)} 成功</b>"])
+            parts_det.append(
+                f"🔄 <b>重试轨迹（重试 {self.retries} 次，退避共耗 {self.retry_wait_total:.1f}s）</b>：{chain_str}。"
+            )
+        else:
+            parts_det.append(f"✅ <b>一次直通成功</b>：使用凭证 <b>{html.escape(short_cred)}</b>（{html.escape(cred_note)}）。")
+
+        if not self.is_unary and clean_ttft is not None:
+            parts_det.append(f"⏱️ 首字响应 <b>{clean_ttft:.2f}s</b>，首字后纯流式输出耗时 <b>{clean_gen:.2f}s</b>（请求总历时 {total_wall:.2f}s）。")
+        else:
+            parts_det.append(f"⏱️ 上游原生整包生成耗时 <b>{clean_gen:.2f}s</b>（无独立首字时间，请求总历时 {total_wall:.2f}s）。")
+
+        if has_usage:
+            spd_txt = f"，速度 <b>{'≈' if tps_approx else ''}{tps:.1f} tok/s</b>" if tps else ""
+            parts_det.append(
+                f"💰 Token 明细：输入 <b>{p_tk:,}</b> · 思考 <b>{th_tk:,}</b> · 正文 <b>{out_tk:,}</b>（共 {p_tk + th_tk + out_tk:,} Tokens{spd_txt}）。"
+            )
+        elif is_cookie:
+            ch_txt = f"，正文共 <b>{out_chars:,}</b> 字符" if out_chars > 0 else ""
+            parts_det.append(f"🍪 Cookie 私有接口不回传 Token 统计{ch_txt}。")
+
+        if is_trunc:
+            parts_det.append("⚠️ <b>达上限截断提醒</b>：finish_reason=length（撞上 max_tokens 限制提前停止），若正文未写完建议调大客户端最大回复长度。")
+
+        t_short, t_full = self._build_time_strs()
+        call_recorder.record({
+            "time": t_short,
+            "full_time": t_full,
+            "group": "ok",
+            "badge_type": badge_type,
+            "retries": self.retries,
+            "code": 200,
+            "finish_reason": str(finish_reason or "stop"),
+            "model": self.model_display,
+            "sandbox": self.sandbox,
+            "prefill": self.prefill,
+            "search": self.search,
+            "tool_calls": bool(has_tool_calls or finish_reason == "tool_calls"),
+            "thinking": self.thinking_label,
+            "think_style": self.think_style,
+            "mode": self.mode_label,
+            "mode_class": self.mode_class,
+            "cred": short_cred,
+            "cred_note": cred_note,
+            "is_unary": self.is_unary,
+            "ttft": clean_ttft,
+            "gen_time": clean_gen,
+            "total_time": total_wall,
+            "is_cookie": is_cookie,
+            "has_usage": has_usage,
+            "p_tk": p_tk,
+            "th_tk": th_tk,
+            "out_tk": out_tk,
+            "out_chars": out_chars,
+            "tps": tps,
+            "tps_approx": tps_approx,
+            "detail": " ".join(parts_det),
+        })
+
+    def finalize_error(self, err_code: int, err_msg: str, preflight: bool = False) -> None:
+        if self.finalized:
+            return
+        self.finalized = True
+        total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
+        if preflight or not self.unique_creds:
+            cred = "未发往上游"
+            cred_note = "前置校验拦截"
+        elif len(self.unique_creds) == 1:
+            cred = self.unique_creds[0]
+            cred_note = f"单凭证重试×{self.retries}" if self.retries > 0 else "未触发重试"
+        else:
+            cred = f"试 {len(self.unique_creds)} 凭证均败"
+            cred_note = f"止于 {self.last_cred_short}"
+
+        parts_det: List[str] = []
+        if self.failed_steps:
+            parts_det.append(f"🔄 <b>尝试轨迹</b>：{' → '.join(self.failed_steps)}。")
+        clean_reason = html.escape(str(err_msg or "未知错误").strip()[:600])
+        parts_det.append(f"❌ <b>失败原因（HTTP {err_code} · 总耗时 {total_wall:.2f}s）</b>：{clean_reason}")
+
+        t_short, t_full = self._build_time_strs()
+        call_recorder.record({
+            "time": t_short,
+            "full_time": t_full,
+            "group": "err",
+            "badge_type": "err",
+            "retries": self.retries,
+            "code": int(err_code or 500),
+            "finish_reason": "error",
+            "model": self.model_display,
+            "sandbox": self.sandbox,
+            "prefill": self.prefill,
+            "search": self.search,
+            "tool_calls": False,
+            "thinking": self.thinking_label,
+            "think_style": self.think_style,
+            "mode": self.mode_label,
+            "mode_class": self.mode_class,
+            "cred": cred,
+            "cred_note": cred_note,
+            "is_unary": self.is_unary,
+            "ttft": None,
+            "gen_time": total_wall,
+            "total_time": total_wall,
+            "is_cookie": (cred == "🍪 Cookie"),
+            "has_usage": False,
+            "p_tk": 0,
+            "th_tk": 0,
+            "out_tk": 0,
+            "out_chars": 0,
+            "tps": None,
+            "tps_approx": False,
+            "detail": " ".join(parts_det),
+        })
+
+    def finalize_cancelled(self, partial_output: bool = False) -> None:
+        if self.finalized:
+            return
+        self.finalized = True
+        total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
+        cred = self.last_cred_short or "—"
+        cred_note = "输出中途断开" if partial_output else "前端主动停止"
+        msg = (
+            f"🛑 <b>客户端中途断开（HTTP 499 · 已耗时 {total_wall:.2f}s）</b>：流式输出期间连接关闭，后台已安全回收上游流。"
+            if partial_output
+            else f"🛑 <b>前端手动停止（HTTP 499 · 已耗时 {total_wall:.2f}s）</b>：首包产出前检测到客户端断开，后台已立即取消上游任务与重试。"
+        )
+        t_short, t_full = self._build_time_strs()
+        call_recorder.record({
+            "time": t_short,
+            "full_time": t_full,
+            "group": "cancel",
+            "badge_type": "cancel",
+            "retries": self.retries,
+            "code": 499,
+            "finish_reason": "cancelled",
+            "model": self.model_display,
+            "sandbox": self.sandbox,
+            "prefill": self.prefill,
+            "search": self.search,
+            "tool_calls": False,
+            "thinking": self.thinking_label,
+            "think_style": self.think_style,
+            "mode": self.mode_label,
+            "mode_class": self.mode_class,
+            "cred": cred,
+            "cred_note": cred_note,
+            "is_unary": self.is_unary,
+            "ttft": None,
+            "gen_time": total_wall,
+            "total_time": total_wall,
+            "is_cookie": (cred == "🍪 Cookie"),
+            "has_usage": False,
+            "p_tk": 0,
+            "th_tk": 0,
+            "out_tk": 0,
+            "out_chars": 0,
+            "tps": None,
+            "tps_approx": False,
+            "detail": msg,
+        })
+
+
 async def execute_unified_completion(
     request_obj: OpenAIRequest,
     fastapi_request: Any,
@@ -1450,9 +1876,11 @@ async def execute_unified_completion(
     - 坏凭证自动隔离与红色告警：401/403/欠费凭证当次隔离跳过并提示删除/更换；
     - 严格遵守 retry_backoff_seconds 退避间隔。
     """
+    tracker = CallTraceTracker(request_obj, primary_channel)
     try:
         validate_request_schemas(request_obj)
     except SchemaValidationError as exc:
+        tracker.finalize_error(400, str(exc), preflight=True)
         return JSONResponse(
             status_code=400,
             content=create_openai_error_response(400, str(exc), "invalid_request_error"),
@@ -1498,6 +1926,7 @@ async def execute_unified_completion(
                 + "，请在控制台「通道与凭证」页添加 Express Key。"
             )
             print(f"❌ [密钥配置] {error_msg}")
+            tracker.finalize_error(401, error_msg, preflight=True)
             return JSONResponse(
                 status_code=401,
                 content=create_openai_error_response(401, error_msg, "authentication_error"),
@@ -1519,6 +1948,7 @@ async def execute_unified_completion(
                 )
         if not base_targets:
             print(f"❌ [Studio 鉴权/配置失败] 模型={request_obj.model} | {cookie_err_msg}")
+            tracker.finalize_error(cookie_err_code, cookie_err_msg, preflight=True)
             return JSONResponse(
                 status_code=cookie_err_code,
                 content=create_openai_error_response(cookie_err_code, cookie_err_msg, "auth_error"),
@@ -1538,6 +1968,7 @@ async def execute_unified_completion(
             if err_resp is not None:
                 return None, None, err_resp
             express_ctx = ctx
+            tracker.sync_from_express_ctx(ctx)
             express_prompt_cache = await asyncio.to_thread(
                 ctx["prompt_func"], ctx["request_obj"].messages
             )
@@ -1546,6 +1977,7 @@ async def execute_unified_completion(
     if any(t["channel"] == "express" for t in base_targets):
         _, _, init_err_resp = await _get_express_ctx()
         if init_err_resp is not None:
+            tracker.finalize_error(getattr(init_err_resp, "status_code", 400), "请求参数校验失败", preflight=True)
             return init_err_resp
 
     dead_targets: set[str] = set()
@@ -1643,518 +2075,641 @@ async def execute_unified_completion(
             return ": keep-alive\n\n"
 
         async def _unified_stream_generator():
-            if not (fake_stream_on or is_image_request):
-                yield ": keep-alive\n\n"
+            any_output_yielded = False
+            try:
+                if not (fake_stream_on or is_image_request):
+                    yield ": keep-alive\n\n"
 
-            for attempt in range(max_retries + 1):
-                if await _client_gone():
-                    print(f"ℹ️ [客户端断开] 流式请求前检测到客户端已断开，停止调用模型 {request_obj.model}。")
-                    return
+                for attempt in range(max_retries + 1):
+                    if await _client_gone():
+                        print(f"ℹ️ [客户端断开] 流式请求前检测到客户端已断开，停止调用模型 {request_obj.model}。")
+                        tracker.finalize_cancelled(partial_output=any_output_yielded)
+                        return
 
-                target = _pick_next_target()
-                if target is None:
-                    break
+                    target = _pick_next_target()
+                    if target is None:
+                        break
 
-                has_yielded_output = False
-                attempt_failed = False
-                err_code = 500
-                err_formatted = ""
-                err_retry_after: Optional[float] = None
-                is_retryable = False
-                is_auth_or_billing = False
+                    tracker.note_attempt_start(target)
+                    has_yielded_output = False
+                    attempt_failed = False
+                    err_code = 500
+                    err_formatted = ""
+                    err_retry_after: Optional[float] = None
+                    is_retryable = False
+                    is_auth_or_billing = False
 
-                # ---------- 1A. 当前轮次使用 Express Key ----------
-                if target["channel"] == "express":
-                    ctx, actual_prompt, _ = await _get_express_ctx()
-                    spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
-                    current_client = spec["client"]
-                    model_to_call = spec["model_to_call"]
-                    fallback_model = spec["fallback_model"]
-                    fallback_client_factory = spec["fallback_client_factory"]
-                    gen_config_dict = ctx["gen_config_dict"]
-                    prefill_text = ctx["prefill_text"]
-                    exp_req_obj = ctx["request_obj"]
-                    synth_tool_name = ctx.get("synthetic_tool_name", "")
+                    # ---------- 1A. 当前轮次使用 Express Key ----------
+                    if target["channel"] == "express":
+                        ctx, actual_prompt, _ = await _get_express_ctx()
+                        spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
+                        current_client = spec["client"]
+                        model_to_call = spec["model_to_call"]
+                        fallback_model = spec["fallback_model"]
+                        fallback_client_factory = spec["fallback_client_factory"]
+                        gen_config_dict = ctx["gen_config_dict"]
+                        prefill_text = ctx["prefill_text"]
+                        exp_req_obj = ctx["request_obj"]
+                        synth_tool_name = ctx.get("synthetic_tool_name", "")
 
-                    print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用 {model_to_call}（请求模型={request_obj.model}）。")
+                        print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用 {model_to_call}（请求模型={request_obj.model}）。")
 
-                    if fake_stream_on or is_image_request:
-                        if is_image_request and attempt == 0:
-                            print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出。")
-                        api_call_task: Optional[asyncio.Task] = None
-                        sampler = _RawSampler()
+                        if fake_stream_on or is_image_request:
+                            if is_image_request and attempt == 0:
+                                print("🖼️ [生图保护] 图片模型请求已自动切换为假流式输出。")
+                            api_call_task: Optional[asyncio.Task] = None
+                            sampler = _RawSampler()
 
-                        async def _cancel_task():
-                            nonlocal api_call_task
-                            if api_call_task is not None and not api_call_task.done():
-                                api_call_task.cancel()
-                                try:
-                                    await api_call_task
-                                except (asyncio.CancelledError, Exception):
-                                    pass
+                            async def _cancel_task():
+                                nonlocal api_call_task
+                                if api_call_task is not None and not api_call_task.done():
+                                    api_call_task.cancel()
+                                    try:
+                                        await api_call_task
+                                    except (asyncio.CancelledError, Exception):
+                                        pass
 
-                        try:
-                            raw_gemini_response = None
-                            unary_cfg = strip_stream_fc_args_from_config(gen_config_dict)
-                            for _pin_try in range(2):
-                                api_call_task = asyncio.create_task(
-                                    current_client.aio.models.generate_content(
-                                        model=model_to_call,
-                                        contents=actual_prompt,
-                                        config=unary_cfg,
+                            try:
+                                raw_gemini_response = None
+                                unary_cfg = strip_stream_fc_args_from_config(gen_config_dict)
+                                fake_call_t0 = time.monotonic()
+                                for _pin_try in range(2):
+                                    fake_call_t0 = time.monotonic()
+                                    api_call_task = asyncio.create_task(
+                                        current_client.aio.models.generate_content(
+                                            model=model_to_call,
+                                            contents=actual_prompt,
+                                            config=unary_cfg,
+                                        )
                                     )
+                                    elapsed_hb = 0.0
+                                    while not api_call_task.done():
+                                        await asyncio.sleep(0.5)
+                                        elapsed_hb += 0.5
+                                        if await _client_gone():
+                                            print("ℹ️ [客户端断开] 假流式等待期间客户端已断开，正在取消上游任务。")
+                                            await _cancel_task()
+                                            tracker.finalize_cancelled(partial_output=False)
+                                            return
+                                        if not api_call_task.done() and elapsed_hb >= outer_keep_alive_interval:
+                                            elapsed_hb = 0.0
+                                            yield _make_keepalive_chunk()
+                                    try:
+                                        raw_gemini_response = await api_call_task
+                                        sampler.add(extract_gemini_chunk_debug_dict(raw_gemini_response))
+                                        break
+                                    except Exception as e_pin:
+                                        if (
+                                            _pin_try == 0
+                                            and fallback_model
+                                            and model_to_call != fallback_model
+                                            and is_location_pin_failure(e_pin)
+                                        ):
+                                            _, pin_msg = extract_upstream_error(e_pin)
+                                            print(f"↩️ [上游端点回退] [{target['label']}] 钉定路径 {model_to_call} 失败（{pin_msg[:600]}），"
+                                                  f"立即退回默认路由 {fallback_model} 重试一次。")
+                                            model_to_call = fallback_model
+                                            current_client = fallback_client_factory()
+                                            continue
+                                        raise
+                                fake_unary_elapsed = max(0.0, time.monotonic() - fake_call_t0)
+
+                                if hasattr(raw_gemini_response, "prompt_feedback") and \
+                                   hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
+                                   raw_gemini_response.prompt_feedback.block_reason:
+                                    print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
+                                    raise ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
+
+                                if not is_gemini_response_valid(
+                                    raw_gemini_response,
+                                    synthetic_tool_name=synth_tool_name,
+                                    prefill_text=prefill_text,
+                                ):
+                                    print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
+                                    err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
+                                    if synth_tool_name:
+                                        err_v.is_retryable = True
+                                    raise err_v
+
+                                usage_info = _record_usage(raw_gemini_response)
+                                openai_response_dict = convert_to_openai_format(
+                                    raw_gemini_response,
+                                    exp_req_obj.model,
+                                    synthetic_tool_name=synth_tool_name,
+                                    prefill_text=prefill_text,
                                 )
-                                elapsed_hb = 0.0
-                                while not api_call_task.done():
-                                    await asyncio.sleep(0.5)
-                                    elapsed_hb += 0.5
-                                    if await _client_gone():
-                                        print("ℹ️ [客户端断开] 假流式等待期间客户端已断开，正在取消上游任务。")
-                                        await _cancel_task()
-                                        return
-                                    if not api_call_task.done() and elapsed_hb >= outer_keep_alive_interval:
-                                        elapsed_hb = 0.0
-                                        yield _make_keepalive_chunk()
-                                try:
-                                    raw_gemini_response = await api_call_task
-                                    sampler.add(extract_gemini_chunk_debug_dict(raw_gemini_response))
-                                    break
-                                except Exception as e_pin:
-                                    if (
-                                        _pin_try == 0
-                                        and fallback_model
-                                        and model_to_call != fallback_model
-                                        and is_location_pin_failure(e_pin)
-                                    ):
-                                        _, pin_msg = extract_upstream_error(e_pin)
-                                        print(f"↩️ [上游端点回退] [{target['label']}] 钉定路径 {model_to_call} 失败（{pin_msg[:600]}），"
-                                              f"立即退回默认路由 {fallback_model} 重试一次。")
-                                        model_to_call = fallback_model
-                                        current_client = fallback_client_factory()
-                                        continue
-                                    raise
+                                _prepend_prefill(openai_response_dict, prefill_text)
 
-                            if hasattr(raw_gemini_response, "prompt_feedback") and \
-                               hasattr(raw_gemini_response.prompt_feedback, "block_reason") and \
-                               raw_gemini_response.prompt_feedback.block_reason:
-                                print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
-                                raise ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
+                                _ch0 = (openai_response_dict.get("choices") or [{}])[0]
+                                _msg0 = _ch0.get("message") or {}
+                                _fin0 = _ch0.get("finish_reason") or "stop"
+                                _has_tc0 = bool(_msg0.get("tool_calls"))
+                                _out_c0 = len(_msg0.get("content") or "")
 
-                            if not is_gemini_response_valid(
-                                raw_gemini_response,
-                                synthetic_tool_name=synth_tool_name,
-                                prefill_text=prefill_text,
-                            ):
-                                print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
-                                err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
-                                if synth_tool_name:
-                                    err_v.is_retryable = True
-                                raise err_v
+                                async for chunk_sse in _chunk_openai_response_dict_for_sse(openai_response_dict=openai_response_dict):
+                                    has_yielded_output = True
+                                    any_output_yielded = True
+                                    yield chunk_sse
+                                if app_state.get_setting("debug_outbound", False):
+                                    print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
+                                tracker.finalize_success(
+                                    target,
+                                    is_cookie=False,
+                                    ttft=None,
+                                    gen_time=fake_unary_elapsed,
+                                    finish_reason=_fin0,
+                                    has_tool_calls=_has_tc0,
+                                    has_usage=bool(usage_info["prompt_tokens"] or usage_info["completion_tokens"]),
+                                    p_tk=usage_info["prompt_tokens"],
+                                    th_tk=usage_info["thoughts_tokens"],
+                                    out_tk=usage_info["output_tokens"],
+                                    out_chars=_out_c0,
+                                )
+                                print(f"✅ [Express] {request_obj.model} | 假流式传输完成")
+                                return
 
-                            _record_usage(raw_gemini_response)
-                            openai_response_dict = convert_to_openai_format(
-                                raw_gemini_response,
-                                exp_req_obj.model,
-                                synthetic_tool_name=synth_tool_name,
-                                prefill_text=prefill_text,
+                            except asyncio.CancelledError:
+                                await _cancel_task()
+                                tracker.finalize_cancelled(partial_output=any_output_yielded)
+                                raise
+                            except Exception as e_fake:
+                                attempt_failed = True
+                                err_code, err_formatted = extract_upstream_error(e_fake)
+                                err_retry_after = extract_retry_after_seconds(e_fake, err_formatted)
+                                is_auth_or_billing = is_express_auth_or_billing_error(e_fake, err_code)
+                                is_retryable = is_retryable_exception(e_fake)
+
+                        else:
+                            # Express 真流式
+                            response_id_for_stream = make_bad_woman_response_id(
+                                "chatcmpl-realstream", sandbox_enabled=bool(synth_tool_name)
                             )
-                            _prepend_prefill(openai_response_dict, prefill_text)
+                            stream_start_ts = time.time()
+                            sampler = _RawSampler()
+                            try:
+                                active_stream_cfg = gen_config_dict
+                                for _pin_try in range(3):
+                                    stream_gen_obj = None
+                                    received_any_stream_chunk = False
+                                    try:
+                                        stream_attempt_t0 = time.monotonic()
+                                        first_tok_mono: Optional[float] = None
+                                        saw_thought_stream = False
+                                        stream_gen_obj = await current_client.aio.models.generate_content_stream(
+                                            model=model_to_call,
+                                            contents=actual_prompt,
+                                            config=active_stream_cfg,
+                                        )
+                                        tool_indexer = ToolCallIndexer(
+                                            synthetic_tool_name=synth_tool_name,
+                                            prefill_text=prefill_text,
+                                        )
+                                        deduper = PrefillDeduper(prefill_text) if (prefill_text and (exp_req_obj.n or 1) == 1) else None
+                                        prefill_emitted = not bool(prefill_text)
+                                        emitted_finish_reason = False
+                                        last_finish_reason_str = "stop"
+                                        last_stream_chunk_obj = None
+                                        final_p_tk, final_th_tk, final_out_tk, final_t_tk = 0, 0, 0, 0
 
-                            async for chunk_sse in _chunk_openai_response_dict_for_sse(openai_response_dict=openai_response_dict):
-                                has_yielded_output = True
-                                yield chunk_sse
-                            if app_state.get_setting("debug_outbound", False):
-                                print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
-                            print(f"✅ [Express] {request_obj.model} | 假流式传输完成")
-                            return
-
-                        except asyncio.CancelledError:
-                            await _cancel_task()
-                            raise
-                        except Exception as e_fake:
-                            attempt_failed = True
-                            err_code, err_formatted = extract_upstream_error(e_fake)
-                            err_retry_after = extract_retry_after_seconds(e_fake, err_formatted)
-                            is_auth_or_billing = is_express_auth_or_billing_error(e_fake, err_code)
-                            is_retryable = is_retryable_exception(e_fake)
-
-                    else:
-                        # Express 真流式
-                        response_id_for_stream = make_bad_woman_response_id(
-                            "chatcmpl-realstream", sandbox_enabled=bool(synth_tool_name)
-                        )
-                        stream_start_ts = time.time()
-                        sampler = _RawSampler()
-                        try:
-                            active_stream_cfg = gen_config_dict
-                            for _pin_try in range(3):
-                                stream_gen_obj = None
-                                received_any_stream_chunk = False
-                                try:
-                                    stream_gen_obj = await current_client.aio.models.generate_content_stream(
-                                        model=model_to_call,
-                                        contents=actual_prompt,
-                                        config=active_stream_cfg,
-                                    )
-                                    tool_indexer = ToolCallIndexer(
-                                        synthetic_tool_name=synth_tool_name,
-                                        prefill_text=prefill_text,
-                                    )
-                                    deduper = PrefillDeduper(prefill_text) if (prefill_text and (exp_req_obj.n or 1) == 1) else None
-                                    prefill_emitted = not bool(prefill_text)
-                                    emitted_finish_reason = False
-                                    last_stream_chunk_obj = None
-                                    final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
-
-                                    async for chunk_item_call in stream_gen_obj:
-                                        received_any_stream_chunk = True
-                                        last_stream_chunk_obj = chunk_item_call
-                                        sampler.add(extract_gemini_chunk_debug_dict(chunk_item_call))
-                                        if getattr(chunk_item_call, "usage_metadata", None):
-                                            final_p_tk, final_c_tk, final_t_tk = _extract_usage(chunk_item_call)
-
-                                        pf = getattr(chunk_item_call, "prompt_feedback", None)
-                                        if pf and getattr(pf, "block_reason", None) and not has_yielded_output:
-                                            print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
-                                            raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
-
-                                        num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
-                                        for ci in range(num_candidates):
-                                            sse_chunk = convert_chunk_to_openai(
-                                                chunk_item_call, exp_req_obj.model, response_id_for_stream, ci,
-                                                indexer=tool_indexer,
+                                        async for chunk_item_call in stream_gen_obj:
+                                            received_any_stream_chunk = True
+                                            last_stream_chunk_obj = chunk_item_call
+                                            _has_m_tok, _has_m_th = _chunk_has_model_token(
+                                                chunk_item_call, include_thoughts=tracker.include_thoughts
                                             )
-                                            if not has_yielded_output and '"finish_reason": "content_filter"' in sse_chunk:
-                                                print(f"🔎 [Express 诊断] 模型={model_to_call} 触发安全过滤。原始响应样本：\n{sampler.dump()}")
+                                            if _has_m_tok and first_tok_mono is None:
+                                                first_tok_mono = time.monotonic()
+                                            if _has_m_th:
+                                                saw_thought_stream = True
+                                            sampler.add(extract_gemini_chunk_debug_dict(chunk_item_call))
+                                            if getattr(chunk_item_call, "usage_metadata", None):
+                                                final_p_tk, final_th_tk, final_out_tk, final_t_tk = _extract_usage_detail(chunk_item_call)
+
+                                            pf = getattr(chunk_item_call, "prompt_feedback", None)
+                                            if pf and getattr(pf, "block_reason", None) and not has_yielded_output:
+                                                print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
                                                 raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
 
-                                            if deduper is not None:
-                                                sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
-                                                if sse_chunk is None:
+                                            num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
+                                            for ci in range(num_candidates):
+                                                sse_chunk = convert_chunk_to_openai(
+                                                    chunk_item_call, exp_req_obj.model, response_id_for_stream, ci,
+                                                    indexer=tool_indexer,
+                                                )
+                                                if not has_yielded_output and '"finish_reason": "content_filter"' in sse_chunk:
+                                                    print(f"🔎 [Express 诊断] 模型={model_to_call} 触发安全过滤。原始响应样本：\n{sampler.dump()}")
+                                                    raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
+
+                                                if deduper is not None:
+                                                    sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
+                                                    if sse_chunk is None:
+                                                        continue
+
+                                                is_real_chunk = (
+                                                    '"reasoning_content":' in sse_chunk
+                                                    or '"tool_calls":' in sse_chunk
+                                                    or ('"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk)
+                                                )
+                                                if is_real_chunk and not has_yielded_output:
+                                                    has_yielded_output = True
+                                                    any_output_yielded = True
+                                                    print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                                elif not has_yielded_output:
                                                     continue
 
-                                            is_real_chunk = (
-                                                '"reasoning_content":' in sse_chunk
-                                                or '"tool_calls":' in sse_chunk
-                                                or ('"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk)
-                                            )
-                                            if is_real_chunk and not has_yielded_output:
-                                                has_yielded_output = True
-                                                print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
-                                            elif not has_yielded_output:
-                                                continue
+                                                if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
+                                                    prefill_emitted = True
+                                                    _pf = {
+                                                        "id": response_id_for_stream,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": exp_req_obj.model,
+                                                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
+                                                    }
+                                                    yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
+                                                if '"finish_reason": null' not in sse_chunk and '"finish_reason":' in sse_chunk:
+                                                    emitted_finish_reason = True
+                                                    if '"finish_reason": "length"' in sse_chunk:
+                                                        last_finish_reason_str = "length"
+                                                    elif '"finish_reason": "tool_calls"' in sse_chunk:
+                                                        last_finish_reason_str = "tool_calls"
+                                                yield sse_chunk
+                                            if tool_indexer.has_synthetic_halted(0):
+                                                print(f"🛑 [抗截断保护] 检测到 {model_to_call} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
+                                                last_finish_reason_str = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
+                                                break
 
-                                            if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
-                                                prefill_emitted = True
-                                                _pf = {
-                                                    "id": response_id_for_stream,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": exp_req_obj.model,
-                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
-                                                }
-                                                yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
-                                            if '"finish_reason": null' not in sse_chunk and '"finish_reason":' in sse_chunk:
-                                                emitted_finish_reason = True
-                                            yield sse_chunk
-                                        if tool_indexer.has_synthetic_halted(0):
-                                            print(f"🛑 [抗截断保护] 检测到 {model_to_call} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
-                                            break
-
-                                    rem_calls = tool_indexer.flush_function_calls(0)
-                                    rem_synth_parts = []
-                                    _tail_synth = tool_indexer.flush_synthetic_tail(0)
-                                    _tail_sig = tool_indexer.pop_synth_signature(0)
-                                    if _tail_synth or _tail_sig:
-                                        from message_processing import ordinary_part_metadata as _ord_meta_fn
-                                        tool_indexer.record_ordinary_part(0, _ord_meta_fn("text", _tail_synth, _tail_sig))
-                                    if _tail_synth:
-                                        rem_synth_parts.append(_tail_synth)
-                                    rem_tool_deltas = []
-                                    for c_item in rem_calls:
-                                        if synth_tool_name and c_item.get("name") == synth_tool_name:
-                                            _extra_synth = extract_synthetic_content(
-                                                c_item.get("args"),
-                                                emit_tool_name=synth_tool_name,
-                                                prefill_text=prefill_text,
-                                            )
-                                            if _extra_synth:
-                                                from message_processing import ordinary_part_metadata as _ord_meta_fn
-                                                tool_indexer.record_ordinary_part(
-                                                    0, _ord_meta_fn("text", _extra_synth, c_item.get("thought_signature"))
+                                        stream_eof_mono = time.monotonic()
+                                        rem_calls = tool_indexer.flush_function_calls(0)
+                                        rem_synth_parts = []
+                                        _tail_synth = tool_indexer.flush_synthetic_tail(0)
+                                        _tail_sig = tool_indexer.pop_synth_signature(0)
+                                        if _tail_synth or _tail_sig:
+                                            from message_processing import ordinary_part_metadata as _ord_meta_fn
+                                            tool_indexer.record_ordinary_part(0, _ord_meta_fn("text", _tail_synth, _tail_sig))
+                                        if _tail_synth:
+                                            rem_synth_parts.append(_tail_synth)
+                                        rem_tool_deltas = []
+                                        for c_item in rem_calls:
+                                            if synth_tool_name and c_item.get("name") == synth_tool_name:
+                                                _extra_synth = extract_synthetic_content(
+                                                    c_item.get("args"),
+                                                    emit_tool_name=synth_tool_name,
+                                                    prefill_text=prefill_text,
                                                 )
-                                                rem_synth_parts.append(_extra_synth)
-                                        else:
-                                            tc_idx = tool_indexer.next_index(0)
-                                            rem_tool_deltas.append(
-                                                _format_assembled_tool_call(c_item, tc_idx, indexer=tool_indexer, candidate_index=0)
-                                            )
-                                    rem_synth = "".join(rem_synth_parts)
-                                    if rem_synth or _tail_sig:
-                                        if rem_synth and deduper is not None:
-                                            rem_synth = deduper.feed(rem_synth)
+                                                if _extra_synth:
+                                                    from message_processing import ordinary_part_metadata as _ord_meta_fn
+                                                    tool_indexer.record_ordinary_part(
+                                                        0, _ord_meta_fn("text", _extra_synth, c_item.get("thought_signature"))
+                                                    )
+                                                    rem_synth_parts.append(_extra_synth)
+                                            else:
+                                                tc_idx = tool_indexer.next_index(0)
+                                                rem_tool_deltas.append(
+                                                    _format_assembled_tool_call(c_item, tc_idx, indexer=tool_indexer, candidate_index=0)
+                                                )
+                                        rem_synth = "".join(rem_synth_parts)
                                         if rem_synth or _tail_sig:
-                                            if rem_synth and not has_yielded_output:
-                                                has_yielded_output = True
-                                                print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
-                                            if rem_synth and not prefill_emitted:
-                                                prefill_emitted = True
-                                                _pf = {
-                                                    "id": response_id_for_stream,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": exp_req_obj.model,
-                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
-                                                }
-                                                yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
-                                            _rem_delta: Dict[str, Any] = {}
-                                            if rem_synth:
-                                                _rem_delta["content"] = rem_synth
-                                            if _rem_delta and has_yielded_output:
-                                                _rem_chunk = {
-                                                    "id": response_id_for_stream,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": int(time.time()),
-                                                    "model": exp_req_obj.model,
-                                                    "choices": [{"index": 0, "delta": _rem_delta, "finish_reason": None}],
-                                                }
-                                                yield f"data: {json.dumps(_rem_chunk, ensure_ascii=False)}\n\n"
+                                            if rem_synth and deduper is not None:
+                                                rem_synth = deduper.feed(rem_synth)
+                                            if rem_synth or _tail_sig:
+                                                if rem_synth and not has_yielded_output:
+                                                    has_yielded_output = True
+                                                    any_output_yielded = True
+                                                    print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                                if rem_synth and not prefill_emitted:
+                                                    prefill_emitted = True
+                                                    _pf = {
+                                                        "id": response_id_for_stream,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": exp_req_obj.model,
+                                                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
+                                                    }
+                                                    yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
+                                                _rem_delta: Dict[str, Any] = {}
+                                                if rem_synth:
+                                                    _rem_delta["content"] = rem_synth
+                                                if _rem_delta and has_yielded_output:
+                                                    _rem_chunk = {
+                                                        "id": response_id_for_stream,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": exp_req_obj.model,
+                                                        "choices": [{"index": 0, "delta": _rem_delta, "finish_reason": None}],
+                                                    }
+                                                    yield f"data: {json.dumps(_rem_chunk, ensure_ascii=False)}\n\n"
 
-                                    if deduper is not None and not deduper.done:
-                                        tail = deduper.flush()
-                                        if tail:
+                                        if deduper is not None and not deduper.done:
+                                            tail = deduper.flush()
+                                            if tail:
+                                                if not has_yielded_output:
+                                                    has_yielded_output = True
+                                                    any_output_yielded = True
+                                                    print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                                if not prefill_emitted:
+                                                    prefill_emitted = True
+                                                    _pf = {
+                                                        "id": response_id_for_stream,
+                                                        "object": "chat.completion.chunk",
+                                                        "created": int(time.time()),
+                                                        "model": exp_req_obj.model,
+                                                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
+                                                    }
+                                                    yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
+                                                _tail = {
+                                                    "id": response_id_for_stream,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": int(time.time()),
+                                                    "model": exp_req_obj.model,
+                                                    "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
+                                                }
+                                                yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+
+                                        if rem_tool_deltas:
+                                            first_flush_tc = not has_yielded_output
                                             if not has_yielded_output:
                                                 has_yielded_output = True
+                                                any_output_yielded = True
                                                 print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
-                                            if not prefill_emitted:
-                                                prefill_emitted = True
-                                                _pf = {
+                                            delta_tc: Dict[str, Any] = {"tool_calls": rem_tool_deltas, "content": None}
+                                            if first_flush_tc:
+                                                delta_tc["role"] = "assistant"
+                                            _g_tc = tool_indexer.build_google_extra(0)
+                                            if _g_tc:
+                                                delta_tc["extra_content"] = {"google": _g_tc}
+                                                tool_indexer.mark_extra_emitted(0)
+                                            _eof_tc_chunk = {
+                                                "id": response_id_for_stream,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": exp_req_obj.model,
+                                                "choices": [{"index": 0, "delta": delta_tc, "finish_reason": None}],
+                                            }
+                                            yield f"data: {json.dumps(_eof_tc_chunk, ensure_ascii=False)}\n\n"
+
+                                        # 真流式全量空回拦截：无论是否开启沙箱，只要模型未产出任何有效正文/思考/工具调用，绝不把空壳当成功发出，立即报错（非沙箱模式不盲目重试）！
+                                        if not has_yielded_output:
+                                            print(f"🔎 [Express 诊断] 模型={model_to_call} 真流式未产出任何有效正文。原始响应样本：\n{sampler.dump()}")
+                                            desc_empty = _describe_empty_gemini_response(last_stream_chunk_obj, model_to_call)
+                                            err_empty_stream = ValueError(desc_empty)
+                                            if synth_tool_name:
+                                                err_empty_stream.is_retryable = True
+                                            raise err_empty_stream
+
+                                        if has_yielded_output and not emitted_finish_reason:
+                                            _fin_reason = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
+                                            last_finish_reason_str = _fin_reason
+                                            _fin_delta_eof: Dict[str, Any] = {}
+                                            if not tool_indexer.has_emitted_extra(0):
+                                                _g_eof = tool_indexer.build_google_extra(0)
+                                                if _g_eof:
+                                                    _fin_delta_eof["extra_content"] = {"google": _g_eof}
+                                                    tool_indexer.mark_extra_emitted(0)
+                                            _fin_chunk = {
+                                                "id": response_id_for_stream,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": exp_req_obj.model,
+                                                "choices": [{"index": 0, "delta": _fin_delta_eof, "finish_reason": _fin_reason}],
+                                            }
+                                            yield f"data: {json.dumps(_fin_chunk, ensure_ascii=False)}\n\n"
+                                        elif has_yielded_output and not tool_indexer.has_emitted_extra(0):
+                                            _g_late = tool_indexer.build_google_extra(0)
+                                            if _g_late.get("thought_signature"):
+                                                tool_indexer.mark_extra_emitted(0)
+                                                _sig_chunk = {
                                                     "id": response_id_for_stream,
                                                     "object": "chat.completion.chunk",
                                                     "created": int(time.time()),
                                                     "model": exp_req_obj.model,
-                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": prefill_text}, "finish_reason": None}],
+                                                    "choices": [{"index": 0, "delta": {"extra_content": {"google": _g_late}}, "finish_reason": None}],
                                                 }
-                                                yield f"data: {json.dumps(_pf, ensure_ascii=False)}\n\n"
-                                            _tail = {
-                                                "id": response_id_for_stream,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": exp_req_obj.model,
-                                                "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
+                                                yield f"data: {json.dumps(_sig_chunk, ensure_ascii=False)}\n\n"
+
+                                        final_comp_tk = final_th_tk + final_out_tk
+                                        if final_p_tk > 0 or final_comp_tk > 0:
+                                            stats.add_tokens(final_p_tk, final_comp_tk)
+                                            print(f"💰 [算力消耗统计] 输入: {final_p_tk} | 思考: {final_th_tk} | 正文: {final_out_tk} | 总计: {final_t_tk} Tokens")
+                                        else:
+                                            stats.add_success()
+
+                                        if wants_usage(exp_req_obj):
+                                            _u_dict: Dict[str, Any] = {
+                                                "prompt_tokens": final_p_tk,
+                                                "completion_tokens": final_comp_tk,
+                                                "total_tokens": final_t_tk,
                                             }
-                                            yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
+                                            if final_th_tk > 0:
+                                                _u_dict["completion_tokens_details"] = {"reasoning_tokens": final_th_tk}
+                                            yield make_usage_chunk(response_id_for_stream, exp_req_obj.model, _u_dict)
 
-                                    if rem_tool_deltas:
-                                        first_flush_tc = not has_yielded_output
-                                        if not has_yielded_output:
-                                            has_yielded_output = True
-                                            print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
-                                        delta_tc: Dict[str, Any] = {"tool_calls": rem_tool_deltas, "content": None}
-                                        if first_flush_tc:
-                                            delta_tc["role"] = "assistant"
-                                        _g_tc = tool_indexer.build_google_extra(0)
-                                        if _g_tc:
-                                            delta_tc["extra_content"] = {"google": _g_tc}
-                                            tool_indexer.mark_extra_emitted(0)
-                                        _eof_tc_chunk = {
-                                            "id": response_id_for_stream,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": exp_req_obj.model,
-                                            "choices": [{"index": 0, "delta": delta_tc, "finish_reason": None}],
-                                        }
-                                        yield f"data: {json.dumps(_eof_tc_chunk, ensure_ascii=False)}\n\n"
+                                        yield "data: [DONE]\n\n"
+                                        elapsed = time.time() - stream_start_ts
+                                        if app_state.get_setting("debug_outbound", False):
+                                            print(f"🔎 [Express 尾包原始结构] {sampler.dump()}")
 
-                                    # 真流式全量空回拦截：无论是否开启沙箱，只要模型未产出任何有效正文/思考/工具调用，绝不把空壳当成功发出，立即报错（非沙箱模式不盲目重试）！
-                                    if not has_yielded_output:
-                                        print(f"🔎 [Express 诊断] 模型={model_to_call} 真流式未产出任何有效正文。原始响应样本：\n{sampler.dump()}")
-                                        desc_empty = _describe_empty_gemini_response(last_stream_chunk_obj, model_to_call)
-                                        err_empty_stream = ValueError(desc_empty)
-                                        if synth_tool_name:
-                                            err_empty_stream.is_retryable = True
-                                        raise err_empty_stream
-
-                                    if has_yielded_output and not emitted_finish_reason:
-                                        _fin_reason = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
-                                        _fin_delta_eof: Dict[str, Any] = {}
-                                        if not tool_indexer.has_emitted_extra(0):
-                                            _g_eof = tool_indexer.build_google_extra(0)
-                                            if _g_eof:
-                                                _fin_delta_eof["extra_content"] = {"google": _g_eof}
-                                                tool_indexer.mark_extra_emitted(0)
-                                        _fin_chunk = {
-                                            "id": response_id_for_stream,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": exp_req_obj.model,
-                                            "choices": [{"index": 0, "delta": _fin_delta_eof, "finish_reason": _fin_reason}],
-                                        }
-                                        yield f"data: {json.dumps(_fin_chunk, ensure_ascii=False)}\n\n"
-                                    elif has_yielded_output and not tool_indexer.has_emitted_extra(0):
-                                        _g_late = tool_indexer.build_google_extra(0)
-                                        if _g_late.get("thought_signature"):
-                                            tool_indexer.mark_extra_emitted(0)
-                                            _sig_chunk = {
-                                                "id": response_id_for_stream,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": exp_req_obj.model,
-                                                "choices": [{"index": 0, "delta": {"extra_content": {"google": _g_late}}, "finish_reason": None}],
-                                            }
-                                            yield f"data: {json.dumps(_sig_chunk, ensure_ascii=False)}\n\n"
-
-                                    if final_p_tk > 0 or final_c_tk > 0:
-                                        stats.add_tokens(final_p_tk, final_c_tk)
-                                        print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
-                                    else:
-                                        stats.add_success()
-
-                                    if wants_usage(exp_req_obj):
-                                        yield make_usage_chunk(response_id_for_stream, exp_req_obj.model, {
-                                            "prompt_tokens": final_p_tk,
-                                            "completion_tokens": final_c_tk,
-                                            "total_tokens": final_t_tk,
-                                        })
-
-                                    yield "data: [DONE]\n\n"
-                                    elapsed = time.time() - stream_start_ts
-                                    if app_state.get_setting("debug_outbound", False):
-                                        print(f"🔎 [Express 尾包原始结构] {sampler.dump()}")
-                                    print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
-                                    return
-                                except Exception as e_pin_stream:
-                                    _stripped_s_cfg = strip_stream_fc_args_from_config(active_stream_cfg)
-                                    if (
-                                        not has_yielded_output
-                                        and not received_any_stream_chunk
-                                        and _stripped_s_cfg is not active_stream_cfg
-                                        and is_stream_fc_args_unsupported_error(e_pin_stream)
-                                    ):
-                                        print(
-                                            f"⚠️ [抗截断兼容] 模型 {model_to_call} 不支持 stream_function_call_arguments，"
-                                            "已自动剥离分片参数标志并保持 compose_reply 重试。"
+                                        _ord_items, _ = tool_indexer.topology(0)
+                                        _stream_chars = (len(prefill_text) if prefill_text else 0) + sum(
+                                            len(it.get("text") or "") for it in _ord_items if it.get("kind") == "text"
                                         )
-                                        active_stream_cfg = _stripped_s_cfg
-                                        continue
-                                    if (
-                                        _pin_try == 0
-                                        and not has_yielded_output
-                                        and fallback_model
-                                        and model_to_call != fallback_model
-                                        and is_location_pin_failure(e_pin_stream)
-                                    ):
-                                        _, pin_msg = extract_upstream_error(e_pin_stream)
-                                        print(f"↩️ [上游端点回退] [{target['label']}] 钉定路径 {model_to_call} 失败（{pin_msg[:600]}），"
-                                              f"立即退回默认路由 {fallback_model} 重试一次。")
-                                        model_to_call = fallback_model
-                                        current_client = fallback_client_factory()
-                                        continue
-                                    raise
-                                finally:
-                                    if stream_gen_obj is not None and hasattr(stream_gen_obj, "aclose"):
-                                        try:
-                                            await stream_gen_obj.aclose()
-                                        except Exception:
-                                            pass
+                                        _s_ttft = max(0.0, first_tok_mono - stream_attempt_t0) if first_tok_mono is not None else None
+                                        _s_gen = (
+                                            max(0.0, stream_eof_mono - first_tok_mono)
+                                            if first_tok_mono is not None
+                                            else max(0.0, stream_eof_mono - stream_attempt_t0)
+                                        )
+                                        tracker.finalize_success(
+                                            target,
+                                            is_cookie=False,
+                                            ttft=_s_ttft,
+                                            gen_time=_s_gen,
+                                            saw_thought_stream=saw_thought_stream,
+                                            finish_reason=("tool_calls" if tool_indexer.has_tool_calls(0) else last_finish_reason_str),
+                                            has_tool_calls=tool_indexer.has_tool_calls(0),
+                                            has_usage=bool(final_p_tk > 0 or final_comp_tk > 0),
+                                            p_tk=final_p_tk,
+                                            th_tk=final_th_tk,
+                                            out_tk=final_out_tk,
+                                            out_chars=_stream_chars,
+                                        )
+                                        print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
+                                        return
+                                    except Exception as e_pin_stream:
+                                        _stripped_s_cfg = strip_stream_fc_args_from_config(active_stream_cfg)
+                                        if (
+                                            not has_yielded_output
+                                            and not received_any_stream_chunk
+                                            and _stripped_s_cfg is not active_stream_cfg
+                                            and is_stream_fc_args_unsupported_error(e_pin_stream)
+                                        ):
+                                            print(
+                                                f"⚠️ [抗截断兼容] 模型 {model_to_call} 不支持 stream_function_call_arguments，"
+                                                "已自动剥离分片参数标志并保持 compose_reply 重试。"
+                                            )
+                                            active_stream_cfg = _stripped_s_cfg
+                                            continue
+                                        if (
+                                            _pin_try == 0
+                                            and not has_yielded_output
+                                            and fallback_model
+                                            and model_to_call != fallback_model
+                                            and is_location_pin_failure(e_pin_stream)
+                                        ):
+                                            _, pin_msg = extract_upstream_error(e_pin_stream)
+                                            print(f"↩️ [上游端点回退] [{target['label']}] 钉定路径 {model_to_call} 失败（{pin_msg[:600]}），"
+                                                  f"立即退回默认路由 {fallback_model} 重试一次。")
+                                            model_to_call = fallback_model
+                                            current_client = fallback_client_factory()
+                                            continue
+                                        raise
+                                    finally:
+                                        if stream_gen_obj is not None and hasattr(stream_gen_obj, "aclose"):
+                                            try:
+                                                await stream_gen_obj.aclose()
+                                            except Exception:
+                                                pass
+                            except asyncio.CancelledError:
+                                print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
+                                tracker.finalize_cancelled(partial_output=any_output_yielded)
+                                raise
+                            except Exception as e_stream_call:
+                                err_code, err_formatted = extract_upstream_error(e_stream_call)
+                                err_retry_after = extract_retry_after_seconds(e_stream_call, err_formatted)
+                                if has_yielded_output:
+                                    stats.add_error()
+                                    tracker.note_attempt_failure(target, err_code)
+                                    tracker.finalize_error(err_code, f"流式传输中途中断：{err_formatted}")
+                                    print(f"❌ [Express 流式中断报错] 凭证=[{target['label']}] | 模型={request_obj.model} | HTTP {err_code} | {err_formatted[:2000]}")
+                                    yield "data: [DONE]\n\n"
+                                    return
+                                attempt_failed = True
+                                is_auth_or_billing = is_express_auth_or_billing_error(e_stream_call, err_code)
+                                is_retryable = is_retryable_exception(e_stream_call)
+
+                    # ---------- 1B. 当前轮次使用 Studio Cookie 直连 ----------
+                    else:
+                        print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用模型 {request_obj.model}。")
+                        cookie_iter = None
+                        cookie_tel: Dict[str, Any] = {}
+                        try:
+                            cookie_resp = await cookie_upstream.execute_once(
+                                request_obj, fastapi_request, telemetry=cookie_tel
+                            )
+                            tracker.sync_from_cookie_telemetry(cookie_tel)
+                            cookie_iter = cookie_resp.body_iterator
+                            async for chunk_item in cookie_iter:
+                                chunk_str = chunk_item.decode("utf-8", errors="replace") if isinstance(chunk_item, bytes) else str(chunk_item)
+                                if chunk_str.strip().startswith("data:") and '"chatcmpl-keepalive"' not in chunk_str:
+                                    has_yielded_output = True
+                                    any_output_yielded = True
+                                yield chunk_str
+                            tracker.sync_from_cookie_telemetry(cookie_tel)
+                            if cookie_tel.get("cancelled"):
+                                tracker.finalize_cancelled(partial_output=any_output_yielded)
+                            elif cookie_tel.get("midstream_error"):
+                                m_code = int(cookie_tel.get("error_code") or 502)
+                                tracker.note_attempt_failure(target, m_code)
+                                tracker.finalize_error(m_code, f"Studio 流式中途报错：{cookie_tel['midstream_error']}")
+                            else:
+                                tracker.finalize_success(
+                                    target,
+                                    is_cookie=True,
+                                    ttft=cookie_tel.get("ttft"),
+                                    gen_time=float(cookie_tel.get("gen_time") or 0.0),
+                                    saw_thought_stream=bool(cookie_tel.get("saw_thought_stream")),
+                                    finish_reason=str(cookie_tel.get("finish_reason") or "stop"),
+                                    has_tool_calls=bool(cookie_tel.get("tool_calls")),
+                                    has_usage=bool(cookie_tel.get("has_usage")),
+                                    p_tk=int(cookie_tel.get("p_tk") or 0),
+                                    th_tk=int(cookie_tel.get("th_tk") or 0),
+                                    out_tk=int(cookie_tel.get("out_tk") or 0),
+                                    out_chars=int(cookie_tel.get("out_chars") or 0),
+                                )
+                            return
                         except asyncio.CancelledError:
-                            print(f"ℹ️ [客户端断开] 真流式响应期间客户端已断开，模型 {model_to_call} 的请求已安全终止。")
+                            tracker.sync_from_cookie_telemetry(cookie_tel)
+                            tracker.finalize_cancelled(partial_output=any_output_yielded)
                             raise
-                        except Exception as e_stream_call:
-                            err_code, err_formatted = extract_upstream_error(e_stream_call)
-                            err_retry_after = extract_retry_after_seconds(e_stream_call, err_formatted)
+                        except Exception as e_cookie:
+                            tracker.sync_from_cookie_telemetry(cookie_tel)
+                            err_code = getattr(e_cookie, "status_code", None) or getattr(e_cookie, "code", None) or 500
+                            err_formatted = getattr(e_cookie, "message", None) or str(e_cookie)
+                            err_retry_after = extract_retry_after_seconds(e_cookie, err_formatted)
                             if has_yielded_output:
                                 stats.add_error()
-                                print(f"❌ [Express 流式中断报错] 凭证=[{target['label']}] | 模型={request_obj.model} | HTTP {err_code} | {err_formatted[:2000]}")
+                                tracker.note_attempt_failure(target, err_code)
+                                tracker.finalize_error(err_code, f"Studio 流式中途报错：{err_formatted}")
+                                print(f"❌ [Studio 流式中断报错] 凭证=[{target['label']}] | 模型={request_obj.model} | {err_formatted[:2000]}")
                                 yield "data: [DONE]\n\n"
                                 return
                             attempt_failed = True
-                            is_auth_or_billing = is_express_auth_or_billing_error(e_stream_call, err_code)
-                            is_retryable = is_retryable_exception(e_stream_call)
+                            is_auth_or_billing = bool(getattr(e_cookie, "is_auth_or_billing", False))
+                            is_retryable = bool(getattr(e_cookie, "is_retryable", False))
+                        finally:
+                            if cookie_iter is not None and hasattr(cookie_iter, "aclose"):
+                                try:
+                                    await cookie_iter.aclose()
+                                except Exception:
+                                    pass
 
-                # ---------- 1B. 当前轮次使用 Studio Cookie 直连 ----------
-                else:
-                    print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用模型 {request_obj.model}。")
-                    cookie_iter = None
-                    try:
-                        cookie_resp = await cookie_upstream.execute_once(request_obj, fastapi_request)
-                        cookie_iter = cookie_resp.body_iterator
-                        async for chunk_item in cookie_iter:
-                            chunk_str = chunk_item.decode("utf-8", errors="replace") if isinstance(chunk_item, bytes) else str(chunk_item)
-                            if chunk_str.strip().startswith("data:") and '"chatcmpl-keepalive"' not in chunk_str:
-                                has_yielded_output = True
-                            yield chunk_str
-                        return
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e_cookie:
-                        err_code = getattr(e_cookie, "status_code", None) or getattr(e_cookie, "code", None) or 500
-                        err_formatted = getattr(e_cookie, "message", None) or str(e_cookie)
-                        err_retry_after = extract_retry_after_seconds(e_cookie, err_formatted)
-                        if has_yielded_output:
-                            stats.add_error()
-                            print(f"❌ [Studio 流式中断报错] 凭证=[{target['label']}] | 模型={request_obj.model} | {err_formatted[:2000]}")
-                            yield "data: [DONE]\n\n"
-                            return
-                        attempt_failed = True
-                        is_auth_or_billing = bool(getattr(e_cookie, "is_auth_or_billing", False))
-                        is_retryable = bool(getattr(e_cookie, "is_retryable", False))
-                    finally:
-                        if cookie_iter is not None and hasattr(cookie_iter, "aclose"):
-                            try:
-                                await cookie_iter.aclose()
-                            except Exception:
-                                pass
+                    # ---------- 1C. 统一处理流式首包前的失败与多凭证退避轮换 ----------
+                    if attempt_failed:
+                        if is_auth_or_billing:
+                            dead_targets.add(target["id"])
+                            tip = _emit_credential_invalid_warning(target, err_code, err_formatted)
+                            if "【凭证更换提醒】" not in err_formatted:
+                                err_formatted = err_formatted + tip
 
-                # ---------- 1C. 统一处理流式首包前的失败与多凭证退避轮换 ----------
-                if attempt_failed:
-                    if is_auth_or_billing:
-                        dead_targets.add(target["id"])
-                        tip = _emit_credential_invalid_warning(target, err_code, err_formatted)
-                        if "【凭证更换提醒】" not in err_formatted:
-                            err_formatted = err_formatted + tip
-
-                    next_target = _peek_next_target()
-                    can_retry = (
-                        attempt < max_retries
-                        and next_target is not None
-                        and (is_retryable or is_auth_or_billing)
-                    )
-                    if can_retry:
-                        if await _client_gone():
-                            print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {request_obj.model}。")
-                            return
-                        stats.add_retry()
-                        wait_target = _compute_smart_retry_wait(
-                            backoff_sec, target, next_target, err_retry_after
+                        next_target = _peek_next_target()
+                        can_retry = (
+                            attempt < max_retries
+                            and next_target is not None
+                            and (is_retryable or is_auth_or_billing)
                         )
-                        print(
-                            f"⚠️ [自动重试] 流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
-                            f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
-                            f"原因: {err_formatted[:1500]}"
-                        )
-                        waited = 0.0
-                        hb_acc = 0.0
-                        hb_step_target = outer_keep_alive_interval if (fake_stream_on or is_image_request) else 3.0
-                        while waited < wait_target:
-                            step = min(0.5, wait_target - waited)
-                            await asyncio.sleep(step)
-                            waited += step
-                            hb_acc += step
+                        if can_retry:
                             if await _client_gone():
-                                print(f"ℹ️ [客户端断开] 退避等待期间客户端已断开，停止重试模型 {request_obj.model}。")
+                                print(f"ℹ️ [客户端断开] 重试前检测到客户端已断开，停止调用模型 {request_obj.model}。")
+                                tracker.finalize_cancelled(partial_output=False)
                                 return
-                            if hb_acc >= hb_step_target:
-                                hb_acc = 0.0
-                                yield _make_keepalive_chunk()
-                        continue
+                            stats.add_retry()
+                            wait_target = _compute_smart_retry_wait(
+                                backoff_sec, target, next_target, err_retry_after
+                            )
+                            tracker.note_attempt_failure(target, err_code, wait_sec=wait_target)
+                            print(
+                                f"⚠️ [自动重试] 流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
+                                f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
+                                f"原因: {err_formatted[:1500]}"
+                            )
+                            waited = 0.0
+                            hb_acc = 0.0
+                            hb_step_target = outer_keep_alive_interval if (fake_stream_on or is_image_request) else 3.0
+                            while waited < wait_target:
+                                step = min(0.5, wait_target - waited)
+                                await asyncio.sleep(step)
+                                waited += step
+                                hb_acc += step
+                                if await _client_gone():
+                                    print(f"ℹ️ [客户端断开] 退避等待期间客户端已断开，停止重试模型 {request_obj.model}。")
+                                    tracker.finalize_cancelled(partial_output=False)
+                                    return
+                                if hb_acc >= hb_step_target:
+                                    hb_acc = 0.0
+                                    yield _make_keepalive_chunk()
+                            continue
 
-                    stats.add_error()
-                    print(f"❌ [流式请求失败] 模型={request_obj.model} | 凭证=[{target['label']}] | HTTP {err_code} | {err_formatted[:2000]}")
-                    err_resp = create_openai_error_response(err_code, err_formatted[:2000], "upstream_error")
-                    yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+                        tracker.note_attempt_failure(target, err_code)
+                        tracker.finalize_error(err_code, err_formatted)
+                        stats.add_error()
+                        print(f"❌ [流式请求失败] 模型={request_obj.model} | 凭证=[{target['label']}] | HTTP {err_code} | {err_formatted[:2000]}")
+                        err_resp = create_openai_error_response(err_code, err_formatted[:2000], "upstream_error")
+                        yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+            finally:
+                if not tracker.finalized:
+                    tracker.finalize_cancelled(partial_output=any_output_yielded)
 
         return StreamingResponse(_unified_stream_generator(), media_type="text/event-stream")
 
@@ -2167,6 +2722,7 @@ async def execute_unified_completion(
     for attempt in range(max_retries + 1):
         if await _client_gone():
             print(f"ℹ️ [客户端断开] 非流式请求前检测到客户端已断开，停止调用模型 {request_obj.model}。")
+            tracker.finalize_cancelled(partial_output=False)
             return JSONResponse(
                 status_code=499,
                 content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
@@ -2176,6 +2732,7 @@ async def execute_unified_completion(
         if target is None:
             break
 
+        tracker.note_attempt_start(target)
         err_code = 500
         err_formatted = ""
         err_retry_after: Optional[float] = None
@@ -2201,7 +2758,9 @@ async def execute_unified_completion(
                 response_obj_call = None
                 sampler = _RawSampler()
                 unary_cfg = strip_stream_fc_args_from_config(gen_config_dict)
+                ns_call_t0 = time.monotonic()
                 for _pin_try in range(2):
+                    ns_call_t0 = time.monotonic()
                     call_task = asyncio.create_task(
                         current_client.aio.models.generate_content(
                             model=model_to_call,
@@ -2219,6 +2778,7 @@ async def execute_unified_completion(
                                     await call_task
                                 except (asyncio.CancelledError, Exception):
                                     pass
+                                tracker.finalize_cancelled(partial_output=False)
                                 return JSONResponse(
                                     status_code=499,
                                     content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
@@ -2229,6 +2789,7 @@ async def execute_unified_completion(
                     except asyncio.CancelledError:
                         if not call_task.done():
                             call_task.cancel()
+                        tracker.finalize_cancelled(partial_output=False)
                         raise
                     except Exception as e_pin_call:
                         if (
@@ -2244,6 +2805,7 @@ async def execute_unified_completion(
                             current_client = fallback_client_factory()
                             continue
                         raise
+                ns_unary_elapsed = max(0.0, time.monotonic() - ns_call_t0)
 
                 if hasattr(response_obj_call, "prompt_feedback") and \
                    hasattr(response_obj_call.prompt_feedback, "block_reason") and \
@@ -2262,7 +2824,7 @@ async def execute_unified_completion(
                         err_v.is_retryable = True
                     raise err_v
 
-                _record_usage(response_obj_call)
+                usage_info_ns = _record_usage(response_obj_call)
                 openai_response_content = convert_to_openai_format(
                     response_obj_call,
                     exp_req_obj.model,
@@ -2272,10 +2834,27 @@ async def execute_unified_completion(
                 _prepend_prefill(openai_response_content, prefill_text)
                 if app_state.get_setting("debug_outbound", False):
                     print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
+                _ns_ch0 = (openai_response_content.get("choices") or [{}])[0]
+                _ns_msg0 = _ns_ch0.get("message") or {}
+                _ns_fin0 = _ns_ch0.get("finish_reason") or "stop"
+                tracker.finalize_success(
+                    target,
+                    is_cookie=False,
+                    ttft=None,
+                    gen_time=ns_unary_elapsed,
+                    finish_reason=_ns_fin0,
+                    has_tool_calls=bool(_ns_msg0.get("tool_calls")),
+                    has_usage=bool(usage_info_ns["prompt_tokens"] or usage_info_ns["completion_tokens"]),
+                    p_tk=usage_info_ns["prompt_tokens"],
+                    th_tk=usage_info_ns["thoughts_tokens"],
+                    out_tk=usage_info_ns["output_tokens"],
+                    out_chars=len(_ns_msg0.get("content") or ""),
+                )
                 print(f"✅ [Express] {request_obj.model} | 非流式响应完成")
                 return JSONResponse(content=openai_response_content)
 
             except asyncio.CancelledError:
+                tracker.finalize_cancelled(partial_output=False)
                 raise
             except Exception as e_call:
                 err_code, err_formatted = extract_upstream_error(e_call)
@@ -2286,11 +2865,35 @@ async def execute_unified_completion(
         # ---------- 2B. 当前轮次使用 Studio Cookie 直连 ----------
         else:
             print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用模型 {request_obj.model}。")
+            cookie_ns_tel: Dict[str, Any] = {}
             try:
-                return await cookie_upstream.execute_once(request_obj, fastapi_request)
+                cookie_ns_resp = await cookie_upstream.execute_once(
+                    request_obj, fastapi_request, telemetry=cookie_ns_tel
+                )
+                tracker.sync_from_cookie_telemetry(cookie_ns_tel)
+                if getattr(cookie_ns_resp, "status_code", 200) == 499 or cookie_ns_tel.get("cancelled"):
+                    tracker.finalize_cancelled(partial_output=False)
+                else:
+                    tracker.finalize_success(
+                        target,
+                        is_cookie=True,
+                        ttft=None,
+                        gen_time=float(cookie_ns_tel.get("gen_time") or 0.0),
+                        finish_reason=str(cookie_ns_tel.get("finish_reason") or "stop"),
+                        has_tool_calls=bool(cookie_ns_tel.get("tool_calls")),
+                        has_usage=bool(cookie_ns_tel.get("has_usage")),
+                        p_tk=int(cookie_ns_tel.get("p_tk") or 0),
+                        th_tk=int(cookie_ns_tel.get("th_tk") or 0),
+                        out_tk=int(cookie_ns_tel.get("out_tk") or 0),
+                        out_chars=int(cookie_ns_tel.get("out_chars") or 0),
+                    )
+                return cookie_ns_resp
             except asyncio.CancelledError:
+                tracker.sync_from_cookie_telemetry(cookie_ns_tel)
+                tracker.finalize_cancelled(partial_output=False)
                 raise
             except Exception as e_cookie:
+                tracker.sync_from_cookie_telemetry(cookie_ns_tel)
                 err_code = getattr(e_cookie, "status_code", None) or getattr(e_cookie, "code", None) or 500
                 err_formatted = getattr(e_cookie, "message", None) or str(e_cookie)
                 err_retry_after = extract_retry_after_seconds(e_cookie, err_formatted)
@@ -2315,6 +2918,7 @@ async def execute_unified_completion(
         )
         if can_retry:
             if await _client_gone():
+                tracker.finalize_cancelled(partial_output=False)
                 return JSONResponse(
                     status_code=499,
                     content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
@@ -2323,6 +2927,7 @@ async def execute_unified_completion(
             wait_target = _compute_smart_retry_wait(
                 backoff_sec, target, next_target, err_retry_after
             )
+            tracker.note_attempt_failure(target, err_code, wait_sec=wait_target)
             print(
                 f"⚠️ [自动重试] 非流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
                 f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
@@ -2335,12 +2940,15 @@ async def execute_unified_completion(
                 waited += step
                 if await _client_gone():
                     print(f"ℹ️ [客户端断开] 非流式退避期间客户端已断开，停止重试模型 {request_obj.model}。")
+                    tracker.finalize_cancelled(partial_output=False)
                     return JSONResponse(
                         status_code=499,
                         content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
                     )
             continue
 
+        tracker.note_attempt_failure(target, err_code)
+        tracker.finalize_error(err_code, err_formatted)
         # 注意：非流式返回 status_code >= 400 时，main.py 的 stats_tracker_middleware 会统一计 1 次 error
         print(f"❌ [非流式请求失败] 模型={request_obj.model} | 凭证=[{target['label']}] | HTTP {err_code} | {err_formatted[:2000]}")
         return JSONResponse(
@@ -2348,6 +2956,7 @@ async def execute_unified_completion(
             content=create_openai_error_response(err_code, err_formatted[:2000], "upstream_error"),
         )
 
+    tracker.finalize_error(last_err_code, last_err_formatted)
     return JSONResponse(
         status_code=last_err_code,
         content=create_openai_error_response(last_err_code, last_err_formatted[:2000], "upstream_error"),

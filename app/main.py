@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from express_key_manager import ExpressKeyManager
 from routes import models_api, chat_api
 
-from logger import rt_logger, stats
+from logger import rt_logger, stats, call_recorder
 import config
 from runtime_state import app_state
 import model_capabilities as mc
@@ -393,6 +393,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   html.dark .pill-mint { border-color:#244a42; background:rgba(95,211,188,.14); color:#6de0c9; }
   .pill-apricot { border-color:#f9e2be; background:#fff8ee; color:var(--apricot-text); font-weight:600; }
   html.dark .pill-apricot { border-color:#4d3b24; background:rgba(248,194,122,.14); color:#fad096; }
+  .pill-coral { border-color:#fbd2da; background:#fff2f5; color:var(--coral-text); font-weight:600; }
+  html.dark .pill-coral { border-color:#522b38; background:rgba(246,134,151,.15); color:#ff9bab; }
+  .pill-sky { border-color:#cfe6ff; background:#f0f7ff; color:#2b73bd; font-weight:600; }
+  html.dark .pill-sky { border-color:#243e5c; background:rgba(116,185,255,.14); color:#8cc6ff; }
   .theme-seg { display:inline-flex; align-items:center; padding:2px; border-radius:999px; border:1px solid var(--border); background:var(--inp-bg); font-size:12px; }
   .theme-seg span { padding:2.5px 9px; border-radius:999px; cursor:pointer; transition:.18s; color:var(--muted); user-select:none; white-space:nowrap; }
   .theme-seg span.on { background:linear-gradient(135deg,#8b7cf6,#f48fb1); color:#fff; font-weight:600; box-shadow:0 2px 6px rgba(139,124,246,.24); }
@@ -469,6 +473,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   #logwin { background:#f8f6fc; box-shadow:inset 0 2px 6px rgba(139,124,246,.05); }
   html.dark #logwin { background:#110f17 !important; box-shadow:inset 0 2px 8px rgba(0,0,0,.35); }
   .log-header { background:var(--surface-soft); border-color:var(--border); }
+  .flt-seg { display:inline-flex; padding:2px; border-radius:9px; border:1px solid var(--border); background:var(--surface-soft); gap:2px; }
+  .flt-btn { padding:3px 10px; border-radius:7px; font-size:11.5px; font-weight:600; color:var(--muted); cursor:pointer; transition:.15s; border:none; background:transparent; white-space:nowrap; }
+  .flt-btn.active { background:var(--inp-bg); color:var(--accent); box-shadow:0 1px 4px rgba(139,124,246,.12); }
+  html.dark .flt-btn.active { background:#252038; color:#c4b8ff; }
+  .rec-table { width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px; }
+  .rec-table th { text-align:left; font-size:11.5px; font-weight:600; color:var(--muted); padding:9px 10px; border-bottom:1px solid var(--border); background:var(--surface-soft); white-space:nowrap; }
+  .rec-table th:first-child { border-top-left-radius:10px; }
+  .rec-table th:last-child { border-top-right-radius:10px; }
+  .rec-row { cursor:pointer; transition:background-color .14s ease; }
+  .rec-row:hover td { background:rgba(139,124,246,.045); }
+  html.dark .rec-row:hover td { background:rgba(139,124,246,.09); }
+  .rec-row td { padding:10px 10px; border-bottom:1px solid var(--border-soft); vertical-align:middle; white-space:nowrap; }
+  .rec-detail td { padding:0; border-bottom:1px solid var(--border-soft); background:var(--surface-soft); }
+  .rec-detail-box { padding:9px 14px; font-size:12px; color:var(--muted); line-height:1.65; border-left:3px solid var(--accent); margin:6px 10px; border-radius:7px; background:var(--inp-bg); white-space:normal; word-break:break-word; }
+  .mini-tag { display:inline-flex; align-items:center; gap:2px; font-size:10.5px; font-weight:600; padding:1px 5.5px; border-radius:5px; border:1px solid var(--border); background:var(--surface-soft); color:var(--muted); }
+  .tk-chip { display:inline-flex; align-items:center; gap:2.5px; font-size:11px; padding:1px 5.5px; border-radius:5px; background:var(--surface-soft); border:1px solid var(--border-soft); }
 </style>
 </head>
 <body class="min-h-screen">
@@ -989,9 +1009,59 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- Tab 4: Logs -->
-  <section id="view-logs" class="tab-pane hidden">
-    <div class="card overflow-hidden">
+  <!-- Tab 4: Call Records & Runtime Logs -->
+  <section id="view-logs" class="tab-pane hidden space-y-3.5">
+    <div class="subnav-seg">
+      <button id="tab-btn-logs-records" class="active" onclick="switchLogsSubTab('records')">
+        <span>📋 调用记录</span>
+        <span id="rec-nav-count" class="pill pill-accent" style="padding:0 6px;font-size:10.5px">0</span>
+      </button>
+      <button id="tab-btn-logs-term" onclick="switchLogsSubTab('term')">
+        <span>💻 实时终端日志</span>
+      </button>
+    </div>
+
+    <!-- 子面板 1：最近调用记录 -->
+    <div id="pane-logs-records" class="card p-4 sm:p-5">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3.5 mb-3 border-b divider-line">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="card-title"><span class="card-dot"></span>最近调用记录</span>
+          <span class="code-tag">最多 200 条 · 点击行展开轨迹</span>
+          <span class="pill pill-mint" style="font-size:11px;padding:1.5px 8px">平均首字 <b id="rec-avg-ttft">—</b></span>
+          <span class="pill pill-accent" style="font-size:11px;padding:1.5px 8px">平均速度 <b id="rec-avg-tps">—</b></span>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <div class="flt-seg">
+            <button id="flt-rec-all" class="flt-btn active" onclick="filterCallRecords('all')">全部 (0)</button>
+            <button id="flt-rec-ok" class="flt-btn" onclick="filterCallRecords('ok')">成功 (0)</button>
+            <button id="flt-rec-err" class="flt-btn" onclick="filterCallRecords('err')">失败 (0)</button>
+          </div>
+          <button class="btn-soft px-2.5 py-1 text-xs" onclick="clearCallRecords()">🧹 清空</button>
+        </div>
+      </div>
+
+      <div id="rec-table-wrap" class="overflow-x-auto -mx-1 px-1">
+        <table class="rec-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>状态 / 重试</th>
+              <th>调用模型 &amp; 特性</th>
+              <th>思考强度</th>
+              <th>模式</th>
+              <th>凭证</th>
+              <th>首字 / 输出耗时</th>
+              <th>Token (入 / 思 / 正) &amp; 速度</th>
+            </tr>
+          </thead>
+          <tbody id="rec-tbody"></tbody>
+        </table>
+      </div>
+      <div id="rec-empty" class="note-box">暂无调用记录。发起一次聊天或生图请求后，此处将实时展示模型、思考档位、首字/吐字耗时及分项 Token 速度。</div>
+    </div>
+
+    <!-- 子面板 2：实时终端日志 -->
+    <div id="pane-logs-term" class="card overflow-hidden hidden">
       <div class="px-4 py-2.5 border-b log-header flex items-center justify-between flex-wrap gap-2">
         <div class="flex items-center gap-2">
           <div class="flex gap-1.5"><div class="w-3 h-3 rounded-full" style="background:#f68697"></div><div class="w-3 h-3 rounded-full" style="background:#f8c27a"></div><div class="w-3 h-3 rounded-full" style="background:#5fd3bc"></div></div>
@@ -1003,7 +1073,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <button class="btn-soft px-2.5 py-1 text-xs" onclick="clearLogs()">🧹 清空</button>
         </div>
       </div>
-      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto" style="height:64vh"></div>
+      <div id="logwin" class="log p-4 space-y-1.5 overflow-y-auto" style="height:60vh"></div>
     </div>
   </section>
 </div>
@@ -1073,8 +1143,26 @@ function switchTab(t){
   document.querySelectorAll('.tab').forEach(function(e){ e.classList.toggle('active', e.dataset.tab===t); });
   ['overview','channel','params','logs'].forEach(function(v){ $('view-'+v).classList.toggle('hidden', v!==t); });
   if(t==='logs'){
-    autoscroll = true;
-    syncAutoscrollBtn();
+    fetchRecords();
+    if(!$('pane-logs-term').classList.contains('hidden')){
+      autoscroll = true;
+      syncAutoscrollBtn();
+      scrollLogsToBottom();
+    }
+  }
+}
+
+function switchLogsSubTab(sub){
+  var isRec = (sub === 'records');
+  var bRec = $('tab-btn-logs-records');
+  var bTerm = $('tab-btn-logs-term');
+  if(bRec) bRec.classList.toggle('active', isRec);
+  if(bTerm) bTerm.classList.toggle('active', !isRec);
+  var pRec = $('pane-logs-records');
+  var pTerm = $('pane-logs-term');
+  if(pRec) pRec.classList.toggle('hidden', !isRec);
+  if(pTerm) pTerm.classList.toggle('hidden', isRec);
+  if(!isRec && autoscroll){
     scrollLogsToBottom();
   }
 }
@@ -1159,6 +1247,9 @@ async function fetchStats(){
     $('bar-comp').style.width   = totTk > 0 ? Math.max(4, Math.round((cTk / totTk) * 100)) + '%' : '0%';
     $('uptime').textContent='已运行 '+(d.uptime/3600).toFixed(1)+' h';
     renderChart(d.success||0, d.error||0, d.retries||0);
+    if(typeof d.records_version === 'number' && d.records_version !== lastRecordsVersion){
+      fetchRecords();
+    }
   }catch(e){}
 }
 
@@ -1580,7 +1671,7 @@ async function saveSettings(){
 var logwin=$('logwin'); var autoscroll=true;
 var LOG_RAW_LINES = [];
 logwin.addEventListener('scroll',function(){
-  if($('view-logs').classList.contains('hidden')) return;
+  if($('view-logs').classList.contains('hidden') || $('pane-logs-term').classList.contains('hidden')) return;
   var nearBottom = (logwin.scrollHeight - logwin.scrollTop - logwin.clientHeight) < 60;
   if(nearBottom !== autoscroll){
     autoscroll = nearBottom;
@@ -1635,7 +1726,7 @@ async function copyAllLogs(){
 }
 function rerenderAllLogs(){
   logwin.innerHTML = LOG_RAW_LINES.map(function(line, i){ return logLine(line, i); }).join('');
-  if(autoscroll) scrollLogsToBottom();
+  if(autoscroll && !$('pane-logs-term').classList.contains('hidden')) scrollLogsToBottom();
 }
 function clearLogs(){
   LOG_RAW_LINES = [];
@@ -1655,14 +1746,163 @@ try{
     var idx = LOG_RAW_LINES.length;
     LOG_RAW_LINES.push(e.data);
     logwin.insertAdjacentHTML('beforeend', logLine(e.data, idx));
-    if(autoscroll) scrollLogsToBottom();
+    if(autoscroll && !$('pane-logs-term').classList.contains('hidden')) scrollLogsToBottom();
   };
 }catch(e){}
+
+var CALL_RECORDS = [], lastRecordsVersion = -1, curRecFilter = 'all', openRecIds = {};
+function escH(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtTkShort(n){
+  var v = Number(n || 0);
+  if(v >= 10000) return (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+  return v.toLocaleString('en-US');
+}
+function renderRecStatusBadge(r){
+  var b = r.badge_type;
+  var rt = Number(r.retries || 0);
+  if(b === 'ok') return '<span class="pill pill-mint" style="font-size:11.5px;padding:2px 8.5px">● 成功</span>';
+  if(b === 'retry_ok') return '<span class="pill pill-apricot" style="font-size:11.5px;padding:2px 8.5px">● 成功 · 重试×' + rt + '</span>';
+  if(b === 'trunc') return '<span class="pill pill-apricot" style="font-size:11.5px;padding:2px 8.5px" title="触发 max_tokens 长度上限">' + (rt > 0 ? ('⚠️ 截断 · 重试×' + rt) : '⚠️ 达上限截断') + '</span>';
+  if(b === 'cancel') return '<span class="pill" style="font-size:11.5px;padding:2px 8.5px">⏹ 已取消</span>';
+  var code = r.code || 500;
+  return '<span class="pill pill-coral" style="font-size:11.5px;padding:2px 8.5px">✕ 失败(' + code + ')' + (rt > 0 ? (' · 重试×' + rt) : '') + '</span>';
+}
+function renderRecThinkBadge(r){
+  var t = escH(r.thinking || '—');
+  if(r.think_style === 'apricot') return '<span class="pill pill-apricot" style="font-size:11px;padding:1px 7px">' + t + '</span>';
+  if(r.think_style === 'accent') return '<span class="pill pill-accent" style="font-size:11px;padding:1px 7px">' + t + '</span>';
+  return '<span class="code-tag">' + t + '</span>';
+}
+function renderRecTiming(r){
+  var genS = Number(r.gen_time || 0).toFixed(1) + 's';
+  if(r.group === 'err' || r.group === 'cancel'){
+    return '<span class="text-muted-light">耗时</span> <span class="val font-medium text-muted">' + genS + '</span>';
+  }
+  if(r.is_unary || r.ttft == null){
+    return '<span class="text-muted-light" title="非流式/假流式由上游整包一次性返回，无独立首字时间">整包</span> <span class="val font-semibold">' + genS + '</span>';
+  }
+  var ttftS = Number(r.ttft).toFixed(1) + 's';
+  return '<span class="val font-semibold" style="color:var(--mint-text)" title="命中最终成功凭证后的真实首字响应时间">首 ' + ttftS + '</span>'
+       + ' <span class="text-muted-light">/</span> '
+       + '<span class="val font-semibold" title="从首字产出到流式全部吐完的纯输出时间">吐 ' + genS + '</span>';
+}
+function renderRecTokens(r){
+  if(r.group === 'err' || r.group === 'cancel'){
+    return '<span class="text-muted-light">—</span>';
+  }
+  if(r.is_cookie && !r.has_usage){
+    var chInfo = r.out_chars > 0 ? (' <span class="text-[11px] text-muted">(' + fmt(r.out_chars) + ' 字)</span>') : '';
+    return '<span class="code-tag" title="Cookie 私有 GraphQL 接口不返回 usageMetadata">Cookie 无回传</span>' + chInfo;
+  }
+  if(!r.has_usage){
+    return '<span class="text-muted-light">—</span>';
+  }
+  var p = Number(r.p_tk || 0), th = Number(r.th_tk || 0), out = Number(r.out_tk || 0);
+  var spdHtml = '';
+  if(r.tps != null && r.tps > 0){
+    spdHtml = '<div class="text-[11px] val font-semibold mt-0.5" style="color:var(--mint-text)">⚡ ' + (r.tps_approx ? '≈' : '') + Number(r.tps).toFixed(1) + ' tok/s</div>';
+  }
+  return '<div class="flex items-center gap-1">'
+       + '<span class="tk-chip" title="输入 Prompt: ' + fmt(p) + ' Tokens"><span class="text-muted-light">入</span><b class="val" style="color:var(--accent)">' + fmtTkShort(p) + '</b></span>'
+       + '<span class="tk-chip" title="原生思考 Thoughts: ' + fmt(th) + ' Tokens"><span class="text-muted-light">思</span><b class="val" style="color:var(--apricot-text)">' + fmtTkShort(th) + '</b></span>'
+       + '<span class="tk-chip" title="正文输出 Candidates: ' + fmt(out) + ' Tokens"><span class="text-muted-light">正</span><b class="val" style="color:var(--mint-text)">' + fmtTkShort(out) + '</b></span>'
+       + '</div>' + spdHtml;
+}
+function renderCallRecords(){
+  var tbody = $('rec-tbody');
+  var wrap = $('rec-table-wrap');
+  var empty = $('rec-empty');
+  if(!tbody) return;
+  var filtered = CALL_RECORDS.filter(function(r){
+    if(curRecFilter === 'all') return true;
+    return r.group === curRecFilter;
+  });
+  if(filtered.length === 0){
+    tbody.innerHTML = '';
+    if(wrap) wrap.classList.toggle('hidden', CALL_RECORDS.length === 0);
+    if(empty){
+      empty.textContent = CALL_RECORDS.length === 0
+        ? '暂无调用记录。发起一次聊天或生图请求后，此处将实时展示模型、思考档位、首字/吐字耗时及分项 Token 速度。'
+        : '当前筛选条件下没有匹配的调用记录。';
+      empty.classList.remove('hidden');
+    }
+    return;
+  }
+  if(wrap) wrap.classList.remove('hidden');
+  if(empty) empty.classList.add('hidden');
+
+  var html = '';
+  filtered.forEach(function(r){
+    var tags = '';
+    if(r.sandbox) tags += '<span class="mini-tag" title="已启用 compose_reply 抗截断">🛡️抗截断</span> ';
+    if(r.prefill) tags += '<span class="mini-tag" title="已启用预填充续写兼容">🩹预填充</span> ';
+    if(r.search)  tags += '<span class="mini-tag" title="已启用 Google 联网搜索">🔎联网</span> ';
+    if(r.tool_calls) tags += '<span class="mini-tag" title="包含客户端工具调用">🔧工具</span> ';
+
+    var credColor = (r.group === 'err') ? 'color:var(--coral-text)' : (r.group === 'cancel' ? 'color:var(--muted)' : 'color:var(--fg)');
+    var isOpen = !!openRecIds[r.id];
+    var modeCls = escH(r.mode_class || 'pill-mint');
+    html += '<tr class="rec-row" onclick="toggleRecordDetail(' + Number(r.id) + ')">'
+      + '<td class="val text-muted" title="' + escH(r.full_time || r.time) + '">' + escH(r.time) + ' <span style="font-size:10px;opacity:.65">' + (isOpen ? '▾' : '▸') + '</span></td>'
+      + '<td>' + renderRecStatusBadge(r) + '</td>'
+      + '<td><div class="font-semibold" style="color:var(--fg)">' + escH(r.model) + '</div>' + (tags ? '<div class="mt-0.5 flex gap-1 flex-wrap">' + tags + '</div>' : '') + '</td>'
+      + '<td>' + renderRecThinkBadge(r) + '</td>'
+      + '<td><span class="pill ' + modeCls + '" style="font-size:11px;padding:1.5px 7.5px">' + escH(r.mode) + '</span></td>'
+      + '<td><div class="font-semibold" style="' + credColor + '">' + escH(r.cred) + '</div><div class="text-[11px] text-muted">' + escH(r.cred_note) + '</div></td>'
+      + '<td>' + renderRecTiming(r) + '</td>'
+      + '<td>' + renderRecTokens(r) + '</td>'
+      + '</tr>';
+    if(isOpen && r.detail){
+      html += '<tr class="rec-detail"><td colspan="8"><div class="rec-detail-box">' + r.detail + '</div></td></tr>';
+    }
+  });
+  tbody.innerHTML = html;
+}
+function toggleRecordDetail(id){
+  openRecIds[id] = !openRecIds[id];
+  renderCallRecords();
+}
+function filterCallRecords(f){
+  curRecFilter = f;
+  ['all','ok','err'].forEach(function(k){
+    var b = $('flt-rec-' + k);
+    if(b) b.classList.toggle('active', k === f);
+  });
+  renderCallRecords();
+}
+async function fetchRecords(){
+  try{
+    var d = await (await fetch('/api/records')).json();
+    lastRecordsVersion = typeof d.version === 'number' ? d.version : lastRecordsVersion;
+    CALL_RECORDS = Array.isArray(d.records) ? d.records : [];
+    var tot = d.total || 0, okc = d.ok_count || 0, errc = d.err_count || 0;
+    if($('rec-nav-count')) $('rec-nav-count').textContent = String(tot);
+    if($('flt-rec-all')) $('flt-rec-all').textContent = '全部 (' + tot + ')';
+    if($('flt-rec-ok'))  $('flt-rec-ok').textContent  = '成功 (' + okc + ')';
+    if($('flt-rec-err')) $('flt-rec-err').textContent = '失败 (' + errc + ')';
+    if($('rec-avg-ttft')) $('rec-avg-ttft').textContent = d.avg_ttft != null ? (Number(d.avg_ttft).toFixed(2).replace(/\.00$/, '.0') + 's') : '—';
+    if($('rec-avg-tps'))  $('rec-avg-tps').textContent  = d.avg_tps != null  ? (Number(d.avg_tps).toFixed(1) + ' tok/s') : '—';
+    renderCallRecords();
+  }catch(e){}
+}
+async function clearCallRecords(){
+  try{
+    var r = await fetch('/api/records/clear', {method:'POST'});
+    if(r.ok){
+      openRecIds = {};
+      await fetchRecords();
+      toast('🧹 已清空调用记录');
+    }
+  }catch(e){ toast('❌ 清空失败'); }
+}
 
 $('project-input').addEventListener('input',function(e){ var v=e.target.value.trim(); var m=v.match(/[?&]project=([^&]+)/)||v.match(/\/projects\/([^\/]+)/); if(m) e.target.value=m[1]; });
 $('image_aspect_ratio').addEventListener('change', function(e){ curAR=e.target.value; });
 
-fetchStats(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
+fetchStats(); fetchRecords(); setInterval(fetchStats,3000); loadRuntime(); loadParams(); loadExpressKeys();
 </script>
 </body>
 </html>
@@ -1725,6 +1965,17 @@ async def logout(request: Request):
 @app.get("/api/stats")
 async def get_stats_api(_auth: bool = Depends(require_auth)):
     return JSONResponse(content=stats.get_json_stats())
+
+
+@app.get("/api/records")
+async def get_call_records_api(_auth: bool = Depends(require_auth)):
+    return JSONResponse(content=call_recorder.get_payload())
+
+
+@app.post("/api/records/clear")
+async def clear_call_records_api(_auth: bool = Depends(require_auth)):
+    call_recorder.clear()
+    return JSONResponse(content=call_recorder.get_payload())
 
 
 class ModeSetting(BaseModel):

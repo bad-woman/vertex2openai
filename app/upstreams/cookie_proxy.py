@@ -1204,24 +1204,44 @@ def _extract_from_results(obj: dict):
 
 # ========== token 用量映射 ==========
 
-def _map_usage(usage_meta: dict | None) -> dict:
+def _extract_studio_usage_detail(usage_meta: dict | None) -> tuple[int, int, int, int]:
+    """提取 Studio(Cookie) 通道返回的 (输入Tokens, 思考Tokens, 正文Tokens, 总Tokens)。"""
     usage_meta = usage_meta or {}
     p = int(usage_meta.get("promptTokenCount", 0) or 0)
-    c = int(usage_meta.get("candidatesTokenCount", 0) or 0)
-    t = int(usage_meta.get("totalTokenCount", p + c) or (p + c))
-    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
+    out_c = int(usage_meta.get("candidatesTokenCount", 0) or 0)
+    raw_th = usage_meta.get("thoughtsTokenCount")
+    tool_p = int(usage_meta.get("toolUsePromptTokenCount", 0) or 0)
+    raw_tot = int(usage_meta.get("totalTokenCount", 0) or 0)
+    if raw_th is not None:
+        th = int(raw_th or 0)
+    elif raw_tot > (p + out_c + tool_p):
+        th = raw_tot - p - out_c - tool_p
+    else:
+        th = 0
+    comp = out_c + th
+    t = raw_tot or (p + comp)
+    return p, th, out_c, t
+
+
+def _map_usage(usage_meta: dict | None) -> dict:
+    p, th, out_c, t = _extract_studio_usage_detail(usage_meta)
+    comp = out_c + th
+    res: dict = {"prompt_tokens": p, "completion_tokens": comp, "total_tokens": t}
+    if th > 0:
+        res["completion_tokens_details"] = {"reasoning_tokens": th}
+    return res
 
 
 def _record_studio_usage(usage_meta: dict | None) -> dict:
     """将 Studio(Cookie) 通道返回的 usageMetadata 计入全局算力统计（无 token 时仅计成功次数）。"""
-    usage = _map_usage(usage_meta)
-    p_tk, c_tk, t_tk = usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
-    if p_tk > 0 or c_tk > 0:
-        stats.add_tokens(p_tk, c_tk)
-        print(f"💰 [Studio 算力统计] 提示词: {p_tk} | 思考与生成: {c_tk} | 总计: {t_tk} Tokens")
+    p_tk, th_tk, out_tk, t_tk = _extract_studio_usage_detail(usage_meta)
+    comp_tk = th_tk + out_tk
+    if p_tk > 0 or comp_tk > 0:
+        stats.add_tokens(p_tk, comp_tk)
+        print(f"💰 [Studio 算力统计] 输入: {p_tk} | 思考: {th_tk} | 正文: {out_tk} | 总计: {t_tk} Tokens")
     else:
         stats.add_success()
-    return usage
+    return _map_usage(usage_meta)
 
 
 # ========== OpenAI SSE 格式化 ==========
@@ -1505,6 +1525,7 @@ async def _collect_full_response_once(
             )
             req_headers = build_headers(_get_cookie_string()) or headers
             fb_latched = False
+            post_t0 = time.monotonic()
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
                 if (sandbox_spec and sandbox_spec.enabled or fallback_body is not None) and _native_tool_error_response(
@@ -1515,7 +1536,9 @@ async def _collect_full_response_once(
                     if hasattr(resolved_fb, "__await__"):
                         resolved_fb = await resolved_fb
                     print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；已自动剥离控制指令并降级为纯文本观测。")
+                    post_t0 = time.monotonic()
                     response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fb)
+            post_elapsed = max(0.0, time.monotonic() - post_t0)
 
             if response.status_code != 200:
                 clean_msg = _extract_clean_error_message(response.text)
@@ -1643,6 +1666,8 @@ async def _collect_full_response_once(
             return {
                 "kind": "ok",
                 "full_text": full_text + safety_html,
+                "raw_body_len": len(full_text),
+                "unary_elapsed": post_elapsed,
                 "reasoning_text": "" if strip_thoughts else reasoning_text,
                 "finish_reason": _map_finish_reason(finish_raw),
                 "usage_meta": usage_meta,
@@ -1690,7 +1715,12 @@ class CookieProxyUpstream(BaseUpstream):
             )
         return True, cookie_str, project_id, headers, 200, ""
 
-    async def execute_once(self, orig_request_obj: OpenAIRequest, fastapi_request: Request):
+    async def execute_once(
+        self,
+        orig_request_obj: OpenAIRequest,
+        fastapi_request: Request,
+        telemetry: Optional[dict] = None,
+    ):
         """执行单次 Cookie 通道请求（失败抛出 CookieAttemptError 交由外层统一调度器决定重试或切换 Key）。"""
         validate_request_schemas(orig_request_obj)
 
@@ -1785,6 +1815,19 @@ class CookieProxyUpstream(BaseUpstream):
 
         is_image = _profile["is_image"]
         fake_stream_enabled = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
+        _wants_search_flag = bool(
+            (force_builtin_search or _forced_search or model_display.lower().endswith("-search"))
+            and _profile.get("supports_search")
+        )
+        if telemetry is not None:
+            telemetry["is_cookie"] = True
+            telemetry["base_model"] = base_model_name
+            telemetry["sandbox"] = bool(sandbox_spec.enabled and not is_image)
+            telemetry["prefill"] = bool(prefill_active)
+            telemetry["search"] = _wants_search_flag
+            telemetry["thinking_resolved"] = _tk
+            telemetry["include_thoughts"] = not strip_thoughts
+            telemetry["is_image"] = bool(is_image)
 
         async def _build_clean_fallback_body(latch_dict: Optional[dict] = None) -> dict:
             """当模型/协议完全拒绝原生函数 Schema 降级为纯文本时，重新基于 orig_clean_msgs 构建请求体，
@@ -1814,8 +1857,13 @@ class CookieProxyUpstream(BaseUpstream):
 
         # ---------- 1. 假流式（生图或开启假流式） ----------
         if is_stream and (is_image or (fake_stream_enabled and not native_custom_tools)):
+            if telemetry is not None:
+                telemetry["is_unary"] = True
+                telemetry["mode_label"] = "🖼️ 生图假流" if is_image else "💓 假流式"
             async def studio_fake_stream_once():
                 if await fastapi_request.is_disconnected():
+                    if telemetry is not None:
+                        telemetry["cancelled"] = True
                     return
                 try:
                     hb_interval = float(app_state.get_setting(
@@ -1843,6 +1891,8 @@ class CookieProxyUpstream(BaseUpstream):
                         await asyncio.sleep(0.5)
                         elapsed_hb += 0.5
                         if await fastapi_request.is_disconnected():
+                            if telemetry is not None:
+                                telemetry["cancelled"] = True
                             collect_task.cancel()
                             try:
                                 await collect_task
@@ -1867,6 +1917,8 @@ class CookieProxyUpstream(BaseUpstream):
 
                 kind = res.get("kind")
                 if kind == "cancelled":
+                    if telemetry is not None:
+                        telemetry["cancelled"] = True
                     return
                 if kind != "ok":
                     raise CookieAttemptError(
@@ -1883,10 +1935,20 @@ class CookieProxyUpstream(BaseUpstream):
                 if res.get("reasoning_text"):
                     yield _make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
                 yield _make_openai_chunk(response_id, model_display, content=full_text or " ")
+                p_u, th_u, out_u, _ = _extract_studio_usage_detail(res.get("usage_meta"))
                 usage = _record_studio_usage(res.get("usage_meta"))
+                fin_r = res.get("finish_reason", "stop")
+                if telemetry is not None:
+                    telemetry["gen_time"] = float(res.get("unary_elapsed") or 0.0)
+                    telemetry["finish_reason"] = fin_r
+                    telemetry["out_chars"] = len(full_text)
+                    telemetry["has_usage"] = bool(p_u > 0 or th_u > 0 or out_u > 0)
+                    telemetry["p_tk"] = p_u
+                    telemetry["th_tk"] = th_u
+                    telemetry["out_tk"] = out_u
                 if want_usage:
                     yield _make_usage_chunk(response_id, model_display, usage)
-                yield _make_openai_chunk(response_id, model_display, finish_reason=res.get("finish_reason", "stop"))
+                yield _make_openai_chunk(response_id, model_display, finish_reason=fin_r)
                 yield "data: [DONE]\n\n"
                 print(f"✅ [Studio] {base_model_name} | 假流式完成")
 
@@ -1894,11 +1956,16 @@ class CookieProxyUpstream(BaseUpstream):
 
         # ---------- 2. 真流式 ----------
         if is_stream:
+            if telemetry is not None:
+                telemetry["is_unary"] = False
+                telemetry["mode_label"] = "⚡ 真流式"
             async def stream_generator_once():
                 last_hb_ts = time.time()
                 native_fallback_state = {"latched": False}
 
                 if await fastapi_request.is_disconnected():
+                    if telemetry is not None:
+                        telemetry["cancelled"] = True
                     return
 
                 body = await build_batch_graphql_body_async(
@@ -1946,6 +2013,10 @@ class CookieProxyUpstream(BaseUpstream):
                     )
                     pending_stream_imgs: list[bytes] = []
                     first_stream_tool_id: Optional[str] = None
+                    stream_req_t0 = time.monotonic()
+                    first_tok_t0: Optional[float] = None
+                    stream_out_chars = len(prefill_text) if prefill_text else 0
+                    saw_thought_stream = False
 
                     stream_gen = _execute_stream_request_generator(
                         client, req_headers, body, sampler=sampler,
@@ -1954,9 +2025,13 @@ class CookieProxyUpstream(BaseUpstream):
                     try:
                         async for status, data in stream_gen:
                             if not has_yielded_to_client and await fastapi_request.is_disconnected():
+                                if telemetry is not None:
+                                    telemetry["cancelled"] = True
                                 return
                             if native_fallback_state["latched"] and fc_assembler.synthetic_tool_name:
                                 fc_assembler.synthetic_tool_name = ""
+                                if telemetry is not None:
+                                    telemetry["sandbox"] = False
 
                             if status == "thought":
                                 got_thought = True
@@ -1966,8 +2041,13 @@ class CookieProxyUpstream(BaseUpstream):
                                         last_hb_ts = now_ts
                                         yield _sse_heartbeat()
                                     continue
+                                if first_tok_t0 is None:
+                                    first_tok_t0 = time.monotonic()
+                                saw_thought_stream = True
 
                             if status == "function_call":
+                                if first_tok_t0 is None:
+                                    first_tok_t0 = time.monotonic()
                                 completed_calls, synth_delta, synth_sig = fc_assembler.feed_with_synthetic(
                                     data, thought_signature=_signature_bytes_from_wire(data.get("thought_signature")),
                                 )
@@ -1982,6 +2062,7 @@ class CookieProxyUpstream(BaseUpstream):
                                     got_text = True
                                     out = deduper.feed(synth_delta)
                                     if out:
+                                        stream_out_chars += len(out)
                                         _append_merged_ordinary_meta(
                                             stream_ordinary_metadata,
                                             stream_part_order,
@@ -2059,9 +2140,13 @@ class CookieProxyUpstream(BaseUpstream):
                                     )
                                     yield _make_openai_chunk(response_id, model_display, reasoning_content=data)
                                 elif status == "api_error_text":
+                                    if telemetry is not None:
+                                        telemetry["midstream_error"] = str(data)
                                     print(f"❌ [Studio 流中断报错] 模型={base_model_name} | {data[:2000]}")
                                     yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio API 错误] {data}")
                                 elif status == "image":
+                                    if first_tok_t0 is None:
+                                        first_tok_t0 = time.monotonic()
                                     img_md = data["markdown"] if isinstance(data, dict) else str(data)
                                     img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
                                     if img_b:
@@ -2077,12 +2162,15 @@ class CookieProxyUpstream(BaseUpstream):
                                     )
                                     yield _make_openai_chunk(response_id, model_display, content=img_md)
                                 else:
+                                    if first_tok_t0 is None:
+                                        first_tok_t0 = time.monotonic()
                                     if prefill_text and not prefill_emitted:
                                         prefill_emitted = True
                                         yield _make_openai_chunk(response_id, model_display, content=prefill_text)
                                     got_text = True
                                     out = deduper.feed(data)
                                     if out:
+                                        stream_out_chars += len(out)
                                         _append_merged_ordinary_meta(
                                             stream_ordinary_metadata,
                                             stream_part_order,
@@ -2104,6 +2192,9 @@ class CookieProxyUpstream(BaseUpstream):
                             elif status == "cookie_error":
                                 if not has_yielded_to_client:
                                     raise CookieAttemptError(403, str(data), is_retryable=False, is_auth_or_billing=True)
+                                if telemetry is not None:
+                                    telemetry["midstream_error"] = str(data)
+                                    telemetry["error_code"] = 403
                                 stats.add_error()
                                 yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
                                 yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
@@ -2118,6 +2209,9 @@ class CookieProxyUpstream(BaseUpstream):
                                         is_retryable=(status == "retryable_error"),
                                         is_auth_or_billing=False,
                                     )
+                                if telemetry is not None:
+                                    telemetry["midstream_error"] = str(data)
+                                    telemetry["error_code"] = 503 if status == "retryable_error" else 400
                                 stats.add_error()
                                 yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
                                 yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
@@ -2136,6 +2230,7 @@ class CookieProxyUpstream(BaseUpstream):
                     if rem_synth or rem_sig:
                         out = deduper.feed(rem_synth) if (deduper and rem_synth) else rem_synth
                         if out:
+                            stream_out_chars += len(out)
                             got_text = True
                             if not has_yielded_to_client:
                                 yield _make_openai_chunk(response_id, model_display, role="assistant")
@@ -2159,6 +2254,7 @@ class CookieProxyUpstream(BaseUpstream):
                             )
                             _out_s = deduper.feed(_extra_s) if (deduper and _extra_s) else _extra_s
                             if _out_s:
+                                stream_out_chars += len(_out_s)
                                 got_text = True
                                 if not has_yielded_to_client:
                                     yield _make_openai_chunk(response_id, model_display, role="assistant")
@@ -2206,6 +2302,7 @@ class CookieProxyUpstream(BaseUpstream):
                         yield _make_openai_chunk(response_id, model_display, content=prefill_text)
                     tail = deduper.flush()
                     if tail:
+                        stream_out_chars += len(tail)
                         _append_merged_ordinary_meta(
                             stream_ordinary_metadata,
                             stream_part_order,
@@ -2228,18 +2325,36 @@ class CookieProxyUpstream(BaseUpstream):
                                 google["thought_signature_part"] = last_signed["kind"]
                             final_extra = {"google": google}
 
+                    final_fr_stream = (
+                        "tool_calls"
+                        if got_tool_call
+                        else ("stop" if fc_assembler.synthetic_halted else _map_finish_reason(finish_raw))
+                    )
                     yield _make_openai_chunk(
                         response_id,
                         model_display,
                         extra_content=final_extra,
-                        finish_reason=(
-                            "tool_calls"
-                            if got_tool_call
-                            else ("stop" if fc_assembler.synthetic_halted else _map_finish_reason(finish_raw))
-                        ),
+                        finish_reason=final_fr_stream,
                     )
 
+                    stream_end_t0 = time.monotonic()
+                    p_u_s, th_u_s, out_u_s, _ = _extract_studio_usage_detail(usage_meta)
                     usage = _record_studio_usage(usage_meta)
+                    if telemetry is not None:
+                        if first_tok_t0 is not None:
+                            telemetry["ttft"] = max(0.0, first_tok_t0 - stream_req_t0)
+                            telemetry["gen_time"] = max(0.0, stream_end_t0 - first_tok_t0)
+                        else:
+                            telemetry["ttft"] = None
+                            telemetry["gen_time"] = max(0.0, stream_end_t0 - stream_req_t0)
+                        telemetry["saw_thought_stream"] = saw_thought_stream
+                        telemetry["finish_reason"] = final_fr_stream
+                        telemetry["tool_calls"] = bool(got_tool_call)
+                        telemetry["out_chars"] = stream_out_chars
+                        telemetry["has_usage"] = bool(p_u_s > 0 or th_u_s > 0 or out_u_s > 0)
+                        telemetry["p_tk"] = p_u_s
+                        telemetry["th_tk"] = th_u_s
+                        telemetry["out_tk"] = out_u_s
                     if want_usage:
                         yield _make_usage_chunk(response_id, model_display, usage)
 
@@ -2252,6 +2367,9 @@ class CookieProxyUpstream(BaseUpstream):
             return StreamingResponse(stream_generator_once(), media_type="text/event-stream")
 
         # ---------- 3. 非流式（整包 POST 返回） ----------
+        if telemetry is not None:
+            telemetry["is_unary"] = True
+            telemetry["mode_label"] = "🖼️ 生图非流" if is_image else "📦 非流式"
         try:
             body = await build_batch_graphql_body_async(
                 project_id, base_model_name, request_obj,
@@ -2274,6 +2392,7 @@ class CookieProxyUpstream(BaseUpstream):
                     prefill_text=prefill_text,
                 )
 
+            ns_post_t0 = time.monotonic()
             async with httpx.AsyncClient(**client_kwargs) as client:
                 post_task = asyncio.create_task(
                     client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=body)
@@ -2281,6 +2400,8 @@ class CookieProxyUpstream(BaseUpstream):
                 while not post_task.done():
                     await asyncio.sleep(0.5)
                     if await fastapi_request.is_disconnected():
+                        if telemetry is not None:
+                            telemetry["cancelled"] = True
                         post_task.cancel()
                         try:
                             await post_task
@@ -2293,9 +2414,13 @@ class CookieProxyUpstream(BaseUpstream):
 
                 if (native_custom_tools or sandbox_spec.enabled) and _native_tool_error_response(response.status_code, response.text):
                     synth_tool_name = ""
+                    if telemetry is not None:
+                        telemetry["sandbox"] = False
                     resolved_fallback = await _build_clean_fallback_body()
                     print("⚠️ [Studio] 当前模型/协议拒绝原生函数 Schema；已自动剥离控制指令并降级为文本工具观测。")
+                    ns_post_t0 = time.monotonic()
                     response = await client.post(BATCH_GRAPHQL_URL, headers=req_headers, json=resolved_fallback)
+            ns_post_elapsed = max(0.0, time.monotonic() - ns_post_t0)
 
             if response.status_code != 200:
                 clean_msg = _extract_clean_error_message(response.text)
@@ -2486,7 +2611,17 @@ class CookieProxyUpstream(BaseUpstream):
             elapsed = time.time() - start_time
             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
 
+            p_u_ns, th_u_ns, out_u_ns, _ = _extract_studio_usage_detail(usage_meta)
             usage = _record_studio_usage(usage_meta)
+            if telemetry is not None:
+                telemetry["gen_time"] = ns_post_elapsed
+                telemetry["finish_reason"] = finish_reason
+                telemetry["tool_calls"] = bool(tool_calls)
+                telemetry["out_chars"] = len(full_text)
+                telemetry["has_usage"] = bool(p_u_ns > 0 or th_u_ns > 0 or out_u_ns > 0)
+                telemetry["p_tk"] = p_u_ns
+                telemetry["th_tk"] = th_u_ns
+                telemetry["out_tk"] = out_u_ns
             content_value = full_text + safety_html
             message_obj = {"role": "assistant", "content": content_value if content_value else None}
             if reasoning_text and not strip_thoughts:
