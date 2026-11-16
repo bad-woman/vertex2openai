@@ -278,6 +278,16 @@ class ExpressSDKUpstream(BaseUpstream):
             prefill_text=prefill_text,
         )
 
+        _resolved_tk_info = mc.resolve_thinking(
+            getattr(orig_request_obj, "model", None) or base_model_name,
+            orig_request_obj,
+            _inj_settings,
+            prefill_active=prefill_active,
+        )
+        _has_search_tool = bool(
+            any(isinstance(t, dict) and "google_search" in t for t in (gen_config_dict.get("tools") or []))
+        )
+
         return {
             "request_obj": request_obj,
             "base_model_name": base_model_name,
@@ -285,6 +295,9 @@ class ExpressSDKUpstream(BaseUpstream):
             "gen_config_dict": gen_config_dict,
             "prompt_func": prompt_func,
             "prefill_text": prefill_text,
+            "prefill_active": bool(prefill_active),
+            "has_search": _has_search_tool,
+            "thinking_resolved": _resolved_tk_info,
             "is_image_model": is_image_model,
             "sandbox_spec": sandbox_spec,
             "synthetic_tool_name": sandbox_spec.emit_tool_name if sandbox_spec.enabled else "",

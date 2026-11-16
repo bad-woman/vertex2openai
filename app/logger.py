@@ -3,7 +3,8 @@ import time
 import asyncio
 import re
 import threading
-from typing import List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -53,9 +54,71 @@ class ProxyStats:
                 "retries": self.retry_counts,
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
+                "records_version": call_recorder.version,
+                "records_count": call_recorder.count(),
             }
 
 
+class CallRecorder:
+    """轻量线程安全的最近调用记录环形缓冲区（默认最多保留 200 条，自动淘汰最旧记录，零磁盘开销）。"""
+
+    def __init__(self, maxlen: int = 200):
+        self.maxlen = maxlen
+        self._records: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
+        self._seq: int = 0
+        self.version: int = 0
+        self._lock = threading.Lock()
+
+    def record(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            self._seq += 1
+            self.version += 1
+            entry = dict(item)
+            entry["id"] = self._seq
+            self._records.appendleft(entry)
+            return entry
+
+    def clear(self) -> None:
+        with self._lock:
+            self._records.clear()
+            self.version += 1
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def get_payload(self) -> Dict[str, Any]:
+        with self._lock:
+            items = list(self._records)
+            ver = self.version
+
+        ok_cnt = sum(1 for r in items if r.get("group") == "ok")
+        err_cnt = sum(1 for r in items if r.get("group") == "err")
+        ttft_vals = [
+            float(r["ttft"])
+            for r in items
+            if r.get("group") == "ok" and isinstance(r.get("ttft"), (int, float)) and r["ttft"] > 0
+        ]
+        tps_vals = [
+            float(r["tps"])
+            for r in items
+            if r.get("group") == "ok" and isinstance(r.get("tps"), (int, float)) and r["tps"] > 0
+        ]
+        avg_ttft = round(sum(ttft_vals) / len(ttft_vals), 2) if ttft_vals else None
+        avg_tps = round(sum(tps_vals) / len(tps_vals), 1) if tps_vals else None
+
+        return {
+            "version": ver,
+            "total": len(items),
+            "ok_count": ok_cnt,
+            "err_count": err_cnt,
+            "avg_ttft": avg_ttft,
+            "avg_tps": avg_tps,
+            "records": items,
+        }
+
+
+call_recorder = CallRecorder(maxlen=200)
 stats = ProxyStats()
 
 
