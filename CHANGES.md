@@ -1,3 +1,17 @@
+## 2026-11-16 新增控制台「调用记录」全链路追踪面板 & 修复原生思考 Token 统计漏计
+
+### 1. 控制台「🖥️ 运行日志」新增二级切换「📋 调用记录」明细面板（`app/logger.py`、`app/api_helpers.py`、`app/upstreams/cookie_proxy.py`、`app/main.py`）
+- **环形内存队列（`CallRecorder`）**：线程安全保留最近 200 条请求级调用摘要（自动淘汰最旧记录，零磁盘 I/O 开销），并通过 `/api/stats` 的 `records_version` 版本号驱动前端按需增量拉取（无新请求时零重绘、不打断已展开详情行）。
+- **精准区分标准模式与 Cookie 模式、拆分「入 / 思 / 正」三项 Token 与 `tok/s` 测速**：
+  - **Express 标准模式**：精确提取 Google 官方 `usage_metadata` 的 `prompt_token_count`（入）、`thoughts_token_count`（原生思考）与 `candidates_token_count`（正文输出），同时修复原概览页与日志漏计 `thoughts_token_count` 的问题；
+  - **Studio (Cookie) 模式**：针对私有 `batchGraphql` 不回传 `usageMetadata` 的特性，诚实标注 `Cookie 无回传` 并附带实际正文字数；
+  - **剥离重试耗时的纯速度算法**：真流式下基于上游首个模型 Token 到达时刻精确记录**真实首字响应时间（TTFT）**与**首字到流结束的纯吐字耗时**，计算真实流式 `tok/s`；假流式与非流式（原生一元整包返回）展示整包耗时与等效均速 `≈ xx tok/s`。
+- **精简凭证与状态徽章 + 点击展开重试/错误轨迹**：
+  - 支持 `全部 / 成功 / 失败` 三档筛选；自动高亮 `⚠️ 达上限截断`（`finish_reason=length`）；
+  - 成功时仅简洁展示最终命中的单一凭证（如 `Key #3` 或 `🍪 Cookie`），多凭证耗尽失败时汇总为 `试 N 凭证均败（止于 Key #X）`，点击任意行即可展开完整退避轨迹与错误诊断。
+
+---
+
 ## 2026-11-14 根治长回复流式 O(N²) 帧膨胀变慢、弱网续传缓冲深度加固与原教旨抗截断升级
 
 ### 0. 根治酒馆长回复流式「越写越慢」SSE 帧膨胀（降低 30~100 倍带宽与内存占用）
