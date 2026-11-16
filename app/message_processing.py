@@ -2257,23 +2257,29 @@ def process_gemini_response_to_openai_dict(
     else:
         choices.append({"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": "stop"})
 
-    usage_data = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    if hasattr(gemini_response_obj, "usage_metadata"):
+    usage_data: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    if hasattr(gemini_response_obj, "usage_metadata") and gemini_response_obj.usage_metadata is not None:
         um = gemini_response_obj.usage_metadata
-        if hasattr(um, "prompt_token_count"):
-            usage_data["prompt_tokens"] = um.prompt_token_count
-        if hasattr(um, "candidates_token_count"):
-            usage_data["completion_tokens"] = um.candidates_token_count
-            if hasattr(um, "total_token_count"):
-                usage_data["total_tokens"] = um.total_token_count
-            else:
-                usage_data["total_tokens"] = usage_data["prompt_tokens"] + usage_data["completion_tokens"]
-        elif hasattr(um, "total_token_count"):
-            usage_data["total_tokens"] = um.total_token_count
-            if usage_data["prompt_tokens"] > 0 and usage_data["total_tokens"] > usage_data["prompt_tokens"]:
-                usage_data["completion_tokens"] = usage_data["total_tokens"] - usage_data["prompt_tokens"]
+        p_tk = int(getattr(um, "prompt_token_count", 0) or 0)
+        out_tk = int(getattr(um, "candidates_token_count", 0) or 0)
+        raw_th = getattr(um, "thoughts_token_count", None)
+        if raw_th is None:
+            raw_th = getattr(um, "thought_token_count", None)
+        tool_p_tk = int(getattr(um, "tool_use_prompt_token_count", 0) or 0)
+        raw_tot = getattr(um, "total_token_count", None)
+        if raw_th is not None:
+            th_tk = int(raw_th or 0)
+        elif raw_tot and int(raw_tot) > (p_tk + out_tk + tool_p_tk):
+            th_tk = int(raw_tot) - p_tk - out_tk - tool_p_tk
         else:
-            usage_data["total_tokens"] = usage_data["prompt_tokens"]
+            th_tk = 0
+        comp_tk = out_tk + th_tk
+        tot_tk = int(raw_tot) if raw_tot else (p_tk + comp_tk)
+        usage_data["prompt_tokens"] = p_tk
+        usage_data["completion_tokens"] = comp_tk
+        usage_data["total_tokens"] = tot_tk
+        if th_tk > 0:
+            usage_data["completion_tokens_details"] = {"reasoning_tokens": th_tk}
 
     return {
         "id": base_id, "object": "chat.completion", "created": response_timestamp,
