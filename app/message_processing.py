@@ -992,6 +992,7 @@ class FunctionCallStreamAssembler:
         self._turn_signature: Optional[bytes] = None
         self._real_calls_emitted: int = 0
         self._synth_tail_buf: str = ""
+        self._synth_total_received: int = 0
         self._lex_state: LexicalState = LexicalState()
         self._lex_seeded: bool = not bool(self.prefill_text)
 
@@ -1023,6 +1024,9 @@ class FunctionCallStreamAssembler:
 
     def has_pending(self) -> bool:
         return self._pending is not None
+
+    def has_received_synthetic_text(self) -> bool:
+        return self._synth_total_received > 0 or bool(self._synth_tail_buf)
 
     def pop_synth_signature(self) -> Optional[bytes]:
         """取出尚未随增量发出的合成工具思考签名（用于短回复在 flush_synthetic_tail 收尾时无损补挂签名）。"""
@@ -1132,13 +1136,16 @@ class FunctionCallStreamAssembler:
             incoming_text = "".join(synth_deltas)
             if incoming_text:
                 self._synth_tail_buf += incoming_text
+                self._synth_total_received += len(incoming_text)
 
             self._ensure_lex_seeded(force=(not fc_will_continue or saw_done_signal))
 
             if not fc_will_continue or saw_done_signal:
-                # 合成工具本轮调用正常收敛结束（或已收到协议层 $.done 闭合信号）：执行 EOF 级尾锚定词法修剪（不断流，保留后续 usage/tool_calls）
+                # 合成工具本轮调用正常收敛结束（或已收到 $.done 信号）：冲刷当前尾窗，但仅在 not fc_will_continue 或实锤裁剪时才封死 _synth_eof_sealed，
+                # 防止 $.done 提前到达时吞掉紧随其后的尾随闭合标签分片（如 </affinity> / </status>）！
                 self._last_synth_path = ""
-                self._saw_synth_partial = False
+                if not fc_will_continue:
+                    self._saw_synth_partial = False
                 clean_buf, trimmed, _ = analyze_synthetic_tail(
                     self._synth_tail_buf,
                     emit_tool_name=self.synthetic_tool_name,
@@ -1147,7 +1154,7 @@ class FunctionCallStreamAssembler:
                 )
                 self._synth_tail_buf = ""
                 self._lex_state.feed(clean_buf)
-                if trimmed or saw_done_signal:
+                if not fc_will_continue or trimmed:
                     self._synth_eof_sealed = True
                 sig_to_emit = self._synth_signature
                 self._synth_signature = None
@@ -2267,12 +2274,14 @@ def process_gemini_response_to_openai_dict(
             raw_th = getattr(um, "thought_token_count", None)
         tool_p_tk = int(getattr(um, "tool_use_prompt_token_count", 0) or 0)
         raw_tot = getattr(um, "total_token_count", None)
-        if raw_th is not None:
-            th_tk = int(raw_th or 0)
-        elif raw_tot and int(raw_tot) > (p_tk + out_tk + tool_p_tk):
-            th_tk = int(raw_tot) - p_tk - out_tk - tool_p_tk
-        else:
-            th_tk = 0
+        if raw_tot is None and isinstance(getattr(um, "model_extra", None), dict):
+            raw_tot = um.model_extra.get("totalTokenCount") or um.model_extra.get("total_token_count")
+        if raw_th is None and isinstance(getattr(um, "model_extra", None), dict):
+            raw_th = um.model_extra.get("thoughtsTokenCount") or um.model_extra.get("thoughts_token_count")
+        th_tk = int(raw_th or 0) if raw_th is not None else 0
+        if raw_tot and int(raw_tot) > (p_tk + out_tk + tool_p_tk + th_tk):
+            residual_gen = int(raw_tot) - p_tk - tool_p_tk
+            th_tk = max(th_tk, residual_gen - out_tk)
         comp_tk = out_tk + th_tk
         tot_tk = int(raw_tot) if raw_tot else (p_tk + comp_tk)
         usage_data["prompt_tokens"] = p_tk
