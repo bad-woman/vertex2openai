@@ -1,3 +1,26 @@
+## 2026-11-18 流式抗截断（`compose_reply`）`MALFORMED_FUNCTION_CALL` 源头治本与末尾状态栏闭合标签保护
+
+### 1. 保留双必填门栓 + 移除过严 `parameters_json_schema` 扩展（`app/synthetic_wrapper.py`）
+- 保持 `required: ["content", "done"]` 与 `property_ordering: ["content", "done"]` 双阶段收敛门栓，防止长文末尾状态栏未写完提前闭合；
+- Express 通道 `compose_reply` 移除易在长文嵌套引号/标签下校验脱轨的 `parameters_json_schema` + `additionalProperties: False`，统一采用 Vertex 原生标准 `parameters`（`types.Schema`）声明，大幅压低 `MALFORMED_FUNCTION_CALL` 触发率；
+- 在传输控制指令中显式增加硬性约束：所有已打开的 XML/HTML 标签（`</...>`）、代码围栏与末尾状态栏面板必须在关闭 `content` 字符串及设置 `done=true` 之前完整配对闭合。
+
+### 2. 未出正文前的 `MALFORMED_FUNCTION_CALL` 零等待无感剥壳自愈 & 思考后空正文拦截（`app/upstreams/express_sdk.py`、`app/api_helpers.py`）
+- `prepare_express_context` 新增 `disable_sandbox=True` 纯净无沙箱上下文构建（干净剥离 `compose_reply` 声明及传输控制指令，保留预填充与客户端真实工具）；
+- 严格区分“已产出思考块（`reasoning_content`）”与“已产出可见正文/真实工具（`has_yielded_visible_body`）”，修复高思考档位下先吐出思考块、正文 0 字即崩工具调用却被漏判为 200 成功空回的 Bug；
+- 真流式下若尚未产出任何可见正文就遇到 `MALFORMED_FUNCTION_CALL / MALFORMED_RESPONSE / UNEXPECTED_TOOL_CALL`，不断开客户端 SSE 连接、0 等待就地剥离 `compose_reply` 回退原生流式输出正文，并自动过滤重连流中的重复思考块；假流式与非流式同步支持自动剥壳降级重试；补齐 `MALFORMED_*` → `finish_reason="length"` 映射。
+
+### 3. 修复 `$.done` 过早封口、中断尾窗冲刷与多行状态栏周期豁免（`app/message_processing.py`、`app/api_helpers.py`、`app/synthetic_wrapper.py`）
+- `FunctionCallStreamAssembler` 仅在 `not fc_will_continue` 或实锤命中溢出裁剪（`trimmed=True`）时才置 `_synth_eof_sealed = True`，确保 `$.done` 提前到达后尾随分片补发的闭合标签（如 `</affinity>`）无损保留；
+- Express 与 Studio 流式在中途/尾跳异常中断退出前，强制冲刷 `flush_synthetic_tail` 滑动尾窗（96～640 字），杜绝已接收在本地内存中的状态栏收尾标签被静默丢弃；
+- `analyze_synthetic_tail` 对含合法配对闭合标签（`paired_close_tag`）的片段予以周期裁剪豁免，并在存在未闭合 XML/HTML 容器标签时放宽流中普通重复阈值（`min_reps=18, min_total_len=280`）。
+
+### 4. 修复 Gemini 4 流式与压制思考下 Token 统计被清零或仅剩单个数（`0` / `8`）的 Bug（`app/api_helpers.py`、`app/message_processing.py`）
+- **流式跨帧单调 `max()` 保留**：防止上游在流式末尾附带的仅含 `{"traffic_type": "ON_DEMAND"}` 空壳包将前序帧已下发的真实 Token 统计覆盖回 `0`；
+- **`total_token_count` 总量守恒校核（`_reconcile_usage_counts`）**：兼容跨 SDK 版本 `model_extra` 驼峰字段读取；当开启压制思考导致 `thoughts_token_count` 仅返回 `0` 或 `8` 标记壳、或流式参数分片下 `candidates_token_count` 仅统计收尾壳时，自动通过 `total_token_count - prompt_token_count` 守恒差额精准还原真实的隐藏思考与正文 Token 数。
+
+---
+
 ## 2026-11-16 新增控制台「调用记录」全链路追踪面板 & 修复原生思考 Token 统计漏计
 
 ### 1. 控制台「🖥️ 运行日志」新增二级切换「📋 调用记录」明细面板（`app/logger.py`、`app/api_helpers.py`、`app/upstreams/cookie_proxy.py`、`app/main.py`）

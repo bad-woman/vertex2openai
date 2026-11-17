@@ -1055,7 +1055,7 @@ _FINISH_FILTERED = {"SAFETY", "PROHIBITED_CONTENT", "RECITATION", "BLOCKLIST", "
 
 def _map_finish_reason(raw: str | None) -> str:
     r = (raw or "").upper()
-    if r == "MAX_TOKENS":
+    if r in ("MAX_TOKENS", "MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE", "UNEXPECTED_TOOL_CALL"):
         return "length"
     if r in _FINISH_FILTERED:
         return "content_filter"
@@ -1785,10 +1785,6 @@ class CookieProxyUpstream(BaseUpstream):
 
         sandbox_spec.prefill_text = prefill_text or ""
         sandbox_spec.has_prefill = bool(prefill_active)
-        if sandbox_spec.enabled:
-            print(
-                f"🛡️ [抗截断] Studio(Cookie) 通道已启用工具传输 | 工具={sandbox_spec.emit_tool_name}"
-            )
 
         client_kwargs = {
             "timeout": httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0),
@@ -1815,6 +1811,16 @@ class CookieProxyUpstream(BaseUpstream):
 
         is_image = _profile["is_image"]
         fake_stream_enabled = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
+        if sandbox_spec.enabled and not is_image:
+            _ck_mode_lbl = (
+                "假流式"
+                if (is_stream and fake_stream_enabled and not native_custom_tools)
+                else ("流式·工具参数整包返回" if is_stream else "非流式")
+            )
+            print(
+                f"🛡️ [抗截断] Studio(Cookie) 通道已启用工具传输 | 工具={sandbox_spec.emit_tool_name}"
+                f" | 模式={_ck_mode_lbl}（Cookie私有协议无参数分片）"
+            )
         _wants_search_flag = bool(
             (force_builtin_search or _forced_search or model_display.lower().endswith("-search"))
             and _profile.get("supports_search")
@@ -1971,7 +1977,7 @@ class CookieProxyUpstream(BaseUpstream):
                 body = await build_batch_graphql_body_async(
                     project_id, base_model_name, request_obj,
                     prefill_active=prefill_active, force_search=force_builtin_search,
-                    native_tools=True, sandbox_spec=sandbox_spec, enable_stream_fc_args=True,
+                    native_tools=True, sandbox_spec=sandbox_spec, enable_stream_fc_args=False,
                 )
                 fallback_body = (
                     (lambda: _build_clean_fallback_body(native_fallback_state))
@@ -2192,12 +2198,17 @@ class CookieProxyUpstream(BaseUpstream):
                             elif status == "cookie_error":
                                 if not has_yielded_to_client:
                                     raise CookieAttemptError(403, str(data), is_retryable=False, is_auth_or_billing=True)
+                                _salv_ck = fc_assembler.flush_synthetic_tail()
+                                if _salv_ck:
+                                    _salv_out = deduper.feed(_salv_ck) if deduper else _salv_ck
+                                    if _salv_out:
+                                        yield _make_openai_chunk(response_id, model_display, content=_salv_out)
                                 if telemetry is not None:
                                     telemetry["midstream_error"] = str(data)
                                     telemetry["error_code"] = 403
                                 stats.add_error()
                                 yield _make_openai_chunk(response_id, model_display, content=f"[Studio 权限错误] {data}")
-                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                yield _make_openai_chunk(response_id, model_display, finish_reason="length")
                                 yield "data: [DONE]\n\n"
                                 return
 
@@ -2209,12 +2220,17 @@ class CookieProxyUpstream(BaseUpstream):
                                         is_retryable=(status == "retryable_error"),
                                         is_auth_or_billing=False,
                                     )
+                                _salv_ck2 = fc_assembler.flush_synthetic_tail()
+                                if _salv_ck2:
+                                    _salv_out2 = deduper.feed(_salv_ck2) if deduper else _salv_ck2
+                                    if _salv_out2:
+                                        yield _make_openai_chunk(response_id, model_display, content=_salv_out2)
                                 if telemetry is not None:
                                     telemetry["midstream_error"] = str(data)
                                     telemetry["error_code"] = 503 if status == "retryable_error" else 400
                                 stats.add_error()
                                 yield _make_openai_chunk(response_id, model_display, content=f"\n[Studio 错误] {data}")
-                                yield _make_openai_chunk(response_id, model_display, finish_reason="stop")
+                                yield _make_openai_chunk(response_id, model_display, finish_reason="length")
                                 yield "data: [DONE]\n\n"
                                 return
 
@@ -2341,7 +2357,17 @@ class CookieProxyUpstream(BaseUpstream):
                     p_u_s, th_u_s, out_u_s, _ = _extract_studio_usage_detail(usage_meta)
                     usage = _record_studio_usage(usage_meta)
                     if telemetry is not None:
-                        if first_tok_t0 is not None:
+                        # Cookie 通道开启抗截断且未流式回传思考时，上游以单帧整包返回 functionCall，自动标记为整包耗时以防出现“吐 0.0s”
+                        if (
+                            fc_assembler.synthetic_hit
+                            and not saw_thought_stream
+                            and first_tok_t0 is not None
+                            and (stream_end_t0 - first_tok_t0) < 0.08
+                        ):
+                            telemetry["is_unary"] = True
+                            telemetry["ttft"] = None
+                            telemetry["gen_time"] = max(0.0, stream_end_t0 - stream_req_t0)
+                        elif first_tok_t0 is not None:
                             telemetry["ttft"] = max(0.0, first_tok_t0 - stream_req_t0)
                             telemetry["gen_time"] = max(0.0, stream_end_t0 - first_tok_t0)
                         else:

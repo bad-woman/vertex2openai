@@ -87,8 +87,48 @@ def _check_sdk_supports_params_json_schema() -> bool:
         return False
 
 
+def _resolve_schema_prop_ordering_key() -> Optional[str]:
+    try:
+        schema_cls = getattr(types, "Schema", None)
+        if schema_cls is None:
+            return "property_ordering"
+        fields = getattr(schema_cls, "model_fields", None) or {}
+        if "property_ordering" in fields:
+            return "property_ordering"
+        if "propertyOrdering" in fields:
+            return "propertyOrdering"
+        ann = getattr(schema_cls, "__annotations__", None) or {}
+        if "property_ordering" in ann:
+            return "property_ordering"
+        if "propertyOrdering" in ann:
+            return "propertyOrdering"
+    except Exception:
+        pass
+    return None
+
+
 _SDK_SUPPORTS_STREAM_FC_ARGS = _check_sdk_supports_stream_fc_args()
 _SDK_SUPPORTS_PARAMS_JSON_SCHEMA = _check_sdk_supports_params_json_schema()
+_SCHEMA_PROP_ORDER_KEY = _resolve_schema_prop_ordering_key()
+
+_MALFORMED_TOOL_FINISH_REASONS = frozenset({
+    "MALFORMED_FUNCTION_CALL",
+    "MALFORMED_RESPONSE",
+    "UNEXPECTED_TOOL_CALL",
+})
+
+
+def is_malformed_tool_finish(resp_or_chunk: Any) -> bool:
+    """检测上游候选是否因工具调用/解码格式畸形中断（MALFORMED_FUNCTION_CALL / MALFORMED_RESPONSE / UNEXPECTED_TOOL_CALL）。"""
+    cands = getattr(resp_or_chunk, "candidates", None) or []
+    for cand in cands:
+        fr = getattr(cand, "finish_reason", None)
+        if not fr:
+            continue
+        fr_str = (getattr(fr, "name", None) or str(fr)).strip().upper()
+        if any(tag in fr_str for tag in _MALFORMED_TOOL_FINISH_REASONS):
+            return True
+    return False
 
 
 @dataclass
@@ -194,16 +234,16 @@ def build_emit_tool_declaration(
 ) -> Dict[str, Any]:
     """构建有序双必填字段 (content + done) 抗截断传输工具声明：
     1. 全局静态固定描述与 Schema，100% 保证命中 Vertex 隐式前缀缓存；
-    2. 协议级带外收敛：受限解码器（FSM）要求模型在写完 content 后必须闭合双引号去填写 `, "done": true}`，
-       为模型注意力提供确定性的结构出口台阶，从根源消除在一元 generateContent / 假流式 / 真流式下把外层容器括号幻觉进 content 或卡死未闭合的问题；
-    3. Express 模式使用 parameters_json_schema + propertyOrdering + additionalProperties: False；
-    4. Cookie 模式使用标准 parameters + propertyOrdering: ["content", "done"]（不含布尔型 additionalProperties，兼容 batchGraphql）。
+    2. 保留 required: ["content", "done"] 与 property_ordering 双阶段收敛门栓，防止末尾状态栏未写完提前封口；
+    3. 统一采用 Vertex 原生标准 parameters（移除过严易脱轨的 parameters_json_schema + additionalProperties: False），
+       激活最稳定的原生 Schema 解码器，从源头大幅消除长文嵌套引号/标签下的 MALFORMED_FUNCTION_CALL。
     """
     desc = "Deliver the complete user-visible reply as text, then set done to true to end the call."
     content_desc = (
-        "The complete user-visible reply itself, preserving its language, code blocks, sections, formatting and markup."
+        "The complete user-visible reply itself, preserving its language, code blocks, sections, formatting, "
+        "all closing tags and trailing status panels."
     )
-    done_desc = "Set to true immediately after content ends to finalize and close the call."
+    done_desc = "Set to true only after all requested content and all closing tags are complete."
     base_schema: Dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -217,16 +257,14 @@ def build_emit_tool_declaration(
             },
         },
         "required": ["content", "done"],
-        "propertyOrdering": ["content", "done"],
     }
-    if not for_cookie and _SDK_SUPPORTS_PARAMS_JSON_SCHEMA:
-        json_schema = {k: v for k, v in base_schema.items() if k != "propertyOrdering"}
-        json_schema["propertyOrdering"] = ["content", "done"]
-        json_schema["additionalProperties"] = False
+    if not for_cookie and _SCHEMA_PROP_ORDER_KEY:
+        express_schema = dict(base_schema)
+        express_schema[_SCHEMA_PROP_ORDER_KEY] = ["content", "done"]
         return {
             "name": emit_tool_name,
             "description": desc,
-            "parameters_json_schema": json_schema,
+            "parameters": express_schema,
         }
     return {
         "name": emit_tool_name,
@@ -242,7 +280,7 @@ def build_sandbox_control_instruction(
     is_keep_turn: bool = False,
     has_callable_client_tools: bool = False,
 ) -> str:
-    """构建通用传输格式指令（配合 content + done 双字段收敛约束，防工具自检与防尾部重复填充）。"""
+    """构建通用传输格式指令（含双必填收敛、XML/HTML 标签与末尾状态栏闭合前置硬约束、防自检与防填充）。"""
     target_text = "only the new continuation text" if has_prefill else "the entire user-visible answer"
     if has_callable_client_tools:
         transport_head = (
@@ -260,8 +298,10 @@ def build_sandbox_control_instruction(
 
     transport_tail = (
         " This transport does not change the task. Do not add unsolicited commentary about this transport, "
-        "tool selection or serialization. Once the requested content is complete, close the content string and set done to true "
-        "immediately without repeating finished content or adding filler. Preserve repetition explicitly requested by the task."
+        "tool selection or serialization. Every opened XML/HTML tag (</...>), code fence, and required trailing "
+        "status or attribute panel must be completely paired and closed inside content before closing the content "
+        "string and setting done to true; then end the call immediately without repeating finished content or adding filler. "
+        "Preserve repetition explicitly requested by the task."
     )
     transport_line = transport_head + transport_tail
 
@@ -1025,14 +1065,26 @@ def analyze_synthetic_tail(
         stripped_u = unit.strip()
         if stripped_u.startswith("</") and stripped_u.endswith(">"):
             continue
+        # 若重复片段中包含已合法配对闭合的 HTML/XML 标签（如多层状态栏闭合 </div></section>），予以周期裁剪豁免
+        if any(metas[k].paired_close_tag for k in range(curr, n)):
+            continue
 
         is_table_row_seg = ("|" in unit and "\n" not in unit)
-        min_total_len = 360 if is_table_row_seg else 120
-        min_reps = 16 if is_table_row_seg else 10
+        has_unclosed_container = any(v > 0 for v in end_lex.html_open_counts.values())
+        if is_table_row_seg:
+            min_total_len = 360
+            min_reps = 16
+        elif not at_eof and has_unclosed_container:
+            # 处于未闭合的 XML/HTML 容器标签（如 <status> / <affinity> 多角色状态栏）内部时，放宽流中普通重复阈值防误伤
+            min_total_len = 280
+            min_reps = 18
+        else:
+            min_total_len = 120
+            min_reps = 10
 
         if repeats >= min_reps and total_rep_chars >= min_total_len:
             best_cut = curr if best_cut is None else min(best_cut, curr)
-        elif not at_eof and repeats >= 4 and total_rep_chars >= 36:
+        elif not at_eof and repeats >= (6 if has_unclosed_container else 4) and total_rep_chars >= (64 if has_unclosed_container else 36):
             suspect_hold = True
 
     if best_cut is not None:

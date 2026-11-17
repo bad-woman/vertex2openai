@@ -27,6 +27,7 @@ from logger import stats, call_recorder
 from synthetic_wrapper import (
     _BUILTIN_SEARCH_NAMES,
     extract_synthetic_content,
+    is_malformed_tool_finish,
     is_stream_fc_args_unsupported_error,
     make_bad_woman_response_id,
     strip_stream_fc_args_from_config,
@@ -191,7 +192,10 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
             "finish_reason=safety", "image_safety", "recitation", "blocklist",
         )):
             code = 400
-        elif any(k in low for k in ("只返回了思考过程", "返回了空内容", "返回了空对象", "未返回任何有效内容")):
+        elif any(k in low for k in (
+            "只返回了思考过程", "返回了空内容", "返回了空对象", "未返回任何有效内容",
+            "解码格式异常", "malformed_response", "malformed_function_call", "unexpected_tool_call",
+        )):
             code = 502
         elif "not found" in low or "404" in low:
             code = 404
@@ -682,6 +686,7 @@ def extract_gemini_chunk_debug_dict(chunk: Any) -> dict:
     if um:
         out["usageMetadata"] = {
             "promptTokenCount": getattr(um, "prompt_token_count", 0),
+            "thoughtsTokenCount": getattr(um, "thoughts_token_count", 0),
             "candidatesTokenCount": getattr(um, "candidates_token_count", 0),
             "totalTokenCount": getattr(um, "total_token_count", 0),
         }
@@ -802,27 +807,85 @@ def print_outbound_debug_report(
     print("\n".join(lines))
 
 
-def _extract_usage_detail(resp: Any) -> tuple[int, int, int, int]:
-    """从 Gemini 响应对象提取精确的 (输入Tokens, 原生思考Tokens, 正文输出Tokens, 总Tokens)。"""
-    um = getattr(resp, "usage_metadata", None)
+def _um_get_int(um: Any, *keys: str) -> Optional[int]:
+    """跨 SDK 版本安全读取 usage_metadata 字段（同时兼容对象属性、dict 与 Pydantic model_extra 未知驼峰字段）。"""
+    if um is None:
+        return None
+    if isinstance(um, dict):
+        for k in keys:
+            v = um.get(k)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    extra = getattr(um, "model_extra", None)
+    for k in keys:
+        v = getattr(um, k, None)
+        if v is None and isinstance(extra, dict):
+            v = extra.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _extract_raw_usage_fields(resp: Any) -> tuple[int, int, int, int, int]:
+    """提取未经守恒折算的原始 (prompt_tk, explicit_th_tk, explicit_out_tk, tool_prompt_tk, total_tk)。"""
+    um = resp.get("usageMetadata") if isinstance(resp, dict) else getattr(resp, "usage_metadata", None)
     if not um:
-        return 0, 0, 0, 0
-    p_tk = int(getattr(um, "prompt_token_count", 0) or 0)
-    out_tk = int(getattr(um, "candidates_token_count", 0) or 0)
-    raw_th = getattr(um, "thoughts_token_count", None)
-    if raw_th is None:
-        raw_th = getattr(um, "thought_token_count", None)
-    tool_p_tk = int(getattr(um, "tool_use_prompt_token_count", 0) or 0)
-    raw_tot = getattr(um, "total_token_count", None)
-    if raw_th is not None:
-        th_tk = int(raw_th or 0)
-    elif raw_tot and int(raw_tot) > (p_tk + out_tk + tool_p_tk):
-        th_tk = int(raw_tot) - p_tk - out_tk - tool_p_tk
-    else:
-        th_tk = 0
+        return 0, 0, 0, 0, 0
+    p_tk = _um_get_int(um, "prompt_token_count", "promptTokenCount") or 0
+    th_tk = _um_get_int(
+        um, "thoughts_token_count", "thoughtsTokenCount", "thought_token_count", "thoughtTokenCount"
+    ) or 0
+    out_tk = _um_get_int(um, "candidates_token_count", "candidatesTokenCount") or 0
+    tool_p_tk = _um_get_int(um, "tool_use_prompt_token_count", "toolUsePromptTokenCount") or 0
+    tot_tk = _um_get_int(um, "total_token_count", "totalTokenCount") or 0
+    return p_tk, th_tk, out_tk, tool_p_tk, tot_tk
+
+
+def _reconcile_usage_counts(
+    p_tk: int,
+    explicit_th: int,
+    explicit_out: int,
+    tool_p_tk: int,
+    raw_tot: int,
+    visible_chars: int = 0,
+) -> tuple[int, int, int, int]:
+    """基于 total_token_count 总量守恒校核并补齐隐藏思考或流式分片漏计的正文 Token：
+    1. 当压制思考 (include_thoughts=False) 时，部分 Gemini 4 模型将 thoughts_token_count 填为 0 或 8（标记壳），
+       而将真实的数百/数千内部推理 Token 计入 total_token_count —— 自动通过差额还原真实 th_tk；
+    2. 当 stream_function_call_arguments 分片传输时，若 candidates_token_count 仅统计了收尾壳（<=32）而实际正文很长，
+       且 explicit_th 已记录思考量，则将剩余差额归还给 out_tk。
+    """
+    th_tk = max(0, int(explicit_th or 0))
+    out_tk = max(0, int(explicit_out or 0))
+    p_tk = max(0, int(p_tk or 0))
+    tool_p_tk = max(0, int(tool_p_tk or 0))
+    raw_tot = max(0, int(raw_tot or 0))
+
+    if raw_tot > 0 and p_tk > 0:
+        residual_gen = max(0, raw_tot - p_tk - tool_p_tk)
+        if residual_gen > (th_tk + out_tk):
+            if th_tk > 16 and out_tk <= 32 and visible_chars > 120:
+                out_tk = max(out_tk, residual_gen - th_tk)
+            else:
+                th_tk = max(th_tk, residual_gen - out_tk)
+
     comp_tk = th_tk + out_tk
-    t_tk = int(raw_tot) if raw_tot else (p_tk + comp_tk)
+    t_tk = max(raw_tot, p_tk + tool_p_tk + comp_tk) if (p_tk or comp_tk or raw_tot) else 0
     return p_tk, th_tk, out_tk, t_tk
+
+
+def _extract_usage_detail(resp: Any, visible_chars: int = 0) -> tuple[int, int, int, int]:
+    """从 Gemini 响应对象提取经总量守恒校核后的精确 (输入Tokens, 原生思考Tokens, 正文输出Tokens, 总Tokens)。"""
+    p_tk, raw_th, raw_out, tool_p_tk, raw_tot = _extract_raw_usage_fields(resp)
+    return _reconcile_usage_counts(p_tk, raw_th, raw_out, tool_p_tk, raw_tot, visible_chars=visible_chars)
 
 
 def _extract_usage(resp: Any) -> tuple[int, int, int]:
@@ -830,14 +893,14 @@ def _extract_usage(resp: Any) -> tuple[int, int, int]:
     return p_tk, (th_tk + out_tk), t_tk
 
 
-def _record_usage(resp: Any) -> dict:
+def _record_usage(resp: Any, visible_chars: int = 0) -> dict:
     usage_metadata = getattr(resp, "usage_metadata", None)
     traffic_type = getattr(usage_metadata, "traffic_type", None) if usage_metadata else None
     if traffic_type:
         value = getattr(traffic_type, "value", None) or str(traffic_type)
         print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
 
-    p_tk, th_tk, out_tk, t_tk = _extract_usage_detail(resp)
+    p_tk, th_tk, out_tk, t_tk = _extract_usage_detail(resp, visible_chars=visible_chars)
     comp_tk = th_tk + out_tk
     if p_tk or comp_tk:
         stats.add_tokens(p_tk, comp_tk)
@@ -1040,6 +1103,10 @@ class ToolCallIndexer:
         asm = self._assemblers.get(candidate_index)
         return bool(asm and asm.has_pending())
 
+    def has_received_synthetic_text(self, candidate_index: int = 0) -> bool:
+        asm = self._assemblers.get(candidate_index)
+        return bool(asm and asm.has_received_synthetic_text())
+
     def next_index(self, candidate_index: int = 0) -> int:
         i = self._next.get(candidate_index, 0)
         self._next[candidate_index] = i + 1
@@ -1133,7 +1200,12 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 
             if raw_gemini_finish_reason_str == "STOP":
                 openai_finish_reason = "stop"
-            elif raw_gemini_finish_reason_str == "MAX_TOKENS":
+            elif raw_gemini_finish_reason_str in (
+                "MAX_TOKENS",
+                "MALFORMED_FUNCTION_CALL",
+                "MALFORMED_RESPONSE",
+                "UNEXPECTED_TOOL_CALL",
+            ):
                 openai_finish_reason = "length"
             elif raw_gemini_finish_reason_str == "SAFETY":
                 openai_finish_reason = "content_filter"
@@ -1422,6 +1494,46 @@ def _dedup_sse_chunk_content(sse_line: str, deduper: PrefillDeduper, force_flush
         return None
     except Exception:
         return sse_line
+
+
+def _strip_sse_reasoning_chunk(sse_line: str) -> Optional[str]:
+    """在流内无感剥壳回退重连时，过滤重连流中重复生成的 reasoning_content 块。"""
+    if '"reasoning_content":' not in sse_line:
+        return sse_line
+    try:
+        payload = json.loads(sse_line[len("data: "):].strip())
+        choices = payload.get("choices") or []
+        if not choices:
+            return sse_line
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        delta.pop("reasoning_content", None)
+        has_finish = choice.get("finish_reason") is not None
+        has_meaningful = bool(
+            delta.get("content")
+            or delta.get("tool_calls")
+            or delta.get("extra_content")
+            or delta.get("role")
+        )
+        if has_meaningful or has_finish:
+            choice["delta"] = delta
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return None
+    except Exception:
+        return sse_line
+
+
+def _sse_chunk_has_visible_body(sse_line: str) -> bool:
+    """判断 SSE 帧是否包含真实的可见正文 (content) 或真实工具调用 (tool_calls)，严格排除纯思考块。"""
+    return bool(
+        '"tool_calls":' in sse_line
+        or ('"content":' in sse_line and '"content": ""' not in sse_line and '"content": null' not in sse_line)
+    )
+
+
+class _MalformedSandboxFallback(Exception):
+    """内部控制流异常：当抗截断沙箱在尚未产出任何可见正文前触发 MALFORMED_FUNCTION_CALL 时，0 等待就地切换为无沙箱原生模式重连。"""
+    pass
 
 
 def is_location_pin_failure(err: Any) -> bool:
@@ -1960,9 +2072,24 @@ async def execute_unified_completion(
 
     express_ctx: Optional[dict] = None
     express_prompt_cache: Optional[List[types.Content]] = None
+    express_nosandbox_ctx: Optional[dict] = None
+    express_nosandbox_prompt_cache: Optional[List[types.Content]] = None
+    sandbox_downgraded: bool = False
 
-    async def _get_express_ctx():
-        nonlocal express_ctx, express_prompt_cache
+    async def _get_express_ctx(no_sandbox: bool = False):
+        nonlocal express_ctx, express_prompt_cache, express_nosandbox_ctx, express_nosandbox_prompt_cache
+        if no_sandbox:
+            if express_nosandbox_ctx is None:
+                ctx, err_resp = express_upstream.prepare_express_context(request_obj, disable_sandbox=True)
+                if err_resp is not None:
+                    return None, None, err_resp
+                express_nosandbox_ctx = ctx
+                tracker.sync_from_express_ctx(ctx)
+                express_nosandbox_prompt_cache = await asyncio.to_thread(
+                    ctx["prompt_func"], ctx["request_obj"].messages
+                )
+            return express_nosandbox_ctx, express_nosandbox_prompt_cache, None
+
         if express_ctx is None:
             ctx, err_resp = express_upstream.prepare_express_context(request_obj)
             if err_resp is not None:
@@ -2075,7 +2202,9 @@ async def execute_unified_completion(
             return ": keep-alive\n\n"
 
         async def _unified_stream_generator():
+            nonlocal sandbox_downgraded
             any_output_yielded = False
+            emitted_reasoning_any = False
             try:
                 if not (fake_stream_on or is_image_request):
                     yield ": keep-alive\n\n"
@@ -2092,6 +2221,7 @@ async def execute_unified_completion(
 
                     tracker.note_attempt_start(target)
                     has_yielded_output = False
+                    has_yielded_visible_body = False
                     attempt_failed = False
                     err_code = 500
                     err_formatted = ""
@@ -2101,7 +2231,7 @@ async def execute_unified_completion(
 
                     # ---------- 1A. 当前轮次使用 Express Key ----------
                     if target["channel"] == "express":
-                        ctx, actual_prompt, _ = await _get_express_ctx()
+                        ctx, actual_prompt, _ = await _get_express_ctx(no_sandbox=sandbox_downgraded)
                         spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
                         current_client = spec["client"]
                         model_to_call = spec["model_to_call"]
@@ -2189,19 +2319,23 @@ async def execute_unified_completion(
                                     err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
                                     if synth_tool_name:
                                         err_v.is_retryable = True
+                                        if not sandbox_downgraded and is_malformed_tool_finish(raw_gemini_response):
+                                            sandbox_downgraded = True
+                                            print(f"🩹 [抗截断自愈] 模型 {model_to_call} 假流式触发工具解码异常，后续重试已自动剥离 compose_reply 切换为原生模式。")
                                     raise err_v
 
-                                usage_info = _record_usage(raw_gemini_response)
                                 openai_response_dict = convert_to_openai_format(
                                     raw_gemini_response,
                                     exp_req_obj.model,
                                     synthetic_tool_name=synth_tool_name,
                                     prefill_text=prefill_text,
                                 )
-                                _prepend_prefill(openai_response_dict, prefill_text)
-
                                 _ch0 = (openai_response_dict.get("choices") or [{}])[0]
                                 _msg0 = _ch0.get("message") or {}
+                                _raw_gen_chars = len(_msg0.get("content") or "")
+                                usage_info = _record_usage(raw_gemini_response, visible_chars=_raw_gen_chars)
+                                _prepend_prefill(openai_response_dict, prefill_text)
+
                                 _fin0 = _ch0.get("finish_reason") or "stop"
                                 _has_tc0 = bool(_msg0.get("tool_calls"))
                                 _out_c0 = len(_msg0.get("content") or "")
@@ -2246,11 +2380,16 @@ async def execute_unified_completion(
                             )
                             stream_start_ts = time.time()
                             sampler = _RawSampler()
+                            tool_indexer: Optional[ToolCallIndexer] = None
+                            deduper: Optional[PrefillDeduper] = None
+                            prefill_emitted: bool = not bool(prefill_text)
+                            emitted_finish_reason: bool = False
                             try:
                                 active_stream_cfg = gen_config_dict
-                                for _pin_try in range(3):
+                                for _pin_try in range(4):
                                     stream_gen_obj = None
                                     received_any_stream_chunk = False
+                                    suppress_dup_reasoning = emitted_reasoning_any
                                     try:
                                         stream_attempt_t0 = time.monotonic()
                                         first_tok_mono: Optional[float] = None
@@ -2269,7 +2408,7 @@ async def execute_unified_completion(
                                         emitted_finish_reason = False
                                         last_finish_reason_str = "stop"
                                         last_stream_chunk_obj = None
-                                        final_p_tk, final_th_tk, final_out_tk, final_t_tk = 0, 0, 0, 0
+                                        raw_p_max, raw_th_max, raw_out_max, raw_tool_p_max, raw_tot_max = 0, 0, 0, 0, 0
 
                                         async for chunk_item_call in stream_gen_obj:
                                             received_any_stream_chunk = True
@@ -2283,12 +2422,43 @@ async def execute_unified_completion(
                                                 saw_thought_stream = True
                                             sampler.add(extract_gemini_chunk_debug_dict(chunk_item_call))
                                             if getattr(chunk_item_call, "usage_metadata", None):
-                                                final_p_tk, final_th_tk, final_out_tk, final_t_tk = _extract_usage_detail(chunk_item_call)
+                                                _up, _uth, _uout, _utp, _utot = _extract_raw_usage_fields(chunk_item_call)
+                                                if _up > raw_p_max:
+                                                    raw_p_max = _up
+                                                if _uth > raw_th_max:
+                                                    raw_th_max = _uth
+                                                if _uout > raw_out_max:
+                                                    raw_out_max = _uout
+                                                if _utp > raw_tool_p_max:
+                                                    raw_tool_p_max = _utp
+                                                if _utot > raw_tot_max:
+                                                    raw_tot_max = _utot
 
                                             pf = getattr(chunk_item_call, "prompt_feedback", None)
-                                            if pf and getattr(pf, "block_reason", None) and not has_yielded_output:
+                                            if pf and getattr(pf, "block_reason", None) and not has_yielded_visible_body:
                                                 print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
                                                 raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
+
+                                            # 若尚未向客户端产出任何可见正文，但合成工具首帧/思考后立即撞上 MALFORMED_FUNCTION_CALL：
+                                            # 拦截 premature finish 帧，0 等待就地剥离 compose_reply 无感回退原生流式！
+                                            if (
+                                                synth_tool_name
+                                                and not sandbox_downgraded
+                                                and not has_yielded_visible_body
+                                                and not tool_indexer.has_received_synthetic_text(0)
+                                                and is_malformed_tool_finish(chunk_item_call)
+                                            ):
+                                                _cand_chk = (getattr(chunk_item_call, "candidates", None) or [None])[0]
+                                                _parts_chk = getattr(getattr(_cand_chk, "content", None), "parts", None) or []
+                                                _has_inline_body = any(
+                                                    (getattr(p, "function_call", None) is not None and (
+                                                        getattr(p.function_call, "args", None) or getattr(p.function_call, "partial_args", None)
+                                                    ))
+                                                    or (not getattr(p, "thought", None) and getattr(p, "text", None))
+                                                    for p in _parts_chk
+                                                )
+                                                if not _has_inline_body:
+                                                    raise _MalformedSandboxFallback()
 
                                             num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
                                             for ci in range(num_candidates):
@@ -2296,26 +2466,34 @@ async def execute_unified_completion(
                                                     chunk_item_call, exp_req_obj.model, response_id_for_stream, ci,
                                                     indexer=tool_indexer,
                                                 )
-                                                if not has_yielded_output and '"finish_reason": "content_filter"' in sse_chunk:
+                                                if not has_yielded_visible_body and '"finish_reason": "content_filter"' in sse_chunk:
                                                     print(f"🔎 [Express 诊断] 模型={model_to_call} 触发安全过滤。原始响应样本：\n{sampler.dump()}")
                                                     raise ValueError(_describe_empty_gemini_response(chunk_item_call, model_to_call))
+
+                                                if suppress_dup_reasoning:
+                                                    sse_chunk = _strip_sse_reasoning_chunk(sse_chunk)
+                                                    if sse_chunk is None:
+                                                        continue
 
                                                 if deduper is not None:
                                                     sse_chunk = _dedup_sse_chunk_content(sse_chunk, deduper)
                                                     if sse_chunk is None:
                                                         continue
 
-                                                is_real_chunk = (
-                                                    '"reasoning_content":' in sse_chunk
-                                                    or '"tool_calls":' in sse_chunk
-                                                    or ('"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk)
-                                                )
+                                                has_vis_in_chunk = _sse_chunk_has_visible_body(sse_chunk)
+                                                has_th_in_chunk = ('"reasoning_content":' in sse_chunk)
+                                                is_real_chunk = has_vis_in_chunk or has_th_in_chunk
                                                 if is_real_chunk and not has_yielded_output:
                                                     has_yielded_output = True
                                                     any_output_yielded = True
                                                     print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
                                                 elif not has_yielded_output:
                                                     continue
+
+                                                if has_th_in_chunk:
+                                                    emitted_reasoning_any = True
+                                                if has_vis_in_chunk:
+                                                    has_yielded_visible_body = True
 
                                                 if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
                                                     prefill_emitted = True
@@ -2373,10 +2551,12 @@ async def execute_unified_completion(
                                             if rem_synth and deduper is not None:
                                                 rem_synth = deduper.feed(rem_synth)
                                             if rem_synth or _tail_sig:
-                                                if rem_synth and not has_yielded_output:
-                                                    has_yielded_output = True
-                                                    any_output_yielded = True
-                                                    print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
+                                                if rem_synth:
+                                                    has_yielded_visible_body = True
+                                                    if not has_yielded_output:
+                                                        has_yielded_output = True
+                                                        any_output_yielded = True
+                                                        print(f"⚡ [Express] {request_obj.model} | 连接建立，正在实时流式输出...")
                                                 if rem_synth and not prefill_emitted:
                                                     prefill_emitted = True
                                                     _pf = {
@@ -2403,6 +2583,7 @@ async def execute_unified_completion(
                                         if deduper is not None and not deduper.done:
                                             tail = deduper.flush()
                                             if tail:
+                                                has_yielded_visible_body = True
                                                 if not has_yielded_output:
                                                     has_yielded_output = True
                                                     any_output_yielded = True
@@ -2427,6 +2608,7 @@ async def execute_unified_completion(
                                                 yield f"data: {json.dumps(_tail, ensure_ascii=False)}\n\n"
 
                                         if rem_tool_deltas:
+                                            has_yielded_visible_body = True
                                             first_flush_tc = not has_yielded_output
                                             if not has_yielded_output:
                                                 has_yielded_output = True
@@ -2448,9 +2630,11 @@ async def execute_unified_completion(
                                             }
                                             yield f"data: {json.dumps(_eof_tc_chunk, ensure_ascii=False)}\n\n"
 
-                                        # 真流式全量空回拦截：无论是否开启沙箱，只要模型未产出任何有效正文/思考/工具调用，绝不把空壳当成功发出，立即报错（非沙箱模式不盲目重试）！
-                                        if not has_yielded_output:
-                                            print(f"🔎 [Express 诊断] 模型={model_to_call} 真流式未产出任何有效正文。原始响应样本：\n{sampler.dump()}")
+                                        # 真流式全量空正文拦截：严格检查 has_yielded_visible_body（即使前面已吐出过 reasoning_content 思考块，只要可见正文/工具为 0 字，绝不当成成功结束！）
+                                        if not has_yielded_visible_body:
+                                            if synth_tool_name and not sandbox_downgraded:
+                                                raise _MalformedSandboxFallback()
+                                            print(f"🔎 [Express 诊断] 模型={model_to_call} 真流式未产出任何可见正文。原始响应样本：\n{sampler.dump()}")
                                             desc_empty = _describe_empty_gemini_response(last_stream_chunk_obj, model_to_call)
                                             err_empty_stream = ValueError(desc_empty)
                                             if synth_tool_name:
@@ -2487,6 +2671,20 @@ async def execute_unified_completion(
                                                 }
                                                 yield f"data: {json.dumps(_sig_chunk, ensure_ascii=False)}\n\n"
 
+                                        _ord_items, _ = tool_indexer.topology(0)
+                                        _gen_only_chars = sum(
+                                            len(it.get("text") or "") for it in _ord_items if it.get("kind") == "text"
+                                        )
+                                        _stream_chars = (len(prefill_text) if prefill_text else 0) + _gen_only_chars
+
+                                        final_p_tk, final_th_tk, final_out_tk, final_t_tk = _reconcile_usage_counts(
+                                            raw_p_max,
+                                            raw_th_max,
+                                            raw_out_max,
+                                            raw_tool_p_max,
+                                            raw_tot_max,
+                                            visible_chars=_gen_only_chars,
+                                        )
                                         final_comp_tk = final_th_tk + final_out_tk
                                         if final_p_tk > 0 or final_comp_tk > 0:
                                             stats.add_tokens(final_p_tk, final_comp_tk)
@@ -2508,11 +2706,6 @@ async def execute_unified_completion(
                                         elapsed = time.time() - stream_start_ts
                                         if app_state.get_setting("debug_outbound", False):
                                             print(f"🔎 [Express 尾包原始结构] {sampler.dump()}")
-
-                                        _ord_items, _ = tool_indexer.topology(0)
-                                        _stream_chars = (len(prefill_text) if prefill_text else 0) + sum(
-                                            len(it.get("text") or "") for it in _ord_items if it.get("kind") == "text"
-                                        )
                                         _s_ttft = max(0.0, first_tok_mono - stream_attempt_t0) if first_tok_mono is not None else None
                                         _s_gen = (
                                             max(0.0, stream_eof_mono - first_tok_mono)
@@ -2535,10 +2728,26 @@ async def execute_unified_completion(
                                         )
                                         print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                                         return
+                                    except _MalformedSandboxFallback:
+                                        sandbox_downgraded = True
+                                        ctx_fb, prompt_fb, _ = await _get_express_ctx(no_sandbox=True)
+                                        if ctx_fb is not None and prompt_fb is not None:
+                                            actual_prompt = prompt_fb
+                                            gen_config_dict = ctx_fb["gen_config_dict"]
+                                            active_stream_cfg = gen_config_dict
+                                            prefill_text = ctx_fb["prefill_text"]
+                                            exp_req_obj = ctx_fb["request_obj"]
+                                            synth_tool_name = ""
+                                            print(
+                                                f"🩹 [抗截断自愈] 模型 {model_to_call} 在未产出可见正文前触发工具解码异常，"
+                                                "0 等待剥离 compose_reply 无感回退原生流式重连..."
+                                            )
+                                            continue
+                                        raise ValueError(_describe_empty_gemini_response(last_stream_chunk_obj, model_to_call))
                                     except Exception as e_pin_stream:
                                         _stripped_s_cfg = strip_stream_fc_args_from_config(active_stream_cfg)
                                         if (
-                                            not has_yielded_output
+                                            not has_yielded_visible_body
                                             and not received_any_stream_chunk
                                             and _stripped_s_cfg is not active_stream_cfg
                                             and is_stream_fc_args_unsupported_error(e_pin_stream)
@@ -2551,7 +2760,7 @@ async def execute_unified_completion(
                                             continue
                                         if (
                                             _pin_try == 0
-                                            and not has_yielded_output
+                                            and not has_yielded_visible_body
                                             and fallback_model
                                             and model_to_call != fallback_model
                                             and is_location_pin_failure(e_pin_stream)
@@ -2577,6 +2786,33 @@ async def execute_unified_completion(
                                 err_code, err_formatted = extract_upstream_error(e_stream_call)
                                 err_retry_after = extract_retry_after_seconds(e_stream_call, err_formatted)
                                 if has_yielded_output:
+                                    # 流式尾跳或中途异常中断前，强制冲刷滑动尾窗（96~640字）中已接收的状态栏文本与闭合标签，防止被静默活埋！
+                                    if tool_indexer is not None:
+                                        _salvage_parts: List[str] = []
+                                        _s_tail = tool_indexer.flush_synthetic_tail(0)
+                                        if _s_tail:
+                                            _salvage_parts.append(_s_tail)
+                                        for _sc in tool_indexer.flush_function_calls(0):
+                                            if synth_tool_name and _sc.get("name") == synth_tool_name:
+                                                _ex_s = extract_synthetic_content(
+                                                    _sc.get("args"), emit_tool_name=synth_tool_name, prefill_text=prefill_text
+                                                )
+                                                if _ex_s:
+                                                    _salvage_parts.append(_ex_s)
+                                        _salvage_txt = "".join(_salvage_parts)
+                                        if deduper is not None:
+                                            if _salvage_txt:
+                                                _salvage_txt = deduper.feed(_salvage_txt)
+                                            if not deduper.done:
+                                                _salvage_txt += deduper.flush()
+                                        if _salvage_txt:
+                                            if not prefill_emitted and prefill_text:
+                                                prefill_emitted = True
+                                                yield f"data: {json.dumps({'id': response_id_for_stream, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': exp_req_obj.model, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': prefill_text}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                                            yield f"data: {json.dumps({'id': response_id_for_stream, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': exp_req_obj.model, 'choices': [{'index': 0, 'delta': {'content': _salvage_txt}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                                            print(f"🛟 [尾窗抢救] 流式异常中断前已成功冲刷挽回滑动尾窗内剩余的 {len(_salvage_txt)} 字符。")
+                                    if not emitted_finish_reason:
+                                        yield f"data: {json.dumps({'id': response_id_for_stream, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': exp_req_obj.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'length'}]}, ensure_ascii=False)}\n\n"
                                     stats.add_error()
                                     tracker.note_attempt_failure(target, err_code)
                                     tracker.finalize_error(err_code, f"流式传输中途中断：{err_formatted}")
@@ -2741,7 +2977,7 @@ async def execute_unified_completion(
 
         # ---------- 2A. 当前轮次使用 Express Key ----------
         if target["channel"] == "express":
-            ctx, actual_prompt, _ = await _get_express_ctx()
+            ctx, actual_prompt, _ = await _get_express_ctx(no_sandbox=sandbox_downgraded)
             spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
             current_client = spec["client"]
             model_to_call = spec["model_to_call"]
@@ -2822,20 +3058,32 @@ async def execute_unified_completion(
                     err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
                     if synth_tool_name:
                         err_v.is_retryable = True
+                        if not sandbox_downgraded and is_malformed_tool_finish(response_obj_call):
+                            sandbox_downgraded = True
+                            print(f"🩹 [抗截断自愈] 模型 {model_to_call} 非流式触发工具解码异常，后续重试已自动剥离 compose_reply 切换为原生模式。")
                     raise err_v
 
-                usage_info_ns = _record_usage(response_obj_call)
                 openai_response_content = convert_to_openai_format(
                     response_obj_call,
                     exp_req_obj.model,
                     synthetic_tool_name=synth_tool_name,
                     prefill_text=prefill_text,
                 )
+                _ns_ch0 = (openai_response_content.get("choices") or [{}])[0]
+                _ns_msg0 = _ns_ch0.get("message") or {}
+                _ns_raw_gen_chars = len(_ns_msg0.get("content") or "")
+                usage_info_ns = _record_usage(response_obj_call, visible_chars=_ns_raw_gen_chars)
+                if "usage" in openai_response_content:
+                    openai_response_content["usage"]["prompt_tokens"] = usage_info_ns["prompt_tokens"]
+                    openai_response_content["usage"]["completion_tokens"] = usage_info_ns["completion_tokens"]
+                    openai_response_content["usage"]["total_tokens"] = usage_info_ns["total_tokens"]
+                    if usage_info_ns["thoughts_tokens"] > 0:
+                        openai_response_content["usage"]["completion_tokens_details"] = {
+                            "reasoning_tokens": usage_info_ns["thoughts_tokens"]
+                        }
                 _prepend_prefill(openai_response_content, prefill_text)
                 if app_state.get_setting("debug_outbound", False):
                     print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
-                _ns_ch0 = (openai_response_content.get("choices") or [{}])[0]
-                _ns_msg0 = _ns_ch0.get("message") or {}
                 _ns_fin0 = _ns_ch0.get("finish_reason") or "stop"
                 tracker.finalize_success(
                     target,

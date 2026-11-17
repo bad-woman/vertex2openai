@@ -25,7 +25,12 @@ import model_capabilities as mc
 from runtime_state import app_state
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
-from synthetic_wrapper import create_sandbox_spec, inject_express_gen_config, supports_stream_fc_args
+from synthetic_wrapper import (
+    SyntheticSandboxSpec,
+    create_sandbox_spec,
+    inject_express_gen_config,
+    supports_stream_fc_args,
+)
 
 
 def _normalize_model_name(model_name: str) -> tuple[str, bool]:
@@ -181,8 +186,13 @@ def resolve_express_model_path(base_model_name: str, settings: dict,
 class ExpressSDKUpstream(BaseUpstream):
     """官方 API Key Express Mode 渠道处理器（支持多 Key 轮询与跨通道 Cookie 互备）。"""
 
-    def prepare_express_context(self, orig_request_obj: OpenAIRequest) -> Tuple[Optional[dict], Optional[JSONResponse]]:
-        """在独立副本上预处理消息、预填充与生成参数（不污染原请求对象，供多 Key 复用）。"""
+    def prepare_express_context(
+        self,
+        orig_request_obj: OpenAIRequest,
+        *,
+        disable_sandbox: bool = False,
+    ) -> Tuple[Optional[dict], Optional[JSONResponse]]:
+        """在独立副本上预处理消息、预填充与生成参数（不污染原请求对象，供多 Key 复用；支持 disable_sandbox 无沙箱降级构建）。"""
         try:
             validate_request_schemas(orig_request_obj)
         except SchemaValidationError as exc:
@@ -207,12 +217,16 @@ class ExpressSDKUpstream(BaseUpstream):
             is_image_model=is_image_model,
             allow_image_prefill=bool(_inj_settings.get("inject_prefill_for_image", False)),
         )
-        for _n in _inj_notes:
-            print(_n)
+        if not disable_sandbox:
+            for _n in _inj_notes:
+                print(_n)
         if _injected is not request_obj.messages:
             request_obj = request_obj.model_copy(update={"messages": _injected})
 
-        sandbox_spec = create_sandbox_spec(base_model_name, request_obj, _inj_settings)
+        if disable_sandbox:
+            sandbox_spec = SyntheticSandboxSpec(enabled=False, bypass_reason="工具解码异常自动剥壳降级")
+        else:
+            sandbox_spec = create_sandbox_spec(base_model_name, request_obj, _inj_settings)
         synth_tool_name = sandbox_spec.emit_tool_name if sandbox_spec.enabled else ""
 
         _prefill_mode = _inj_settings.get("prefill_mode", app_config.DEFAULT_SETTINGS["prefill_mode"])
