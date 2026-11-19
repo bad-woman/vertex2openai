@@ -25,17 +25,22 @@
 - **非流式续传轮询返回完整 `payload`（`GET /v1/resumable/{stream_id}`）**：针对 `buf.kind == "json"` 在完成后直接返回 `payload` 与 `status_code`，且仅在实际交付非错误有效 `payload` 后才执行 `mark_delivered()`，解决轮询拿到空 `events: []` 却误标已交付导致同 ID 重试重复调用上游的问题；
 - **Express 假流式支持 `stream_options: {"include_usage": true}`**：`_chunk_openai_response_dict_for_sse` 新增 `include_usage` 参数并在调用处透传 `wants_usage(exp_req_obj)` 与守恒校核后的 `usage`，开启时在 `[DONE]` 前下发 `choices: []` 的 `usage` 帧，关闭时保持原帧序列完全不变。
 
-### 4. 流式抗截断防误杀、收尾恐慌循环拦截与日志精准化（`app/synthetic_wrapper.py`、`app/message_processing.py`、`app/api_helpers.py`、`app/upstreams/cookie_proxy.py`、`app/main.py`）
-- **根治 Gemini 4 工具收尾恐慌死循环**：
-  - 修复 `LexicalState` 单行未闭合反引号（`` ` ``）长期停留在 `in_code=True` 导致整段防溢出规则失明的 Bug（行内反引号超 200 字或跨行超 80 字自动失效），并排除数学小于号 `< 5` 干扰 HTML 标签追踪；
-  - 扩展 `_SELF_CHECK_RE` 与 `_SUSPECT_SELF_CHECK_PREFIX_RE`，覆盖 `Let's finish/close/end/stop/fix ... tool call / function call / JSON / done:true}` 及裸漏 `,done:true}`；
-  - 新增同义词轮换型收尾恐慌循环检测（`_PANIC_CLOSURE_LOOP_RE`），在 `Let's stop.!》?>}] Let's end.!》?>}] Let's finish.!》?>}]` 类非固定周期循环的第 3 句立即熔断止损，防止刷爆 `MAX_TOKENS`。
-- **精准区分装饰符号与乱码、降低误截断**：
-  - `LexicalState` 单个 HTML 开标签追踪上限放宽至 2048 字符并支持超长自闭合标签识别，悬空闭合标签熔断门槛提升至 `8(EOF)/12(流中)`；
-  - 收窄 `_is_pure_layout_unit` 仅豁免真正的排版分割线/进度条/装饰符号（`─━═█░✦◆·` 等），不再误豁免 `! ? > < 》 »` 乱码；流中普通周期重复平衡至 `14 次/180 字`（表格、代码块及未闭合 HTML/XML 容器内为 `20 次/320 字`）。
-- **防分片提前封口 & 消除假 `max_tokens` 误报**：
-  - `FunctionCallStreamAssembler` 合并 `partialArgs[].willContinue`，在 `$.content` 分片未收到 `$.done=true` 时绝不因单帧漏带 `will_continue` 永久封口吞掉后续正文；支持同轮显式二次 `compose_reply` 续接（含去重）并修复 `$.done=false` 提前封口；
-  - 取消上游静默断流强制伪造 `finish_reason="length"`（仅在日志告警，避免客户端误报 `max_tokens`），并在日志与调用记录面板明确打印上游原始 `finish_reason`（区分真实 `MAX_TOKENS` 与 `MALFORMED_FUNCTION_CALL`）。
+### 4. 抗截断架构重构：单字段 `compose_reply` + 融合低误杀 `SyntheticTailGuard` + 0 字超限自愈（`app/synthetic_wrapper.py`、`app/message_processing.py`、`app/api_helpers.py`、`app/upstreams/cookie_proxy.py`、`app/main.py`）
+- **源头减负（砍掉冗余 `done` 字段与焦虑元指令）**：
+  - `compose_reply` 精简为**单必填字段 `content`**（Express 在 SDK 支持时采用 `parameters_json_schema + additionalProperties: False`，Cookie 回退标准 `parameters`），彻底消除长文末尾从 `content` 切换到 `,done:true}` 时的闭合悬崖；
+  - 控制提示词精简为极简中性措辞，去除易诱发模型自检复读的 `closing the content string` / `done to true` 字眼。
+- **融合低误杀尾部保护引擎 `SyntheticTailGuard`（Express & Cookie 双通道通用）**：
+  - **根治提前误截断**：流中彻底移除激进的闭合标签（`</div>`）与闭合括号（`]}`）切断规则，多余闭合残片仅在流末（`flush`）且全部括号均未配对时清理；流中通用重复熔断阈值提升至 **`≥12 次 且 ≥600 字`**（1600 字历史回看 + 128 字暂扣尾窗，豁免代码与排版分隔符）；
+  - **精准狙击 4 类实锤跑飞**：
+    1. 未闭合行内反引号超 `100` 字或跨行时**回溯取消保护**（防止乱码里的孤立 `` ` `` 致盲后续检测），并修复单行三反引号 ```` ```x``` ```` 误判；
+    2. 新增 48 字高密度货币/符号乱码检测（`find_symbol_salad`）；
+    3. 新增英文自检句尾粘连孤立闭合括号（`_META_TAIL`，支持 `.!}?)` / `.!»}]` / `.!»?>}]` / `.!》?>}]` 并校验 `}` 孤立未配对防误伤代码）与同义词轮换型恐慌循环检测，首句即可 0 泄漏秒断；
+    4. 新增句末孤立 `}` + `400` 字多语种收尾念叨观察窗（`_stray_close` + `_is_chatter`），念叨即从 `}` 切除，正常正文则原样放行；
+  - **第二次重复调用智能去重 & 截断 JSON 恢复**：`FunctionCallStreamAssembler` 新增流式二次调用前 `40` 字探测（`SAME_DRAFT_PROBE`），自动抑制重复前缀并仅放行新增尾巴；非流式截断字符串 `args` 支持有界内容恢复；中间 `$.content` 分片漏带 `willContinue` 不再提前按 EOF 裁剪或封口；Cookie `_extract_from_results` 严格按 `data == "functionCall"` 区分空收尾帧。
+- **消除假 `max_tokens` 误报 & 0 字思考超限自动重写**：
+  - 主动切除跑飞尾巴后（含流式、假流式、非流式及 Cookie 通道），统一恢复 `finish_reason="stop"`，避免前端误报达上限截断；撤销上游静默断流伪造 `length`；
+  - 控制台调用记录与终端日志透传并明确区分上游真实原因（`MAX_TOKENS` vs `MALFORMED_FUNCTION_CALL`）；
+  - 新增 **0 字正文即耗尽 `MAX_TOKENS`（思考占满上限）自动重写 1 次**：Express 真流式、假流式、非流式下自动追加精简思考提示重写，降低空回复报错率。
 
 ---
 

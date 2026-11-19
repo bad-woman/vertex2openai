@@ -1769,10 +1769,14 @@ async def _collect_full_response_once(
             tail_text = fc_assembler.flush_synthetic_tail()
             if tail_text:
                 synth_text += tail_text
+            synth_extra_halted: list[str] = []
             for c_item in fc_assembler.flush():
                 if synth_tool_name and c_item.get("name") == synth_tool_name:
                     synth_text += extract_synthetic_content(
-                        c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=synth_prefill
+                        c_item.get("args"),
+                        emit_tool_name=synth_tool_name,
+                        prefill_text=synth_prefill,
+                        halted_out=synth_extra_halted,
                     )
             if synth_text or fc_assembler.synthetic_hit:
                 full_text = synth_text
@@ -1800,13 +1804,14 @@ async def _collect_full_response_once(
             if fatal_error:
                 full_text += f"\n\n[Studio 中途报错] {fatal_error}"
 
+            _fake_fin_r = "stop" if (fc_assembler.synthetic_halted or bool(synth_extra_halted)) else _map_finish_reason(finish_raw)
             return {
                 "kind": "ok",
                 "full_text": full_text + safety_html,
                 "raw_body_len": len(full_text),
                 "unary_elapsed": post_elapsed,
                 "reasoning_text": "" if strip_thoughts else reasoning_text,
-                "finish_reason": _map_finish_reason(finish_raw),
+                "finish_reason": _fake_fin_r,
                 "raw_finish_reason": str(finish_raw or ""),
                 "usage_meta": usage_meta,
             }
@@ -2761,10 +2766,14 @@ class CookieProxyUpstream(BaseUpstream):
                 )
                 if tail_sig:
                     message_extra = thought_signature_extra(tail_sig, "text")
+            synth_extra_halted_ns: list[str] = []
             for c_item in fc_assembler.flush():
                 if synth_tool_name and c_item.get("name") == synth_tool_name:
                     extra_s = extract_synthetic_content(
-                        c_item.get("args"), emit_tool_name=synth_tool_name, prefill_text=prefill_text
+                        c_item.get("args"),
+                        emit_tool_name=synth_tool_name,
+                        prefill_text=prefill_text,
+                        halted_out=synth_extra_halted_ns,
                     )
                     if extra_s:
                         synth_text += extra_s
@@ -2814,7 +2823,7 @@ class CookieProxyUpstream(BaseUpstream):
             finish_reason = (
                 "tool_calls"
                 if tool_calls
-                else ("stop" if fc_assembler.synthetic_halted else _map_finish_reason(finish_raw))
+                else ("stop" if (fc_assembler.synthetic_halted or bool(synth_extra_halted_ns)) else _map_finish_reason(finish_raw))
             )
             elapsed = time.time() - start_time
             print(f"✅ [Studio] {base_model_name} | {len(full_text)} 字符 | {elapsed:.1f}s")
