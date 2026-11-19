@@ -12,6 +12,7 @@ import json
 import random
 import re
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,6 +35,12 @@ CONTENT_KEYS = (
     "message",
 )
 
+_EXPLICIT_GOOGLE_SEARCH_NAMES = {
+    "google_search",
+    "googlesearch",
+    "google_search_retrieval",
+}
+
 _BUILTIN_SEARCH_NAMES = {
     "google_search",
     "googlesearch",
@@ -44,6 +51,29 @@ _BUILTIN_SEARCH_NAMES = {
     "browse",
     "search",
 }
+
+
+def is_builtin_search_tool(tool: Any) -> bool:
+    """准确识别 OpenAI tools 列表里的内置搜索占位工具，避免误劫持带参数 Schema 的客户端自定义函数（如 search / browse）。"""
+    if not isinstance(tool, dict):
+        return False
+    t_type = str(tool.get("type") or "").strip().lower().replace("-", "_")
+    if t_type and t_type != "function" and t_type in _BUILTIN_SEARCH_NAMES:
+        return True
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
+    raw_name = (fn.get("name") if fn is not None else None) or tool.get("name") or ""
+    norm_name = str(raw_name).strip().lower().replace("-", "_")
+    if not norm_name or norm_name not in _BUILTIN_SEARCH_NAMES:
+        return False
+    if norm_name in _EXPLICIT_GOOGLE_SEARCH_NAMES:
+        return True
+    # 对于 search / browse / web_search 等通用名：若带有效 parameters.properties，说明是客户端自定义函数，不可劫持
+    params = (fn.get("parameters") if fn is not None else None) or tool.get("parameters")
+    if isinstance(params, dict):
+        props = params.get("properties")
+        if isinstance(props, dict) and len(props) > 0:
+            return False
+    return True
 
 _VOID_HTML_TAGS = {
     "br", "hr", "img", "input", "meta", "link", "area", "base",
@@ -167,11 +197,7 @@ def should_enable_sandbox(model_name: str, request_obj: Any, settings: Optional[
         return False, "联网搜索后缀自动旁路"
 
     for tool in (getattr(request_obj, "tools", None) or []):
-        if not isinstance(tool, dict):
-            continue
-        fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
-        t_name = str(fn.get("name") or tool.get("name") or tool.get("type") or "").strip().lower().replace("-", "_")
-        if t_name in _BUILTIN_SEARCH_NAMES:
+        if is_builtin_search_tool(tool):
             return False, "内置搜索工具自动旁路"
 
     resp_fmt = getattr(request_obj, "response_format", None)
@@ -198,19 +224,24 @@ def create_sandbox_spec(model_name: str, request_obj: Any, settings: Optional[di
         return SyntheticSandboxSpec(enabled=False, bypass_reason=reason)
 
     tc = getattr(request_obj, "tool_choice", None)
-    strip_client = isinstance(tc, str) and tc.strip().lower() == "none"
+    tc_is_none = isinstance(tc, str) and tc.strip().lower() == "none"
+    has_tool_history = any(
+        getattr(m, "role", None) == "tool" or bool(getattr(m, "tool_calls", None))
+        for m in (getattr(request_obj, "messages", None) or [])
+    )
+    # 历史含工具轮次时，即使 tool_choice=none 也要保留工具声明（由 allowed_function_names=[compose_reply] 禁止本轮调用客户端工具）
+    strip_client = bool(tc_is_none and not has_tool_history)
 
     all_client_names: List[str] = []
     for tool in (getattr(request_obj, "tools", None) or []):
-        if not isinstance(tool, dict):
+        if not isinstance(tool, dict) or is_builtin_search_tool(tool):
             continue
         fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
         name = str(fn.get("name") or tool.get("name") or "").strip()
-        if name and name.lower().replace("-", "_") not in _BUILTIN_SEARCH_NAMES:
-            if name not in all_client_names:
-                all_client_names.append(name)
+        if name and name not in all_client_names:
+            all_client_names.append(name)
 
-    real_names = [] if strip_client else list(all_client_names)
+    real_names = [] if tc_is_none else list(all_client_names)
 
     if any(n.startswith(DEFAULT_SYNTHETIC_TOOL_NAME) for n in all_client_names):
         emit_name = f"compose_{uuid.uuid4().hex[:24]}"
@@ -475,6 +506,7 @@ class LexicalState:
         self.tag_overflow: bool = False
         self.tag_rel_offset: int = 0
         self.tag_quote: str = ""
+        self.tag_prev_ch: str = ""
         self.html_open_counts: Dict[str, int] = {}
 
     def clone(self) -> "LexicalState":
@@ -500,6 +532,7 @@ class LexicalState:
         c.tag_overflow = self.tag_overflow
         c.tag_rel_offset = self.tag_rel_offset
         c.tag_quote = self.tag_quote
+        c.tag_prev_ch = self.tag_prev_ch
         c.html_open_counts = dict(self.html_open_counts)
         return c
 
@@ -637,6 +670,7 @@ class LexicalState:
                     self.tag_overflow = False
                     self.tag_rel_offset = 0
                     self.tag_quote = ""
+                    self.tag_prev_ch = ""
                 elif self.tag_buf:
                     self.tag_rel_offset += 1
                     if not self.tag_overflow and len(self.tag_buf) < 96:
@@ -718,6 +752,7 @@ class LexicalState:
             self.tag_overflow = False
             self.tag_rel_offset = 0
             self.tag_quote = ""
+            self.tag_prev_ch = ""
         elif self.tag_buf:
             self.tag_rel_offset += 1
             if not self.tag_overflow and len(self.tag_buf) < 96:
@@ -728,19 +763,26 @@ class LexicalState:
             if self.tag_quote:
                 if ch == self.tag_quote:
                     self.tag_quote = ""
+                if ch not in (" ", "\t", "\r", "\n"):
+                    self.tag_prev_ch = ch
             elif ch in ('"', "'") and len(self.tag_buf) > 2 and not self.tag_buf.startswith("<!--"):
                 self.tag_quote = ch
+                self.tag_prev_ch = ch
             elif ch == ">":
-                if self.tag_buf.startswith("<!--") and not self.tag_buf.endswith("-->"):
-                    pass
+                if self.tag_buf.startswith("<!--") and not (
+                    self.tag_buf.endswith("-->") or (self.tag_overflow and self.tag_prev_ch == "-")
+                ):
+                    self.tag_prev_ch = ch
                 else:
                     full_t = self.tag_buf
                     is_ovf = self.tag_overflow
                     rel_off = self.tag_rel_offset
+                    prev_non_ws = self.tag_prev_ch
                     self.tag_buf = ""
                     self.tag_overflow = False
                     self.tag_rel_offset = 0
                     self.tag_quote = ""
+                    self.tag_prev_ch = ""
 
                     if not full_t.startswith(("<!--", "<!", "<?")):
                         m_close = _CLOSE_TAG_FULL_RE.match(full_t) if not is_ovf else None
@@ -754,7 +796,7 @@ class LexicalState:
                                         meta.paired_close_tag = True
                                 elif meta is not None:
                                     meta.orphan_close_tag_start = idx - rel_off
-                        elif not full_t.rstrip().endswith("/>"):
+                        elif not (prev_non_ws == "/" or full_t.rstrip().endswith("/>")):
                             m_open = _OPEN_TAG_HEAD_RE.match(full_t)
                             if m_open:
                                 tname = m_open.group(1).lower()
@@ -764,11 +806,14 @@ class LexicalState:
                                     self.html_open_counts[tname] = min(
                                         self.html_open_counts.get(tname, 0) + 1, 512
                                     )
-            elif self.tag_rel_offset > 256:
+            elif self.tag_rel_offset > 2048:
                 self.tag_buf = ""
                 self.tag_overflow = False
                 self.tag_rel_offset = 0
                 self.tag_quote = ""
+                self.tag_prev_ch = ""
+            elif ch not in (" ", "\t", "\r", "\n"):
+                self.tag_prev_ch = ch
 
 
 def prefill_appears_repeated(prefill_text: str, output_head: str) -> bool:
@@ -844,17 +889,43 @@ def _primitive_period(s: str) -> int:
     return n
 
 
+def _is_pure_layout_unit(non_ws: List[str]) -> bool:
+    """判断非空重复单元是否全为装饰/排版符号、标点或 0（不含字母/汉字/其他数字，且不含 })] 悬空闭合括号）。"""
+    if not non_ws:
+        return True
+    for ch in non_ws:
+        if ch in _CLOSER_CHARS:
+            return False
+        if ch in _PURE_LAYOUT_CHARS:
+            continue
+        cat = unicodedata.category(ch)
+        if cat and cat[0] in ("P", "S", "Z"):
+            continue
+        return False
+    return True
+
+
+def _short_reason_preview(snippet: str, limit: int = 36) -> str:
+    clean = (snippet or "").replace("\r", "\\r").replace("\n", "\\n")
+    return clean[:limit] + ("…" if len(clean) > limit else "")
+
+
 def analyze_synthetic_tail(
     text: str,
     emit_tool_name: str = DEFAULT_SYNTHETIC_TOOL_NAME,
     base_lex: Optional[LexicalState] = None,
     at_eof: bool = True,
+    reason_out: Optional[List[str]] = None,
 ) -> Tuple[str, bool, bool]:
     """词法状态感知 + 分期尾窗检测与清洗核心引擎。
     返回: (干净文本, 是否触发了溢出切除, 流中是否需扩容隔离窗口暂缓吐出)
     """
     if not text:
         return "", False, False
+
+    def _note_reason(msg: str) -> None:
+        if reason_out is not None:
+            reason_out.append(msg)
 
     lex = base_lex.clone() if base_lex is not None else LexicalState()
     metas, end_lex = lex.scan(text)
@@ -896,6 +967,7 @@ def analyze_synthetic_tail(
             f_chars = m_glue.group(2)
             if f_chars[0] == end_lex.fence_char and len(f_chars) >= end_lex.fence_len:
                 keep_end = line_start + len(m_glue.group(1)) + len(f_chars)
+                _note_reason(f"围栏粘连工具尾({_short_reason_preview(text[keep_end:])})")
                 return text[:keep_end], True, False
 
     # 1. 显式工具自检独白与控制伪词拦截（仅在代码块与行内代码作用域之外生效）
@@ -919,6 +991,7 @@ def analyze_synthetic_tail(
                 and not metas[cut_pos].is_orphan_closer
             ):
                 cut_pos += 1
+            _note_reason(f"显式工具自检/控制词泄漏({_short_reason_preview(text[cut_pos:m.end()])})")
             return text[:cut_pos], True, False
 
     if emit_tool_name and emit_tool_name not in ("compose_reply", "router_emit") and emit_tool_name in text:
@@ -941,6 +1014,7 @@ def analyze_synthetic_tail(
                     and not metas[cut_pos].is_orphan_closer
                 ):
                     cut_pos += 1
+                _note_reason(f"合成工具名自检泄漏({_short_reason_preview(text[cut_pos:m_dyn.end()])})")
                 return text[:cut_pos], True, False
 
     # 2. 悬空多余闭合标签刷屏检测（完整保留合法配对的 </div>，仅切掉超出开启深度的多余闭合标签）
@@ -966,15 +1040,16 @@ def analyze_synthetic_tail(
             pos = t_start - 1
 
         orphan_tag_cnt = len(orphan_tag_starts)
-        halt_tag_thresh = 5 if at_eof else 7
+        halt_tag_thresh = 8 if at_eof else 12
         if orphan_tag_cnt >= halt_tag_thresh:
             cut_at = orphan_tag_starts[-1]
             while cut_at > 0 and text[cut_at - 1] in " \t":
                 cut_at -= 1
             if cut_at > 0 and text[cut_at - 1] == "\n":
                 cut_at -= 1
+            _note_reason(f"悬空闭合标签刷屏({first_tag_norm}×{orphan_tag_cnt})")
             return text[:cut_at], True, False
-        if not at_eof and orphan_tag_cnt >= 2:
+        if not at_eof and orphan_tag_cnt >= 4:
             return text, False, True
 
     # 3. 单字符悬空右括号刷屏死循环（保留前面合法配对的括号，仅从首个悬空右括号切起）
@@ -994,6 +1069,7 @@ def analyze_synthetic_tail(
             first_orphan = orphan_closer_indices[-1]
             if first_orphan > 0 and text[first_orphan - 1] == '"' and metas[first_orphan - 1].orphan_dquote:
                 first_orphan -= 1
+            _note_reason(f"悬空右括号刷屏(×{len(orphan_closer_indices)})")
             return text[:first_orphan], True, False
         if not at_eof and len(orphan_closer_indices) >= 3:
             return text, False, True
@@ -1002,6 +1078,13 @@ def analyze_synthetic_tail(
     suspect_hold = False
     max_u = min(48, n // 2)
     best_cut: Optional[int] = None
+    best_cut_reason: str = ""
+
+    def _update_best(cut_pos: int, r_msg: str) -> None:
+        nonlocal best_cut, best_cut_reason
+        if best_cut is None or cut_pos < best_cut:
+            best_cut = cut_pos
+            best_cut_reason = r_msg
 
     for ulen in range(2, max_u + 1):
         unit = text[n - ulen :]
@@ -1010,7 +1093,7 @@ def analyze_synthetic_tail(
         non_ws = [c for c in unit if c not in " \t\r\n"]
         if not non_ws:
             continue
-        if all(c in _PURE_LAYOUT_CHARS for c in non_ws):
+        if _is_pure_layout_unit(non_ws):
             continue
 
         repeats = 1
@@ -1029,7 +1112,7 @@ def analyze_synthetic_tail(
             emit_tool_name and emit_tool_name.lower() in unit_low
         ):
             if not metas[curr].in_code:
-                best_cut = curr if best_cut is None else min(best_cut, curr)
+                _update_best(curr, f"工具控制词周期泄漏({_short_reason_preview(unit)}×{repeats})")
                 continue
 
         if all(c in " \t\r\n}])\"'`" for c in unit) and any(c in _CLOSER_CHARS for c in unit):
@@ -1053,10 +1136,9 @@ def analyze_synthetic_tail(
 
             if orphan_reps >= 2 and first_all_orphan_rep_start is not None:
                 if at_eof or (orphan_reps >= 4 and orphan_reps * ulen >= 10):
-                    best_cut = (
-                        first_all_orphan_rep_start
-                        if best_cut is None
-                        else min(best_cut, first_all_orphan_rep_start)
+                    _update_best(
+                        first_all_orphan_rep_start,
+                        f"悬空括号周期刷屏({_short_reason_preview(unit)}×{orphan_reps})",
                     )
                     continue
                 else:
@@ -1071,23 +1153,26 @@ def analyze_synthetic_tail(
 
         is_table_row_seg = ("|" in unit and "\n" not in unit)
         has_unclosed_container = any(v > 0 for v in end_lex.html_open_counts.values())
-        if is_table_row_seg:
-            min_total_len = 360
-            min_reps = 16
-        elif not at_eof and has_unclosed_container:
-            # 处于未闭合的 XML/HTML 容器标签（如 <status> / <affinity> 多角色状态栏）内部时，放宽流中普通重复阈值防误伤
-            min_total_len = 280
-            min_reps = 18
+        in_code_block = bool(metas[curr].in_code or end_lex.is_currently_in_code())
+        if is_table_row_seg or in_code_block or (not at_eof and has_unclosed_container):
+            # 表格、代码块及未闭合 XML/HTML 容器内部放宽重复阈值，避免误杀合法结构化内容
+            min_total_len = 400
+            min_reps = 24
+        elif not at_eof:
+            # 流中普通文本提高门槛至 20 次 / 320 字（640 字隔离窗仍可毫秒级止损真复读机死循环，大幅降低误杀）
+            min_total_len = 320
+            min_reps = 20
         else:
-            min_total_len = 120
-            min_reps = 10
+            min_total_len = 240
+            min_reps = 16
 
         if repeats >= min_reps and total_rep_chars >= min_total_len:
-            best_cut = curr if best_cut is None else min(best_cut, curr)
-        elif not at_eof and repeats >= (6 if has_unclosed_container else 4) and total_rep_chars >= (64 if has_unclosed_container else 36):
+            _update_best(curr, f"周期重复退化(单元='{_short_reason_preview(unit, 24)}', 重复{repeats}次/{total_rep_chars}字)")
+        elif not at_eof and repeats >= (10 if (has_unclosed_container or in_code_block) else 8) and total_rep_chars >= (100 if (has_unclosed_container or in_code_block) else 80):
             suspect_hold = True
 
     if best_cut is not None:
+        _note_reason(best_cut_reason or "周期退化熔断")
         return text[:best_cut], True, False
 
     # 5. 流末 (at_eof=True) 专属：切除全文最末尾单发悬空工具闭合残片（如 ")} 、 "]})} 、 ]})) 、 """) ）
@@ -1120,6 +1205,7 @@ def analyze_synthetic_tail(
                             should_trim = True
 
                     if should_trim:
+                        _note_reason(f"流末悬空闭合残片({_short_reason_preview(cluster)})")
                         return text[:c_start], True, False
 
     # 6. 流中 (at_eof=False) 检查末尾是否有半截自检前缀，需暂扣在隔离窗口观察

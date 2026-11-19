@@ -256,14 +256,24 @@ class ExpressSDKUpstream(BaseUpstream):
             gen_config_dict["thinking_config"] = thinking_config
 
         _tools_disabled = isinstance(request_obj.tool_choice, str) and request_obj.tool_choice.lower() == "none"
+        _has_custom_fc = any(
+            isinstance(t, dict) and t.get("function_declarations")
+            for t in (gen_config_dict.get("tools") or [])
+        )
         if is_grounded_search and not _tools_disabled:
-            search_tool = {"google_search": {}}
-            if "tools" in gen_config_dict and isinstance(gen_config_dict["tools"], list):
-                if search_tool not in gen_config_dict["tools"]:
-                    gen_config_dict["tools"].append(search_tool)
+            if _has_custom_fc:
+                print(
+                    f"ℹ️ [搜索增强] 模型 {base_model_name} 请求携带自定义函数工具，"
+                    "Vertex AI 不支持与 google_search 同请求混用，已优先保留自定义函数工具。"
+                )
             else:
-                gen_config_dict["tools"] = [search_tool]
-            print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
+                search_tool = {"google_search": {}}
+                if "tools" in gen_config_dict and isinstance(gen_config_dict["tools"], list):
+                    if search_tool not in gen_config_dict["tools"]:
+                        gen_config_dict["tools"].append(search_tool)
+                else:
+                    gen_config_dict["tools"] = [search_tool]
+                print(f"🔎 [搜索增强] 已为模型 {base_model_name} 启用 Google Search 工具。")
 
         sandbox_spec.prefill_text = prefill_text or ""
         sandbox_spec.has_prefill = bool(prefill_active)

@@ -91,36 +91,65 @@ docker compose up -d
 
 ## 模型列表配置（`vertexModels.json`）
 
-当前支持的模型清单（系统会自动为所有支持搜索的模型附加 `-search` 联网搜索别名）：
+当前支持按能力分组配置（`categories`）与扁平列表（`models`）共存，既向后兼容远程配置合并，又支持零改代码扩展新模型与控制台分组展示（系统会自动为所有支持搜索的模型附加 `-search` 联网搜索别名）：
 
 ```json
 {
+  "categories": [
+    {
+      "id": "gemini-4-xhigh",
+      "label": "Gemini 4 · 四档思考 / 64K 一元",
+      "capabilities": {
+        "thinking_levels": ["low", "medium", "high", "xhigh"],
+        "max_nonstream_output_tokens": 65536
+      },
+      "models": ["gemini-4-neon", "gemini-4-hydrogen"]
+    },
+    {
+      "id": "gemini-4-standard",
+      "label": "Gemini 4 · 三档思考 / 32K 一元",
+      "capabilities": {
+        "thinking_levels": ["low", "medium", "high"],
+        "max_nonstream_output_tokens": 32768
+      },
+      "models": ["gemini-4-carbon", "gemini-4-argon"]
+    },
+    {
+      "id": "gemini-3-standard",
+      "label": "Gemini 3.x · 三档思考",
+      "capabilities": { "thinking_levels": ["low", "medium", "high"] },
+      "models": ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.1-pro-preview"]
+    },
+    {
+      "id": "gemini-3-minimal",
+      "label": "Gemini 3.x · 四档思考（含 minimal）",
+      "capabilities": { "thinking_levels": ["minimal", "low", "medium", "high"] },
+      "models": ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
+    },
+    {
+      "id": "gemini-image",
+      "label": "生图模型",
+      "models": ["gemini-3.1-flash-image", "gemini-nano-banana-2.1", "gemini-3-pro-image"]
+    }
+  ],
   "models": [
-    "gemini-4-argon",
-    "gemini-4-carbon",
-    "gemini-4-hydrogen",
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-pro-preview",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-image",
-    "gemini-nano-banana-2.1",
-    "gemini-3-pro-image",
-    "gemini-3-flash-preview"
+    "gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon",
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite", "gemini-3.1-flash-image",
+    "gemini-nano-banana-2.1", "gemini-3-pro-image", "gemini-3-flash-preview"
   ]
 }
 ```
 
 ### 模型能力自动适配规则（`app/model_capabilities.py`）
-- **采样参数自动剥离**：自 `gemini-3.6-flash`、`gemini-3.5-flash-lite` 及 `gemini-4-*` 起，官方已废弃 `temperature` / `top_p` / `top_k`，代理会自动剥离以防 400 报错；惩罚参数（`presence_penalty` / `frequency_penalty`）全系默认剥离。
-- **思考档位（`thinking_level`）**：
+- **采样参数自动剥离**：自 `gemini-3.6-flash`、`gemini-3.5-flash-lite` 及 `gemini-4-*` 起，官方已废弃/不建议修改 `temperature` / `top_p` / `top_k`，代理会自动剥离以防 400 报错；惩罚参数（`presence_penalty` / `frequency_penalty`）全系默认剥离。
+- **思考档位（`thinking_level`）与输出上限**：
   - 选「自动」档位时不强塞猜测档位，直接交由 Google 上游采用该模型真实的官方原生默认思考强度。
-  - `3.6-flash` / `3.5-flash` / `3.5-flash-lite` / `3.1-flash-lite`：支持 `minimal / low / medium / high`。
+  - `3.6-flash` / `3.5-flash` / `3.5-flash-lite` / `3.1-flash-lite` / `3-flash-preview`：支持 `minimal / low / medium / high`。
   - `3.7-flash` / `3.8-flash` / `3.1-pro-preview`：支持 `low / medium / high`。
-  - `gemini-4-*` 全系（`argon` / `carbon` / `hydrogen` 等）：支持 **`low / medium / high / xhigh`** 四档（最低统一发送 `low`，单轮流式/非流式均支持 `64K` 输出与 SDK 自动长解码）。
+  - `gemini-4-neon` / `gemini-4-hydrogen`：支持 **`low / medium / high / xhigh`** 四档，一元（非流式/假流式）与流式均支持 `64K`（流式超 64K 由 SDK >= 2.30.0 自动 Long Decode）。
+  - `gemini-4-carbon` / `gemini-4-argon`：支持 **`low / medium / high`** 三档，一元（非流式/假流式）夹紧至 `32K`、流式支持 `64K` 及以上。
   - 跑酒馆角色扮演预设时，推荐在控制台将「原生思考控制」设为 **「关闭原生思考」**，自动忽略前端传来的 `reasoning_effort=xhigh`，将思考压到该模型支持的最低合法档并剥离原生思考块。
 - **生图模型**：`gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-nano-banana-2.1` 均支持全部 15 种官方宽高比（`1:1, 3:2, 2:3, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9, 9:21, 1:4, 4:1, 1:8, 8:1`）及最高 `4K` 分辨率，生图请求自动启用假流式保活输出。
 
