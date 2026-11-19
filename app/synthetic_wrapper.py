@@ -496,6 +496,7 @@ class LexicalState:
 
         self.inline_tick_len: int = 0
         self.inline_newlines: int = 0
+        self.inline_chars: int = 0
         self.consec_newlines: int = 0
 
         self.bracket_stack: List[str] = []
@@ -524,6 +525,7 @@ class LexicalState:
         c.closing_fence_ok = self.closing_fence_ok
         c.inline_tick_len = self.inline_tick_len
         c.inline_newlines = self.inline_newlines
+        c.inline_chars = self.inline_chars
         c.consec_newlines = self.consec_newlines
         c.bracket_stack = list(self.bracket_stack)
         c.dquote_open = self.dquote_open
@@ -559,6 +561,7 @@ class LexicalState:
                 else:
                     self.inline_tick_len = self.pending_open_len
                     self.inline_newlines = 0
+                    self.inline_chars = 0
                     self.pending_open_char = ""
                     self.pending_open_len = 0
             return
@@ -567,6 +570,7 @@ class LexicalState:
             if rc == "`" and rl == self.inline_tick_len:
                 self.inline_tick_len = 0
                 self.inline_newlines = 0
+                self.inline_chars = 0
             return
 
         if was_bol and rl >= 3 and rc in ("`", "~"):
@@ -575,6 +579,7 @@ class LexicalState:
         elif rc == "`":
             self.inline_tick_len = rl
             self.inline_newlines = 0
+            self.inline_chars = 0
 
     def is_currently_in_code(self) -> bool:
         if self.in_fence:
@@ -659,9 +664,10 @@ class LexicalState:
                     was_in_code = True
                 elif self.inline_tick_len > 0:
                     self.inline_newlines += 1
-                    if self.consec_newlines >= 2 or self.inline_newlines >= 2:
+                    if self.consec_newlines >= 2 or self.inline_newlines >= 2 or self.inline_chars >= 80:
                         self.inline_tick_len = 0
                         self.inline_newlines = 0
+                        self.inline_chars = 0
 
             if not self.in_fence:
                 self.dquote_open = False
@@ -707,11 +713,23 @@ class LexicalState:
                 meta.in_code = True
             return
 
-        if self.pending_open_len > 0 or self.inline_tick_len > 0:
+        if self.pending_open_len > 0:
             self.prev_backslash = False
             if meta is not None:
                 meta.in_code = True
             return
+
+        if self.inline_tick_len > 0:
+            self.inline_chars += 1
+            if self.inline_chars <= 200:
+                self.prev_backslash = False
+                if meta is not None:
+                    meta.in_code = True
+                return
+            # 孤立未闭合的单行反引号超过 200 字符自动失效，防止致盲后续整段文本的防溢出检测
+            self.inline_tick_len = 0
+            self.inline_newlines = 0
+            self.inline_chars = 0
 
         if meta is not None:
             meta.in_code = False
@@ -755,6 +773,16 @@ class LexicalState:
             self.tag_prev_ch = ""
         elif self.tag_buf:
             self.tag_rel_offset += 1
+            if self.tag_rel_offset == 1 and not (
+                ch.isalpha() or ch in ("/", "!", "?") or ("\u4e00" <= ch <= "\u9fff") or ("\u3040" <= ch <= "\u30ff")
+            ):
+                # 排除数学小于号等非标签 `< 5` / `< b`，防止后续撇号被误认为属性引号
+                self.tag_buf = ""
+                self.tag_overflow = False
+                self.tag_rel_offset = 0
+                self.tag_quote = ""
+                self.tag_prev_ch = ""
+                return
             if not self.tag_overflow and len(self.tag_buf) < 96:
                 self.tag_buf += ch
             else:
@@ -834,10 +862,19 @@ def prefill_appears_repeated(prefill_text: str, output_head: str) -> bool:
 _SELF_CHECK_RE = re.compile(
     r"(?:"
     r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?"
-    r"\bLet['’]s\s+(?:check|finalize|make\s+sure|verify|review|ensure|confirm)\b"
+    r"\bLet['’]s\s+(?:check|finalize|make\s+sure|verify|review|ensure|confirm"
+    r"|finish|close|end|stop|complete"
+    r"|just\s+(?:close|finish|end|stop))\b"
     r"[\s\S]{0,180}?"
-    r"(?:compose_reply|router_emit|\btool\s*call\b|\bfunction\s*call\b|\bjson\s*string\b"
+    r"(?:compose_reply|router_emit|\btool\s*call\b|\bfunction\s*call\b"
+    r"|\bjson\s*string\b|\bcontent\s*string\b|\bproper\s*closure\b"
+    r"|\bgenerating\s*tokens?\b|\bdone\b[\"']?\s*[:=]\s*true\b"
     r"|Done![ \t\r\n\"']*[}\])][ \t\r\n\"']*[}\])])"
+    r"|"
+    r"(?:[\"'»》!?,][ \t]*)?[\"']?\bdone\b[\"']?\s*[:=]\s*true[ \t]*[}\])]"
+    r"|"
+    r"\b(?:I\s+am\s+still\s+inside\s+the\s+(?:tool|function)\s*call"
+    r"|the\s+[`'\"]?content[`'\"]?\s+string\s+(?:is\s+)?already\s+closed)\b"
     r"|"
     r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?Done![ \t\r\n\"']*[}\])][ \t\r\n\"']*[}\])][\s\"'}\])]*\Z"
     r"|"
@@ -848,10 +885,23 @@ _SELF_CHECK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 同义词轮换型工具收尾恐慌循环（如 Let's stop.!》?>}] Let's end.!》?>}] Let's finish.!》?>}]）
+_PANIC_CLOSURE_CLAUSE = (
+    r"\bLet['’]s\s+(?:stop|end|finish|close|complete|fix|check|do\s+it|review|ensure|make\s+sure"
+    r"|just\s+(?:close|stop|finish|end|output)|not\s+(?:output|put))\b"
+    r"[^.!?\n]{0,48}[.!?]+(?:[ \t]*[»》>?}\])\"'!]){2,}"
+)
+_PANIC_CLOSURE_SINGLE_RE = re.compile(_PANIC_CLOSURE_CLAUSE, re.IGNORECASE)
+_PANIC_CLOSURE_LOOP_RE = re.compile(
+    r"(?:" + _PANIC_CLOSURE_CLAUSE + r"[ \t]*){3,}",
+    re.IGNORECASE,
+)
+
 # 流中疑似正在形成工具自检前缀（尚未吐完后续关键词，触发动态隔离窗口暂扣观察）
 _SUSPECT_SELF_CHECK_PREFIX_RE = re.compile(
     r"(?:"
-    r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?\bLet['’]s\s*(?:(?:check|finalize|make|verify|review|ensure|confirm)\b[^\n]{0,120})?\Z"
+    r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?\bLet['’]s\s*(?:(?:check|finalize|make|verify|review|ensure|confirm"
+    r"|finish|close|end|stop|fix|complete|output|just|not)\b[^\n]{0,120})?\Z"
     r"|"
     r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?Done![\s\"'}\])]{0,12}\Z"
     r"|"
@@ -867,7 +917,7 @@ _FENCE_GLUED_OVERFLOW_RE = re.compile(
     r"[\"']\s*[}\])][\s}\])\"']*"
     r"|[}\])]{3,}[\s}\])\"']*"
     r"|(?:[\"']?\s*[}\])]*\s*)?(?:endasi|end_assistant|исповедь)\b[\s\S]*"
-    r"|(?:[\"']?\s*[}\])]*\s*)?\bLet['’]s\s+(?:check|finalize|make\s+sure|verify)\b[\s\S]*"
+    r"|(?:[\"']?\s*[}\])]*\s*)?\bLet['’]s\s+(?:check|finalize|make\s+sure|verify|finish|close|end|stop)\b[\s\S]*"
     r")\s*\Z",
     re.IGNORECASE,
 )
@@ -889,17 +939,21 @@ def _primitive_period(s: str) -> int:
     return n
 
 
+_DECO_LAYOUT_EXTRA = set("·•‣⁃～〜―⁃•◦▪▫■□●○◆◇★☆✦✧❖✿❀")
+
+
 def _is_pure_layout_unit(non_ws: List[str]) -> bool:
-    """判断非空重复单元是否全为装饰/排版符号、标点或 0（不含字母/汉字/其他数字，且不含 })] 悬空闭合括号）。"""
+    """仅豁免真正的排版分割线/进度条/装饰符号（如 ─━═█░✦◆·），绝不豁免 ! ? > < 》 » , : ) } ] 等乱码/闭合符号。"""
     if not non_ws:
         return True
     for ch in non_ws:
-        if ch in _CLOSER_CHARS:
-            return False
-        if ch in _PURE_LAYOUT_CHARS:
+        if ch in _PURE_LAYOUT_CHARS or ch in _DECO_LAYOUT_EXTRA:
             continue
-        cat = unicodedata.category(ch)
-        if cat and cat[0] in ("P", "S", "Z"):
+        cp = ord(ch)
+        # Box Drawing (2500-257F), Block Elements (2580-259F), Geometric Shapes (25A0-25FF), Misc Symbols & Dingbats (2600-27BF)
+        if 0x2500 <= cp <= 0x27BF:
+            continue
+        if unicodedata.category(ch) == "Zs":
             continue
         return False
     return True
@@ -992,6 +1046,14 @@ def analyze_synthetic_tail(
             ):
                 cut_pos += 1
             _note_reason(f"显式工具自检/控制词泄漏({_short_reason_preview(text[cut_pos:m.end()])})")
+            return text[:cut_pos], True, False
+
+    # 1b. 同义词轮换型收尾恐慌循环拦截（如 Let's stop.!》?>}] Let's end.!》?>}] Let's finish.!》?>}]）
+    m_panic = _PANIC_CLOSURE_LOOP_RE.search(text)
+    if m_panic is not None:
+        if not end_lex.in_fence or len(re.findall(_PANIC_CLOSURE_CLAUSE, m_panic.group(0), re.IGNORECASE)) >= 5:
+            cut_pos = m_panic.start()
+            _note_reason(f"工具收尾恐慌循环({_short_reason_preview(m_panic.group(0))})")
             return text[:cut_pos], True, False
 
     if emit_tool_name and emit_tool_name not in ("compose_reply", "router_emit") and emit_tool_name in text:
@@ -1156,19 +1218,19 @@ def analyze_synthetic_tail(
         in_code_block = bool(metas[curr].in_code or end_lex.is_currently_in_code())
         if is_table_row_seg or in_code_block or (not at_eof and has_unclosed_container):
             # 表格、代码块及未闭合 XML/HTML 容器内部放宽重复阈值，避免误杀合法结构化内容
-            min_total_len = 400
-            min_reps = 24
-        elif not at_eof:
-            # 流中普通文本提高门槛至 20 次 / 320 字（640 字隔离窗仍可毫秒级止损真复读机死循环，大幅降低误杀）
             min_total_len = 320
             min_reps = 20
+        elif not at_eof:
+            # 流中普通文本在 14 次 / 180 字处止损，兼顾防误杀与及时切断复读死循环
+            min_total_len = 180
+            min_reps = 14
         else:
-            min_total_len = 240
-            min_reps = 16
+            min_total_len = 160
+            min_reps = 12
 
         if repeats >= min_reps and total_rep_chars >= min_total_len:
             _update_best(curr, f"周期重复退化(单元='{_short_reason_preview(unit, 24)}', 重复{repeats}次/{total_rep_chars}字)")
-        elif not at_eof and repeats >= (10 if (has_unclosed_container or in_code_block) else 8) and total_rep_chars >= (100 if (has_unclosed_container or in_code_block) else 80):
+        elif not at_eof and repeats >= (8 if (has_unclosed_container or in_code_block) else 5) and total_rep_chars >= (80 if (has_unclosed_container or in_code_block) else 48):
             suspect_hold = True
 
     if best_cut is not None:
@@ -1208,14 +1270,17 @@ def analyze_synthetic_tail(
                         _note_reason(f"流末悬空闭合残片({_short_reason_preview(cluster)})")
                         return text[:c_start], True, False
 
-    # 6. 流中 (at_eof=False) 检查末尾是否有半截自检前缀，需暂扣在隔离窗口观察
-    if not at_eof and not end_lex.is_currently_in_code():
-        tail_probe = text[-140:] if n > 140 else text
-        m_susp = _SUSPECT_SELF_CHECK_PREFIX_RE.search(tail_probe)
-        if m_susp:
-            abs_pos = (n - len(tail_probe)) + m_susp.start()
-            if not metas[abs_pos].in_code:
-                suspect_hold = True
+    # 6. 流中 (at_eof=False) 检查末尾是否有半截自检前缀或单发恐慌闭合残句，需暂扣在隔离窗口观察
+    if not at_eof:
+        tail_probe = text[-180:] if n > 180 else text
+        if not end_lex.in_fence and _PANIC_CLOSURE_SINGLE_RE.search(tail_probe):
+            suspect_hold = True
+        elif not end_lex.is_currently_in_code():
+            m_susp = _SUSPECT_SELF_CHECK_PREFIX_RE.search(tail_probe)
+            if m_susp:
+                abs_pos = (n - len(tail_probe)) + m_susp.start()
+                if not metas[abs_pos].in_code:
+                    suspect_hold = True
 
     return text, False, suspect_hold
 

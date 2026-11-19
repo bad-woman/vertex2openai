@@ -1809,6 +1809,7 @@ class CallTraceTracker:
         gen_time: float = 0.0,
         saw_thought_stream: bool = False,
         finish_reason: str = "stop",
+        raw_finish_reason: str = "",
         has_tool_calls: bool = False,
         has_usage: bool = False,
         p_tk: int = 0,
@@ -1882,7 +1883,20 @@ class CallTraceTracker:
             parts_det.append(f"🍪 Cookie 私有接口不回传 Token 统计{ch_txt}。")
 
         if is_trunc:
-            parts_det.append("⚠️ <b>达上限截断提醒</b>：finish_reason=length（撞上 max_tokens 限制提前停止），若正文未写完建议调大客户端最大回复长度。")
+            raw_fr_up = str(raw_finish_reason or "").strip().upper()
+            if raw_fr_up in ("MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE", "UNEXPECTED_TOOL_CALL"):
+                parts_det.append(
+                    f"⚠️ <b>上游格式中断</b>：上游返回 <code>{html.escape(raw_fr_up)}</code>（OpenAI 协议映射为 length，并非超过 max_tokens，而是模型流式工具参数外层 JSON 编码中途出错被上游中止）。"
+                )
+            elif raw_fr_up == "MAX_TOKENS":
+                parts_det.append(
+                    "⚠️ <b>达上限截断提醒</b>：上游返回 <code>MAX_TOKENS</code>（正文与隐性思考 Token 合计撞上 max_tokens 上限提前停止），若正文未写完建议调大客户端最大回复长度。"
+                )
+            else:
+                raw_note = f"（上游={html.escape(raw_fr_up)}）" if raw_fr_up else ""
+                parts_det.append(
+                    f"⚠️ <b>提前截断提醒</b>：finish_reason=length{raw_note}（可能是输出含隐性思考 Token 触及 max_tokens 上限，或上游工具编码格式中断），若正文未写完建议调大客户端最大回复长度。"
+                )
 
         t_short, t_full = self._build_time_strs()
         call_recorder.record({
@@ -2406,12 +2420,18 @@ async def execute_unified_completion(
                                     yield chunk_sse
                                 if app_state.get_setting("debug_outbound", False):
                                     print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
+                                _raw_fr0 = ""
+                                _cands0 = getattr(raw_gemini_response, "candidates", None) or []
+                                if _cands0 and getattr(_cands0[0], "finish_reason", None) is not None:
+                                    _fv0 = _cands0[0].finish_reason
+                                    _raw_fr0 = str(getattr(_fv0, "name", _fv0) or "").strip().upper()
                                 tracker.finalize_success(
                                     target,
                                     is_cookie=False,
                                     ttft=None,
                                     gen_time=fake_unary_elapsed,
                                     finish_reason=_fin0,
+                                    raw_finish_reason=_raw_fr0,
                                     has_tool_calls=_has_tc0,
                                     has_usage=bool(usage_info["prompt_tokens"] or usage_info["completion_tokens"]),
                                     p_tk=usage_info["prompt_tokens"],
@@ -2467,7 +2487,8 @@ async def execute_unified_completion(
                                         prefill_emitted = not bool(prefill_text)
                                         emitted_finish_reason = False
                                         saw_upstream_finish_reason = False
-                                        silent_eof_truncated = False
+                                        raw_upstream_finish_reason = ""
+                                        silent_eof_warning = False
                                         last_finish_reason_str = "stop"
                                         last_stream_chunk_obj = None
                                         raw_p_max, raw_th_max, raw_out_max, raw_tool_p_max, raw_tot_max = 0, 0, 0, 0, 0
@@ -2481,6 +2502,7 @@ async def execute_unified_completion(
                                                     _fr_nm = str(getattr(_fr_val, "name", _fr_val) or "").strip().upper()
                                                     if _fr_nm and not _fr_nm.endswith("UNSPECIFIED"):
                                                         saw_upstream_finish_reason = True
+                                                        raw_upstream_finish_reason = _fr_nm
                                                         break
                                             _has_m_tok, _has_m_th = _chunk_has_model_token(
                                                 chunk_item_call, include_thoughts=tracker.include_thoughts
@@ -2588,6 +2610,7 @@ async def execute_unified_completion(
                                                 break
 
                                         stream_eof_mono = time.monotonic()
+                                        had_unclosed_synth_at_eof = tool_indexer.has_unclosed_synthetic(0)
                                         rem_calls = tool_indexer.flush_function_calls(0)
                                         rem_synth_parts = []
                                         _tail_synth = tool_indexer.flush_synthetic_tail(0)
@@ -2712,16 +2735,9 @@ async def execute_unified_completion(
                                             raise err_empty_stream
 
                                         if has_yielded_output and not emitted_finish_reason:
-                                            if tool_indexer.has_tool_calls(0):
-                                                _fin_reason = "tool_calls"
-                                            elif tool_indexer.has_synthetic_halted(0):
-                                                _fin_reason = "stop"
-                                            elif not saw_upstream_finish_reason:
-                                                # 上游未下发任何 finish_reason 即静默结束流：按截断上报 finish_reason=length，避免客户端误以为完整收尾
-                                                _fin_reason = "length"
-                                                silent_eof_truncated = True
-                                            else:
-                                                _fin_reason = "stop"
+                                            _fin_reason = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
+                                            if not saw_upstream_finish_reason and had_unclosed_synth_at_eof and not tool_indexer.has_synthetic_halted(0):
+                                                silent_eof_warning = True
                                             last_finish_reason_str = _fin_reason
                                             _fin_delta_eof: Dict[str, Any] = {}
                                             if not tool_indexer.has_emitted_extra(0):
@@ -2798,6 +2814,7 @@ async def execute_unified_completion(
                                             gen_time=_s_gen,
                                             saw_thought_stream=saw_thought_stream,
                                             finish_reason=("tool_calls" if tool_indexer.has_tool_calls(0) else last_finish_reason_str),
+                                            raw_finish_reason=raw_upstream_finish_reason,
                                             has_tool_calls=tool_indexer.has_tool_calls(0),
                                             has_usage=bool(final_p_tk > 0 or final_comp_tk > 0),
                                             p_tk=final_p_tk,
@@ -2808,10 +2825,11 @@ async def execute_unified_completion(
                                         if tool_indexer.has_synthetic_halted(0):
                                             _h_fin = tool_indexer.synthetic_halt_reason(0) or "闭合溢出"
                                             print(f"⚠️ [Express] {request_obj.model} | 抗截断保护提前收口（{_h_fin}）| 耗时 {elapsed:.1f}s")
-                                        elif silent_eof_truncated:
-                                            print(f"⚠️ [Express] {request_obj.model} | 上游静默断流（未收到 finish_reason，正文可能不完整），已标 finish_reason=length | 耗时 {elapsed:.1f}s")
+                                        elif silent_eof_warning:
+                                            print(f"⚠️ [Express] {request_obj.model} | 上游静默断流（未收到 finish_reason 且 compose_reply 未闭合）| 耗时 {elapsed:.1f}s")
                                         elif last_finish_reason_str == "length":
-                                            print(f"⚠️ [Express] {request_obj.model} | 流式传输结束（finish_reason=length，已达上限或截断）| 耗时 {elapsed:.1f}s")
+                                            _raw_fr_note = f"上游={raw_upstream_finish_reason}" if raw_upstream_finish_reason else "上游=length"
+                                            print(f"⚠️ [Express] {request_obj.model} | 流式传输中断（{_raw_fr_note}）| 耗时 {elapsed:.1f}s")
                                         else:
                                             print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                                         return
@@ -2942,6 +2960,7 @@ async def execute_unified_completion(
                                     gen_time=float(cookie_tel.get("gen_time") or 0.0),
                                     saw_thought_stream=bool(cookie_tel.get("saw_thought_stream")),
                                     finish_reason=str(cookie_tel.get("finish_reason") or "stop"),
+                                    raw_finish_reason=str(cookie_tel.get("raw_finish_reason") or ""),
                                     has_tool_calls=bool(cookie_tel.get("tool_calls")),
                                     has_usage=bool(cookie_tel.get("has_usage")),
                                     p_tk=int(cookie_tel.get("p_tk") or 0),
@@ -3172,12 +3191,18 @@ async def execute_unified_completion(
                 if app_state.get_setting("debug_outbound", False):
                     print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
                 _ns_fin0 = _ns_ch0.get("finish_reason") or "stop"
+                _ns_raw_fr0 = ""
+                _ns_cands0 = getattr(response_obj_call, "candidates", None) or []
+                if _ns_cands0 and getattr(_ns_cands0[0], "finish_reason", None) is not None:
+                    _ns_fv0 = _ns_cands0[0].finish_reason
+                    _ns_raw_fr0 = str(getattr(_ns_fv0, "name", _ns_fv0) or "").strip().upper()
                 tracker.finalize_success(
                     target,
                     is_cookie=False,
                     ttft=None,
                     gen_time=ns_unary_elapsed,
                     finish_reason=_ns_fin0,
+                    raw_finish_reason=_ns_raw_fr0,
                     has_tool_calls=bool(_ns_msg0.get("tool_calls")),
                     has_usage=bool(usage_info_ns["prompt_tokens"] or usage_info_ns["completion_tokens"]),
                     p_tk=usage_info_ns["prompt_tokens"],
@@ -3215,6 +3240,7 @@ async def execute_unified_completion(
                         ttft=None,
                         gen_time=float(cookie_ns_tel.get("gen_time") or 0.0),
                         finish_reason=str(cookie_ns_tel.get("finish_reason") or "stop"),
+                        raw_finish_reason=str(cookie_ns_tel.get("raw_finish_reason") or ""),
                         has_tool_calls=bool(cookie_ns_tel.get("tool_calls")),
                         has_usage=bool(cookie_ns_tel.get("has_usage")),
                         p_tk=int(cookie_ns_tel.get("p_tk") or 0),

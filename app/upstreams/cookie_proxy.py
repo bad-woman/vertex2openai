@@ -1287,7 +1287,14 @@ def _extract_from_results(obj: dict):
                     fc_args = function_call.get("args") if isinstance(function_call.get("args"), dict) else {}
                     fc_partial = function_call.get("partialArgs") if isinstance(function_call.get("partialArgs"), list) else []
                     fc_wc = bool(function_call.get("willContinue"))
-                    fc_explicit_end = (function_call.get("willContinue") is False)
+                    has_oneof_disc = "data" in part
+                    fc_explicit_end = (
+                        function_call.get("willContinue") is False
+                        and not text
+                        and not _is_thought_part(part)
+                        and not part.get("inlineData")
+                        and (part.get("data") == "functionCall" if has_oneof_disc else True)
+                    )
                     if fc_name or fc_args or fc_partial or fc_wc or fc_explicit_end:
                         yield ("function_call", {
                             "id": str(function_call.get("id") or "").strip() or None,
@@ -1800,6 +1807,7 @@ async def _collect_full_response_once(
                 "unary_elapsed": post_elapsed,
                 "reasoning_text": "" if strip_thoughts else reasoning_text,
                 "finish_reason": _map_finish_reason(finish_raw),
+                "raw_finish_reason": str(finish_raw or ""),
                 "usage_meta": usage_meta,
             }
 
@@ -2081,6 +2089,7 @@ class CookieProxyUpstream(BaseUpstream):
                 if telemetry is not None:
                     telemetry["gen_time"] = float(res.get("unary_elapsed") or 0.0)
                     telemetry["finish_reason"] = fin_r
+                    telemetry["raw_finish_reason"] = str(res.get("raw_finish_reason") or "")
                     telemetry["out_chars"] = len(full_text)
                     telemetry["has_usage"] = bool(p_u > 0 or th_u > 0 or out_u > 0)
                     telemetry["p_tk"] = p_u
@@ -2487,20 +2496,16 @@ class CookieProxyUpstream(BaseUpstream):
                                 google["thought_signature_part"] = last_signed["kind"]
                             final_extra = {"google": google}
 
-                    silent_eof_truncated = bool(
+                    silent_eof_warning = bool(
                         not finish_raw
                         and not got_tool_call
                         and not fc_assembler.synthetic_halted
-                        and (not fc_assembler.synthetic_hit or had_unclosed_synth)
+                        and had_unclosed_synth
                     )
                     final_fr_stream = (
                         "tool_calls"
                         if got_tool_call
-                        else (
-                            "stop"
-                            if fc_assembler.synthetic_halted
-                            else ("length" if silent_eof_truncated else _map_finish_reason(finish_raw))
-                        )
+                        else ("stop" if fc_assembler.synthetic_halted else _map_finish_reason(finish_raw))
                     )
                     yield _make_openai_chunk(
                         response_id,
@@ -2531,6 +2536,7 @@ class CookieProxyUpstream(BaseUpstream):
                             telemetry["gen_time"] = max(0.0, stream_end_t0 - stream_req_t0)
                         telemetry["saw_thought_stream"] = saw_thought_stream
                         telemetry["finish_reason"] = final_fr_stream
+                        telemetry["raw_finish_reason"] = str(finish_raw or "")
                         telemetry["tool_calls"] = bool(got_tool_call)
                         telemetry["out_chars"] = stream_out_chars
                         telemetry["has_usage"] = bool(p_u_s > 0 or th_u_s > 0 or out_u_s > 0)
@@ -2547,10 +2553,11 @@ class CookieProxyUpstream(BaseUpstream):
                     if fc_assembler.synthetic_halted:
                         _ck_h_fin = fc_assembler.synthetic_halt_reason or "闭合溢出"
                         print(f"⚠️ [Studio] {base_model_name} | 抗截断保护提前收口（{_ck_h_fin}）| 耗时 {elapsed:.1f}s")
-                    elif silent_eof_truncated:
-                        print(f"⚠️ [Studio] {base_model_name} | 上游静默断流（未收到 finishReason，正文可能不完整），已标 finish_reason=length | 耗时 {elapsed:.1f}s")
+                    elif silent_eof_warning:
+                        print(f"⚠️ [Studio] {base_model_name} | 上游静默断流（未收到 finishReason 且 compose_reply 未闭合）| 耗时 {elapsed:.1f}s")
                     elif final_fr_stream == "length":
-                        print(f"⚠️ [Studio] {base_model_name} | 流式传输结束（finish_reason=length，已达上限或截断）| 耗时 {elapsed:.1f}s")
+                        _ck_fr_note = f"上游={finish_raw}" if finish_raw else "上游=length"
+                        print(f"⚠️ [Studio] {base_model_name} | 流式传输中断（{_ck_fr_note}）| 耗时 {elapsed:.1f}s")
                     else:
                         print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
 
@@ -2817,6 +2824,7 @@ class CookieProxyUpstream(BaseUpstream):
             if telemetry is not None:
                 telemetry["gen_time"] = ns_post_elapsed
                 telemetry["finish_reason"] = finish_reason
+                telemetry["raw_finish_reason"] = str(finish_raw or "")
                 telemetry["tool_calls"] = bool(tool_calls)
                 telemetry["out_chars"] = len(full_text)
                 telemetry["has_usage"] = bool(p_u_ns > 0 or th_u_ns > 0 or out_u_ns > 0)

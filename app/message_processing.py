@@ -1212,6 +1212,7 @@ class FunctionCallStreamAssembler:
 
             synth_deltas: List[str] = []
             saw_done_signal = False
+            any_parg_wc = False
 
             if has_partial:
                 for parg in fc_partial:
@@ -1225,12 +1226,16 @@ class FunctionCallStreamAssembler:
                         self._last_synth_path = path_str
                     tokens = _parse_json_path_tokens(path_str)
                     if is_done_json_path(tokens, path_str):
-                        has_done_val, done_val, _ = _extract_partial_arg_value(parg)
+                        has_done_val, done_val, p_wc = _extract_partial_arg_value(parg)
+                        if p_wc:
+                            any_parg_wc = True
                         # 仅当 done 为真（或省略布尔值）时才视作收敛信号；done=false 表示仍在分段续写，不可提前封口
                         if not has_done_val or done_val is not False:
                             saw_done_signal = True
                         continue
-                    has_val, val, _ = _extract_partial_arg_value(parg)
+                    has_val, val, p_wc = _extract_partial_arg_value(parg)
+                    if p_wc:
+                        any_parg_wc = True
                     if has_val and isinstance(val, str) and val:
                         if is_content_json_path(tokens, path_str) or not tokens:
                             synth_deltas.append(val)
@@ -1248,6 +1253,9 @@ class FunctionCallStreamAssembler:
                     if not is_dup_full:
                         synth_deltas.append(raw_extracted)
 
+            eff_will_continue = bool(fc_will_continue or any_parg_wc)
+            self._pending_is_synthetic = bool(eff_will_continue or (has_partial and not saw_done_signal))
+
             incoming_text = "".join(synth_deltas)
             if incoming_text:
                 self._synth_tail_buf += incoming_text
@@ -1257,13 +1265,17 @@ class FunctionCallStreamAssembler:
                     need_h = 120 - len(self._cur_synth_call_head)
                     self._cur_synth_call_head += incoming_text[:need_h]
 
-            self._ensure_lex_seeded(force=(not fc_will_continue or saw_done_signal))
+            should_seal = bool(
+                saw_done_signal
+                or (not has_partial and not eff_will_continue)
+            )
+            self._ensure_lex_seeded(force=should_seal)
 
-            if not fc_will_continue or saw_done_signal:
-                # 合成工具本轮调用正常收敛结束（或已收到 $.done=true 信号）：冲刷当前尾窗，但仅在 not fc_will_continue 或实锤裁剪时才封死 _synth_eof_sealed，
-                # 防止 $.done 提前到达时吞掉紧随其后的尾随闭合标签分片（如 </affinity> / </status>）！
+            if should_seal:
+                # 仅在收到 $.done=true、非分片整包结束或显式空收尾帧时才进入收口并冲刷尾窗；
+                # 若分片流中某个 $.content 块漏带 will_continue 且尚未收到 $.done，绝不提前按 EOF 裁剪或封口丢弃后续正文！
                 self._last_synth_path = ""
-                if not fc_will_continue:
+                if not eff_will_continue:
                     self._saw_synth_partial = False
                     if self._cur_synth_call_head:
                         self._last_synth_call_head = self._cur_synth_call_head
@@ -1278,7 +1290,7 @@ class FunctionCallStreamAssembler:
                 )
                 self._synth_tail_buf = ""
                 self._lex_state.feed(clean_buf)
-                if not fc_will_continue or trimmed:
+                if (not eff_will_continue) or trimmed:
                     self._synth_eof_sealed = True
                 sig_to_emit = self._synth_signature
                 self._synth_signature = None
@@ -1329,12 +1341,17 @@ class FunctionCallStreamAssembler:
                 self._synth_signature = None
             return ready_real, out_text, sig_to_emit
 
-        # 若此前处于合成工具分片但本块切换到了真实工具名，复位合成挂起状态
+        # 若此前处于合成工具分片但本块切换到了真实工具名，先冲刷合成尾窗再处理真实工具调用
+        flushed_synth = ""
+        flushed_sig: Optional[bytes] = None
         if fc_name and self.synthetic_tool_name and fc_name != self.synthetic_tool_name:
+            if self._synth_tail_buf:
+                flushed_synth = self.flush_synthetic_tail()
+                flushed_sig = self.pop_synth_signature()
             self._pending_is_synthetic = False
             self._last_synth_path = ""
 
-        return self._attach_fallback_synth_sig(self.feed(fc, thought_signature=thought_signature)), "", None
+        return self._attach_fallback_synth_sig(self.feed(fc, thought_signature=thought_signature)), flushed_synth, flushed_sig
 
     def feed(self, fc: Any, thought_signature: Optional[bytes] = None) -> List[Dict[str, Any]]:
         """喂入一个真实 function_call 对象或字典，返回目前已聚合完成的调用列表。"""
