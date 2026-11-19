@@ -1584,6 +1584,39 @@ class _MalformedSandboxFallback(Exception):
     pass
 
 
+_THINKING_CUTOFF_REWRITE_NUDGE = (
+    "\n\n[Note: The previous attempt ran out of output length before delivering any reply text. "
+    "Start writing the user-visible answer directly and keep any internal reasoning brief.]"
+)
+
+
+def _is_max_tokens_finish(resp_or_chunk: Any) -> bool:
+    """检查上游响应或分片是否带有 MAX_TOKENS 结束原因。"""
+    cands = getattr(resp_or_chunk, "candidates", None) or []
+    for cand in cands:
+        fr = getattr(cand, "finish_reason", None)
+        if fr is not None:
+            fr_str = str(getattr(fr, "name", fr) or "").strip().upper()
+            if fr_str == "MAX_TOKENS":
+                return True
+    return False
+
+
+def _with_brief_reasoning_nudge(contents: List[Any]) -> List[Any]:
+    """在最后一条 user 消息末尾追加简短的精简思考重写提示（用于 0 正文即撞上 MAX_TOKENS 的 1 次自动自愈重写）。"""
+    if not contents:
+        return contents
+    cloned = list(contents)
+    for idx in range(len(cloned) - 1, -1, -1):
+        c_item = cloned[idx]
+        if getattr(c_item, "role", None) == "user" and getattr(c_item, "parts", None) is not None:
+            new_parts = list(c_item.parts) + [types.Part.from_text(text=_THINKING_CUTOFF_REWRITE_NUDGE)]
+            cloned[idx] = types.Content(role="user", parts=new_parts)
+            return cloned
+    cloned.append(types.Content(role="user", parts=[types.Part.from_text(text=_THINKING_CUTOFF_REWRITE_NUDGE.strip())]))
+    return cloned
+
+
 def is_location_pin_failure(err: Any) -> bool:
     """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。"""
     e = str(err).lower()
@@ -2267,6 +2300,7 @@ async def execute_unified_completion(
             nonlocal sandbox_downgraded
             any_output_yielded = False
             emitted_reasoning_any = False
+            thinking_cutoff_rewritten = False
             try:
                 if not (fake_stream_on or is_image_request):
                     yield ": keep-alive\n\n"
@@ -2330,7 +2364,7 @@ async def execute_unified_completion(
                                     api_call_task = asyncio.create_task(
                                         current_client.aio.models.generate_content(
                                             model=model_to_call,
-                                            contents=actual_prompt,
+                                            contents=(_with_brief_reasoning_nudge(actual_prompt) if thinking_cutoff_rewritten else actual_prompt),
                                             config=unary_cfg,
                                         )
                                     )
@@ -2379,7 +2413,11 @@ async def execute_unified_completion(
                                 ):
                                     print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                                     err_v = ValueError(_describe_empty_gemini_response(raw_gemini_response, model_to_call))
-                                    if synth_tool_name:
+                                    if _is_max_tokens_finish(raw_gemini_response) and not thinking_cutoff_rewritten:
+                                        thinking_cutoff_rewritten = True
+                                        err_v.is_retryable = True
+                                        print(f"🩹 [思考超限自愈] 模型 {model_to_call} 假流式仅输出思考即耗尽 max_tokens（0 字正文），将自动追加精简思考提示重写一次。")
+                                    elif synth_tool_name:
                                         err_v.is_retryable = True
                                         if not sandbox_downgraded and is_malformed_tool_finish(raw_gemini_response):
                                             sandbox_downgraded = True
@@ -2725,6 +2763,14 @@ async def execute_unified_completion(
 
                                         # 真流式全量空正文拦截：严格检查 has_yielded_visible_body（即使前面已吐出过 reasoning_content 思考块，只要可见正文/工具为 0 字，绝不当成成功结束！）
                                         if not has_yielded_visible_body:
+                                            if raw_upstream_finish_reason == "MAX_TOKENS" and not thinking_cutoff_rewritten:
+                                                thinking_cutoff_rewritten = True
+                                                actual_prompt = _with_brief_reasoning_nudge(actual_prompt)
+                                                print(
+                                                    f"🩹 [思考超限自愈] 模型 {model_to_call} 真流式仅输出思考即耗尽 max_tokens（0 字正文），"
+                                                    "0 等待追加精简思考提示并自动重写一次..."
+                                                )
+                                                continue
                                             if synth_tool_name and not sandbox_downgraded:
                                                 raise _MalformedSandboxFallback()
                                             print(f"🔎 [Express 诊断] 模型={model_to_call} 真流式未产出任何可见正文。原始响应样本：\n{sampler.dump()}")
@@ -3060,6 +3106,7 @@ async def execute_unified_completion(
     # ============================================================
     last_err_code = 502
     last_err_formatted = f"模型 {request_obj.model} 上游未返回任何响应（重试已耗尽）。"
+    ns_thinking_cutoff_rewritten = False
 
     for attempt in range(max_retries + 1):
         if await _client_gone():
@@ -3106,7 +3153,7 @@ async def execute_unified_completion(
                     call_task = asyncio.create_task(
                         current_client.aio.models.generate_content(
                             model=model_to_call,
-                            contents=actual_prompt,
+                            contents=(_with_brief_reasoning_nudge(actual_prompt) if ns_thinking_cutoff_rewritten else actual_prompt),
                             config=unary_cfg,
                         )
                     )
@@ -3162,7 +3209,11 @@ async def execute_unified_completion(
                 ):
                     print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
                     err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
-                    if synth_tool_name:
+                    if _is_max_tokens_finish(response_obj_call) and not ns_thinking_cutoff_rewritten:
+                        ns_thinking_cutoff_rewritten = True
+                        err_v.is_retryable = True
+                        print(f"🩹 [思考超限自愈] 模型 {model_to_call} 非流式仅输出思考即耗尽 max_tokens（0 字正文），将自动追加精简思考提示重写一次。")
+                    elif synth_tool_name:
                         err_v.is_retryable = True
                         if not sandbox_downgraded and is_malformed_tool_finish(response_obj_call):
                             sandbox_downgraded = True

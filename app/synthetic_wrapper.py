@@ -14,6 +14,7 @@ import re
 import time
 import unicodedata
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -263,44 +264,48 @@ def build_emit_tool_declaration(
     emit_tool_name: str,
     for_cookie: bool = False,
 ) -> Dict[str, Any]:
-    """构建有序双必填字段 (content + done) 抗截断传输工具声明：
-    1. 全局静态固定描述与 Schema，100% 保证命中 Vertex 隐式前缀缓存；
-    2. 保留 required: ["content", "done"] 与 property_ordering 双阶段收敛门栓，防止末尾状态栏未写完提前封口；
-    3. 统一采用 Vertex 原生标准 parameters（移除过严易脱轨的 parameters_json_schema + additionalProperties: False），
-       激活最稳定的原生 Schema 解码器，从源头大幅消除长文嵌套引号/标签下的 MALFORMED_FUNCTION_CALL。
+    """构建单字段 (content) 抗截断传输工具声明：
+    1. 全局静态固定工具名与极简中性描述，100% 保证命中 Vertex 隐式前缀缓存；
+    2. 去掉冗余的 done 布尔字段，消除长文末尾从 content 切换到 ,done:true} 时的闭合悬崖与恐慌循环；
+    3. Express 通道在 SDK 支持时采用 parameters_json_schema + additionalProperties: False（只允许 content 单键），
+       Cookie 通道或旧版 SDK 自动回退为标准 parameters 单字段 Schema。
     """
-    desc = "Deliver the complete user-visible reply as text, then set done to true to end the call."
-    content_desc = (
-        "The complete user-visible reply itself, preserving its language, code blocks, sections, formatting, "
-        "all closing tags and trailing status panels."
+    desc = (
+        "Deliver the complete user-visible reply as text; "
+        "end the call when the requested content is complete."
     )
-    done_desc = "Set to true only after all requested content and all closing tags are complete."
-    base_schema: Dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "content": {
-                "type": "string",
-                "description": content_desc,
-            },
-            "done": {
-                "type": "boolean",
-                "description": done_desc,
-            },
-        },
-        "required": ["content", "done"],
-    }
-    if not for_cookie and _SCHEMA_PROP_ORDER_KEY:
-        express_schema = dict(base_schema)
-        express_schema[_SCHEMA_PROP_ORDER_KEY] = ["content", "done"]
+    content_desc = (
+        "The requested reply itself, preserving its language, sections, formatting and markup."
+    )
+    if not for_cookie and _SDK_SUPPORTS_PARAMS_JSON_SCHEMA:
         return {
             "name": emit_tool_name,
             "description": desc,
-            "parameters": express_schema,
+            "parameters_json_schema": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": content_desc,
+                    },
+                },
+                "required": ["content"],
+                "additionalProperties": False,
+            },
         }
     return {
         "name": emit_tool_name,
         "description": desc,
-        "parameters": base_schema,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": content_desc,
+                },
+            },
+            "required": ["content"],
+        },
     }
 
 
@@ -311,28 +316,26 @@ def build_sandbox_control_instruction(
     is_keep_turn: bool = False,
     has_callable_client_tools: bool = False,
 ) -> str:
-    """构建通用传输格式指令（含双必填收敛、XML/HTML 标签与末尾状态栏闭合前置硬约束、防自检与防填充）。"""
+    """构建极简中性传输格式指令（单字段 content，去除易诱发模型自检复读的闭合焦虑措辞）。"""
     target_text = "only the new continuation text" if has_prefill else "the entire user-visible answer"
     if has_callable_client_tools:
         transport_head = (
             f"Transport format for this reply: put all user-visible text, if any, in exactly one call of {emit_tool_name}; "
-            f"its content string holds {target_text} (preserving all requested formatting, code blocks, markup, language and sections), "
-            f"then set done to true. {emit_tool_name} only transports text and performs no external action. "
+            f"its content string holds {target_text}, preserving all requested formatting, markup, language and sections. "
+            f"{emit_tool_name} only transports text and performs no external action. "
             f"Call the other tools whenever the task needs them, with or without {emit_tool_name}."
         )
     else:
         transport_head = (
             f"Transport format for this reply: call {emit_tool_name} exactly once. "
-            f"Put {target_text} in its content string (preserving all requested formatting, code blocks, markup, language and sections), "
-            f"then set done to true. The function only transports text and performs no external action."
+            f"Put {target_text} in its content string, preserving all requested formatting, markup, language and sections. "
+            f"The function only transports text and performs no external action."
         )
 
     transport_tail = (
         " This transport does not change the task. Do not add unsolicited commentary about this transport, "
-        "tool selection or serialization. Every opened XML/HTML tag (</...>), code fence, and required trailing "
-        "status or attribute panel must be completely paired and closed inside content before closing the content "
-        "string and setting done to true; then end the call immediately without repeating finished content or adding filler. "
-        "Preserve repetition explicitly requested by the task."
+        "tool selection or serialization. Once the requested content is complete, end the call without "
+        "repeating finished content or adding filler. Preserve repetition explicitly requested by the task."
     )
     transport_line = transport_head + transport_tail
 
@@ -858,86 +861,26 @@ def prefill_appears_repeated(prefill_text: str, output_head: str) -> bool:
     return False
 
 
-# 显式工具自检独白与控制伪词正则（无嵌套歧义量词，保证线性时间 O(N) 无回溯风险）
-_SELF_CHECK_RE = re.compile(
-    r"(?:"
-    r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?"
-    r"\bLet['’]s\s+(?:check|finalize|make\s+sure|verify|review|ensure|confirm"
-    r"|finish|close|end|stop|complete"
-    r"|just\s+(?:close|finish|end|stop))\b"
-    r"[\s\S]{0,180}?"
-    r"(?:compose_reply|router_emit|\btool\s*call\b|\bfunction\s*call\b"
-    r"|\bjson\s*string\b|\bcontent\s*string\b|\bproper\s*closure\b"
-    r"|\bgenerating\s*tokens?\b|\bdone\b[\"']?\s*[:=]\s*true\b"
-    r"|Done![ \t\r\n\"']*[}\])][ \t\r\n\"']*[}\])])"
-    r"|"
-    r"(?:[\"'»》!?,][ \t]*)?[\"']?\bdone\b[\"']?\s*[:=]\s*true[ \t]*[}\])]"
-    r"|"
-    r"\b(?:I\s+am\s+still\s+inside\s+the\s+(?:tool|function)\s*call"
-    r"|the\s+[`'\"]?content[`'\"]?\s+string\s+(?:is\s+)?already\s+closed)\b"
-    r"|"
-    r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?Done![ \t\r\n\"']*[}\])][ \t\r\n\"']*[}\])][\s\"'}\])]*\Z"
-    r"|"
-    r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?(?:endasi|end_assistant|исповедь|<\|endoftext\|>|<\|im_end\|>)(?=[\s}\])\"'!.?]*\Z|\s)"
-    r"|"
-    r"[!?\s]*\}\s*(?:endasi|end_assistant|compose_reply|router_emit)\b"
-    r")",
-    re.IGNORECASE,
-)
+# ============================================================================
+# 融合尾部保护引擎 (SyntheticTailGuard)：
+# 结合 vertex2openai-access v8.2.5 TailGuard 低误杀架构与 Gemini 4 实战跑飞补丁：
+#   1. 流中零激进规则：不因闭合标签(</div>)或闭合括号(]})截断，周期重复阈值收紧至 >=12次 且 >=600字；
+#   2. 未闭合行内反引号超过 100 字或跨行时回溯取消保护，防止乱码里的孤立 ` 致盲整段检测；
+#   3. 四类高置信实锤狙击：
+#      - 显式工具名/工具调用自检独白与控制伪词；
+#      - 48 字高密度货币/符号乱码窗 (find_symbol_salad)；
+#      - 英文自检句尾粘连孤立闭合括号 (_META_TAIL，含 »/》/?> 变体) 与同义词恐慌循环；
+#      - 句末孤立 } + 400 字多语种收尾念叨观察窗 (_stray_close + _is_chatter)；
+#   4. 仅在流末 (flush) 才清理孤立未配对的尾部闭合残片 (]}) / Done!}}) 与围栏粘连尾。
+# ============================================================================
 
-# 同义词轮换型工具收尾恐慌循环（如 Let's stop.!》?>}] Let's end.!》?>}] Let's finish.!》?>}]）
-_PANIC_CLOSURE_CLAUSE = (
-    r"\bLet['’]s\s+(?:stop|end|finish|close|complete|fix|check|do\s+it|review|ensure|make\s+sure"
-    r"|just\s+(?:close|stop|finish|end|output)|not\s+(?:output|put))\b"
-    r"[^.!?\n]{0,48}[.!?]+(?:[ \t]*[»》>?}\])\"'!]){2,}"
-)
-_PANIC_CLOSURE_SINGLE_RE = re.compile(_PANIC_CLOSURE_CLAUSE, re.IGNORECASE)
-_PANIC_CLOSURE_LOOP_RE = re.compile(
-    r"(?:" + _PANIC_CLOSURE_CLAUSE + r"[ \t]*){3,}",
-    re.IGNORECASE,
-)
-
-# 流中疑似正在形成工具自检前缀（尚未吐完后续关键词，触发动态隔离窗口暂扣观察）
-_SUSPECT_SELF_CHECK_PREFIX_RE = re.compile(
-    r"(?:"
-    r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?\bLet['’]s\s*(?:(?:check|finalize|make|verify|review|ensure|confirm"
-    r"|finish|close|end|stop|fix|complete|output|just|not)\b[^\n]{0,120})?\Z"
-    r"|"
-    r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?Done![\s\"'}\])]{0,12}\Z"
-    r"|"
-    r"[}\])\"']+\s*(?:end|comp|rout|исп)[a-z_а-я]{0,14}\Z"
-    r")",
-    re.IGNORECASE,
-)
-
-# EOF 末尾未换行闭合围栏直接粘连工具溢出残片（例如: ```")} 或 ~~~]})) ）
-_FENCE_GLUED_OVERFLOW_RE = re.compile(
-    r"^([ \t]{0,7})(`{3,}|~{3,})([ \t]*)"
-    r"("
-    r"[\"']\s*[}\])][\s}\])\"']*"
-    r"|[}\])]{3,}[\s}\])\"']*"
-    r"|(?:[\"']?\s*[}\])]*\s*)?(?:endasi|end_assistant|исповедь)\b[\s\S]*"
-    r"|(?:[\"']?\s*[}\])]*\s*)?\bLet['’]s\s+(?:check|finalize|make\s+sure|verify|finish|close|end|stop)\b[\s\S]*"
-    r")\s*\Z",
-    re.IGNORECASE,
-)
-
-# EOF 末尾悬空闭合括号簇候选（必须通过词法栈 100% 未配对悬空校验方可裁剪）
-_EOF_CLOSER_CLUSTER_RE = re.compile(
-    r"([\"']{1,3}[ \t]*[}\])][\s}\])]*|[}\])][\s}\])]{1,24})\Z"
-)
-
-
-def _primitive_period(s: str) -> int:
-    """求字符串 s 的最小本原周期长度（例如 '------' -> 1, '</div></div>' -> 6）。"""
-    n = len(s)
-    if n <= 1:
-        return n
-    for p in range(1, n // 2 + 1):
-        if n % p == 0 and s == s[:p] * (n // p):
-            return p
-    return n
-
+TAIL_HOLD = 128            # 流式暂扣尾窗长度（覆盖单句自检 + 符号乱码窗）
+TAIL_HISTORY = 1600        # 重复检测与句末前瞻回看长度
+TAIL_MAX_UNIT = 200        # 重复检测最大单元长度
+TAIL_MIN_REPEATS = 12      # 周期死循环最小重复次数
+TAIL_MIN_SPAN = 600        # 周期死循环最小总跨度字符数
+TAIL_SUSPECT = 400         # 句末孤立 } 后的多语种收尾念叨观察窗长度
+TAIL_INLINE_WAIT = 100     # 行内反引号同一行内等待闭合的最大字符数
 
 _DECO_LAYOUT_EXTRA = set("·•‣⁃～〜―⁃•◦▪▫■□●○◆◇★☆✦✧❖✿❀")
 
@@ -950,7 +893,6 @@ def _is_pure_layout_unit(non_ws: List[str]) -> bool:
         if ch in _PURE_LAYOUT_CHARS or ch in _DECO_LAYOUT_EXTRA:
             continue
         cp = ord(ch)
-        # Box Drawing (2500-257F), Block Elements (2580-259F), Geometric Shapes (25A0-25FF), Misc Symbols & Dingbats (2600-27BF)
         if 0x2500 <= cp <= 0x27BF:
             continue
         if unicodedata.category(ch) == "Zs":
@@ -964,6 +906,500 @@ def _short_reason_preview(snippet: str, limit: int = 36) -> str:
     return clean[:limit] + ("…" if len(clean) > limit else "")
 
 
+def _build_leak_pattern(tool_name: str = "") -> re.Pattern:
+    """构造显式工具名/工具调用自检独白与控制伪词正则（不含易误杀正常编程讨论的宽泛词组）。"""
+    names = ["compose_reply", "router_emit"]
+    tn = (tool_name or "").strip()
+    if tn and tn not in names:
+        names.append(tn)
+    name_alt = "|".join(re.escape(n) for n in names)
+    return re.compile(
+        r"(?:"
+        r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?"
+        r"\bLet['’]s\s+(?:check|finalize|make\s+sure|verify|review|ensure|confirm"
+        r"|finish|close|end|stop|complete|fix"
+        r"|just\s+(?:close|finish|end|stop))\b"
+        r"[^\n]{0,140}?"
+        r"(?:" + name_alt + r"|\btool\s*call\b|\bfunction\s*call\b"
+        r"|\bjson\s*string\b|\bcontent\s*string\b|\bproper\s*closure\b"
+        r"|\bgenerating\s*tokens?\b|\bdone\b[\"']?\s*[:=]\s*true\b)"
+        r"|"
+        r"(?:[\"'»》!?,][ \t]*)?[\"']?\bdone\b[\"']?\s*[:=]\s*true[ \t]*[}\])]"
+        r"|"
+        r"\b(?:I\s+am\s+still\s+inside\s+the\s+(?:tool|function)\s*call"
+        r"|the\s+[`'\"]?content[`'\"]?\s+string\s+(?:is\s+)?already\s+closed)\b"
+        r"|"
+        r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?(?:endasi|end_assistant|исповедь|<\|endoftext\|>|<\|im_end\|>)(?=[\s}\])\"'!.?]*\Z|\s)"
+        r"|"
+        r"[!?\s]*\}\s*(?:endasi|end_assistant|" + name_alt + r")\b"
+        r")",
+        re.IGNORECASE,
+    )
+
+
+# 英文自检起手词 + 句末标点后紧跟孤立闭合括号残渣（兼容 .!}?) / .!»}] / .!»?>}] / .!》?>}]）
+_META_TAIL_RE = re.compile(
+    r"\b(?:Let['’]s|Let\s+me|I\s+(?:must|should|need\s+to|have\s+to|will|am\s+still)|Wait)\b"
+    r"[^\n}]{0,90}?[.!?]+(?:[ \t]*[!?\"'»》>]){0,5}\s*\}\s*[\])?]",
+    re.IGNORECASE,
+)
+
+# 同义词轮换型收尾恐慌循环（即使不含 }，如 Let's stop.!》?> Let's end.!》?> Let's finish.!》?>）
+_PANIC_CLOSURE_CLAUSE = (
+    r"\bLet['’]s\s+(?:stop|end|finish|close|complete|fix|check|do\s+it|review|ensure|make\s+sure"
+    r"|just\s+(?:close|stop|finish|end|output)|not\s+(?:output|put))\b"
+    r"[^.!?\n]{0,48}[.!?]+(?:[ \t]*[»》>?}\])\"'!]){2,}"
+)
+_PANIC_CLOSURE_SINGLE_RE = re.compile(_PANIC_CLOSURE_CLAUSE, re.IGNORECASE)
+_PANIC_CLOSURE_LOOP_RE = re.compile(
+    r"(?:" + _PANIC_CLOSURE_CLAUSE + r"[ \t]*){3,}",
+    re.IGNORECASE,
+)
+
+# 句末标点（后面可带收尾引号/书名号及至多两个空白）紧接孤立 }
+_AFTER_SENTENCE_RE = re.compile(r'[.!?。！？…~～]["\'”’」』»》>?]{0,3}[ \t\r\n]{0,2}$')
+_STRAY_BRACE_REASON = "模型写完正文后多写了一个 } 想结束工具调用并开始收尾念叨"
+
+# 孤立 } 后面的多语种「已结束/无需再输出」收尾念叨特征
+_CHATTER_RE = re.compile(
+    r"end\s+of\s+(?:turn|response|output|message)|no\s+(?:further|more)\s+(?:output|text|words|content)"
+    r"|nothing\s+(?:follows|more|else)|(?:tool|function)\s*call|empty\s+after"
+    r"|工具调用|函数调用|通过(?:函数|工具)|无需再|不再(?:输出|生成)|(?:完整|全部)交付"
+    r"|เสร็จสิ้น|keine\s+weiteren|ツール|関数呼び出し|도구\s*호출",
+    re.IGNORECASE,
+)
+_PAREN_END_LINE_RE = re.compile(r"^[ \t]*\([^()\n]{1,40}\)[ \t]*$", re.MULTILINE)
+
+# 流末专属：只在整段正文最末尾且全部括号均未配对时才清理的残渣
+_DONE_TAIL_RE = re.compile(r"Done!\s*[}\])\s]{2,}\Z")
+_CLOSURE_TAIL_RE = re.compile(
+    r"(?:[\"']{1,3}[ \t]*[}\])][\s}\])]*|(?:\]\}\)\}|\]\}\)\)|\}\]\)\}|\]\}\)|[}\])][\s}\])]{2,24}))\Z"
+)
+
+# 流末围栏粘连工具溢出残片（例如: ```")} 或 ~~~]})) ）
+_FENCE_GLUED_OVERFLOW_RE = re.compile(
+    r"^([ \t]{0,7})(`{3,}|~{3,})([ \t]*)"
+    r"("
+    r"[\"']\s*[}\])][\s}\])\"']*"
+    r"|[}\])]{3,}[\s}\])\"']*"
+    r"|(?:[\"']?\s*[}\])]*\s*)?(?:endasi|end_assistant|исповедь)\b[\s\S]*"
+    r"|(?:[\"']?\s*[}\])]*\s*)?\bLet['’]s\s+(?:check|finalize|make\s+sure|verify|finish|close|end|stop)\b[\s\S]*"
+    r")\s*\Z",
+    re.IGNORECASE,
+)
+
+# 48 字高密度货币/符号乱码检测常量（v8.2.0 实锤规则）
+_SALAD_WINDOW = 48
+_SALAD_MIN_DISTINCT = 18
+_SALAD_MIN_CURRENCY = 6
+_ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_SENTENCE_END_CHARS = "。！？.!?”’」』）)…~～"
+
+
+def _is_chatter(after: str) -> bool:
+    """判断孤立 } 后面是否是多语种收尾念叨或连续三行 (End)/(Done)/(Stop)。"""
+    probe = after[:TAIL_SUSPECT]
+    return bool(_CHATTER_RE.search(probe)) or len(_PAREN_END_LINE_RE.findall(probe)) >= 3
+
+
+def _is_symbol_ch(ch: str) -> bool:
+    return not (ch.isalnum() or ch.isspace())
+
+
+def _is_currency_ch(ch: str) -> bool:
+    return ch in "$¢£¤¥֏؋৲৳૱௹฿៛" or "₠" <= ch <= "⃏"
+
+
+def _is_rare_symbol_ch(ch: str) -> bool:
+    return "←" <= ch <= "⏿" or "─" <= ch <= "▟"
+
+
+def find_symbol_salad(text: str, start: int = 0) -> Optional[int]:
+    """检测正文后突然冒出的 48 字高密度货币/符号乱码，返回乱码起始下标；未命中返回 None。"""
+    n = len(text)
+    if n - start < _SALAD_WINDOW:
+        return None
+    for i in range(start, n - _SALAD_WINDOW + 1):
+        if not _is_symbol_ch(text[i]) or text[i] in _SENTENCE_END_CHARS:
+            continue
+        window = text[i : i + _SALAD_WINDOW]
+        symbols = {c for c in window if _is_symbol_ch(c)}
+        currency = sum(1 for c in symbols if _is_currency_ch(c))
+        hit = currency >= _SALAD_MIN_CURRENCY
+        if not hit and sum(1 for c in symbols if c in _ASCII_PUNCT) >= _SALAD_MIN_DISTINCT:
+            wordish = sum(1 for c in window if c.isalnum())
+            rare = sum(1 for c in window if _is_rare_symbol_ch(c))
+            hit = wordish <= _SALAD_WINDOW // 4 and rare >= 3
+        if not hit:
+            continue
+        line_start = text.rfind("\n", 0, i) + 1
+        j = i
+        while j > line_start:
+            ch = text[j - 1]
+            if (_is_symbol_ch(ch) and ch not in _SENTENCE_END_CHARS) or ch in " \t":
+                j -= 1
+                continue
+            if ch.isalpha() and j - 2 >= line_start and not text[j - 2].isalnum():
+                j -= 1
+                continue
+            break
+        return j
+    return None
+
+
+def find_runaway_repetition(text: str) -> Optional[int]:
+    """检测尾部是否同一小段连续重复 >=12 次且总跨度 >=600 字（豁免纯空白与排版分隔符），
+    命中时返回保留第一遍后的切点下标，否则返回 None。"""
+    n = len(text)
+    if n < TAIL_MIN_SPAN:
+        return None
+    best: Optional[int] = None
+    max_sz = min(TAIL_MAX_UNIT, n // TAIL_MIN_REPEATS)
+    for size in range(1, max_sz + 1):
+        unit = text[n - size :]
+        non_ws = [c for c in unit if not c.isspace()]
+        if not non_ws or _is_pure_layout_unit(non_ws):
+            continue
+        repeats = 1
+        pos = n - size
+        while pos >= size and text[pos - size : pos] == unit:
+            repeats += 1
+            pos -= size
+        if repeats >= TAIL_MIN_REPEATS and repeats * size >= TAIL_MIN_SPAN:
+            cut = pos + size
+            if best is None or cut < best:
+                best = cut
+    return best
+
+
+class _TailTextState:
+    """轻量流式词法状态机：跨尾窗保留围栏代码块、单行三反引号、行内代码与括号配对状态。"""
+
+    def __init__(self) -> None:
+        self.fence: str = ""
+        self.fence_len: int = 0
+        self.fence_open_line: bool = False
+        self.inline: int = 0
+        self.run: str = ""
+        self.run_len: int = 0
+        self.run_bol: bool = False
+        self.indent: int = 0
+        self.escaped: bool = False
+        self.stack: List[str] = []
+        self.inline_pos: Optional[int] = None
+
+    def scan(self, text: str) -> Tuple[List[bool], List[bool]]:
+        protected: List[bool] = []
+        orphan: List[bool] = []
+        self.inline_pos = None
+        for i, ch in enumerate(text):
+            if self.run and ch != self.run:
+                if self.fence:
+                    inline_close = (
+                        self.fence == "`"
+                        and self.fence_open_line
+                        and self.run_len == self.fence_len
+                    )
+                    if self.run == self.fence and (
+                        inline_close
+                        or (self.run_bol and self.run_len >= self.fence_len and ch.isspace())
+                    ):
+                        self.fence = ""
+                elif self.inline:
+                    if self.run == "`" and self.run_len == self.inline:
+                        self.inline = 0
+                elif self.run_bol and self.run_len >= 3:
+                    self.fence, self.fence_len = self.run, self.run_len
+                    self.fence_open_line = True
+                elif self.run == "`":
+                    self.inline = self.run_len
+                    self.inline_pos = max(0, i - self.run_len)
+                self.run = ""
+                self.run_len = 0
+
+            code = bool(self.fence or self.inline)
+            delimiter = ch in "`~" and (not self.escaped or code)
+            if delimiter:
+                if not self.run:
+                    self.run, self.run_bol = ch, 0 <= self.indent <= 7
+                self.run_len += 1
+            is_code = code or delimiter
+            unmatched = False
+            if not is_code:
+                if ch in _OPEN_TO_CLOSE:
+                    if len(self.stack) < 512:
+                        self.stack.append(ch)
+                elif ch in _CLOSE_TO_OPEN:
+                    opening = _CLOSE_TO_OPEN[ch]
+                    if self.stack and self.stack[-1] == opening:
+                        self.stack.pop()
+                    else:
+                        # 弹性容错 3 层内嵌未闭合括号，防止正文颜文字/半括号污染后续正常闭合
+                        found_idx = -1
+                        low_bound = max(0, len(self.stack) - 3)
+                        for k in range(len(self.stack) - 1, low_bound - 1, -1):
+                            if self.stack[k] == opening:
+                                found_idx = k
+                                break
+                        if found_idx != -1:
+                            del self.stack[found_idx:]
+                        else:
+                            unmatched = True
+            protected.append(is_code)
+            orphan.append(unmatched)
+            if ch == "\n":
+                self.fence_open_line = False
+                if self.inline and not self.fence:
+                    # 行内代码不跨行：到行尾未闭合则回溯取消从反引号起的所有保护
+                    for idx_p in range(self.inline_pos or 0, len(protected)):
+                        protected[idx_p] = False
+                    self.inline = 0
+                    self.inline_pos = None
+            self.indent = 0 if ch == "\n" else (self.indent + 1 if ch == " " and self.indent >= 0 else -1)
+            self.escaped = (ch == "\\" and not self.escaped)
+        return protected, orphan
+
+
+def _scan_tail_window(state: _TailTextState, text: str) -> Tuple[List[bool], List[bool], _TailTextState]:
+    """扫描暂扣窗口并返回 (代码保护标记, 孤立括号标记, 末态副本)。
+    核心保障（v8.2.2）：孤立未闭合的行内反引号同一行超过 100 字或跨行后，
+    立即回溯取消从该反引号起的代码保护，防止乱码里的反引号致盲整段检测。
+    """
+    probe = deepcopy(state)
+    carried = bool(probe.inline) and not probe.fence
+    protected, orphan = probe.scan(text)
+    closing_now = (probe.run == "`" and probe.run_len == probe.inline)
+    if probe.inline and not probe.fence and not closing_now:
+        if probe.inline_pos is not None:
+            start = probe.inline_pos if len(text) - probe.inline_pos > TAIL_INLINE_WAIT else len(text)
+        elif carried:
+            nl = text.find("\n")
+            start = len(text) if nl < 0 else nl
+        else:
+            start = len(text)
+        for idx_p in range(start, len(text)):
+            protected[idx_p] = False
+    return protected, orphan, probe
+
+
+def _first_unprotected_match(pattern: re.Pattern, text: str, protected: List[bool]) -> Optional[re.Match]:
+    for m in pattern.finditer(text):
+        if not any(protected[m.start() : m.end()]):
+            return m
+    return None
+
+
+class SyntheticTailGuard:
+    """流式与非流式通用的正文尾部保护器（零激进误杀 + 高精准跑飞熔断）。"""
+
+    def __init__(self, tool_name: str = DEFAULT_SYNTHETIC_TOOL_NAME, prefill_text: str = "") -> None:
+        self.tool_name: str = (tool_name or DEFAULT_SYNTHETIC_TOOL_NAME).strip()
+        self._leak_re: re.Pattern = _build_leak_pattern(self.tool_name)
+        self._held: str = ""
+        self._sent_tail: str = ""
+        self._sent_code: List[bool] = []
+        self._state: _TailTextState = _TailTextState()
+        self._prefill_seeded: bool = False
+        self.halted: bool = False
+        self.trimmed_at_eof: bool = False
+        self.chatter_trimmed: bool = False
+        self.reason: str = ""
+        self._released: int = 0
+        self._ok_abs: int = -1
+        if prefill_text:
+            self.seed_prefill(prefill_text)
+
+    def seed_prefill(self, prefill_text: str) -> None:
+        """用未复述的 prefill 文本预热括号与代码围栏状态（仅在尚未放出任何正文前生效）。"""
+        if prefill_text and not self._prefill_seeded and self._released == 0:
+            self._state.scan(prefill_text)
+            self._prefill_seeded = True
+
+    def _halt(self, reason: str) -> None:
+        self.halted = True
+        self.reason = reason
+        self._held = ""
+
+    def _release(self, out: str) -> str:
+        if out:
+            self._released += len(out)
+            protected, _ = self._state.scan(out)
+            self._sent_code = (self._sent_code + protected)[-TAIL_HISTORY:]
+            self._sent_tail = (self._sent_tail + out)[-TAIL_HISTORY:]
+        return out
+
+    def _stray_close(self, text: str, protected: List[bool], orphan: List[bool]) -> Optional[int]:
+        for i, ch in enumerate(text):
+            if ch != "}" or not orphan[i] or protected[i] or self._released + i <= self._ok_abs:
+                continue
+            if _AFTER_SENTENCE_RE.search((self._sent_tail + text[:i])[-12:]):
+                return i
+        return None
+
+    def feed(self, delta: str) -> str:
+        """喂入新解码出的正文增量，返回已确认安全、可立即下发给客户端的正文。"""
+        if self.halted or not delta:
+            return ""
+        self._held += delta
+        protected, orphan, end_probe = _scan_tail_window(self._state, self._held)
+
+        cuts: List[Tuple[int, str]] = []
+
+        # 1. 显式工具名/工具调用自检独白与控制伪词
+        m_leak = _first_unprotected_match(self._leak_re, self._held, protected)
+        if m_leak is not None:
+            cut_pos = m_leak.start()
+            while cut_pos < m_leak.end() and self._held[cut_pos] in _CLOSER_CHARS and not orphan[cut_pos]:
+                cut_pos += 1
+            cuts.append((cut_pos, f"工具自检/控制词泄漏({_short_reason_preview(self._held[cut_pos:m_leak.end()])})"))
+
+        # 2. 48 字高密度货币/符号乱码（代码保护位等长替换为 'a' 以保持下标一致）
+        masked_for_salad = "".join("a" if p else c for c, p in zip(self._held, protected))
+        salad_pos = find_symbol_salad(masked_for_salad)
+        if salad_pos is not None:
+            cuts.append((salad_pos, "正文后冒出高密度符号/货币乱码"))
+
+        # 3. 英文自检句尾粘连孤立闭合括号残渣（要求匹配到的 } 为孤立未配对括号，彻底防误伤合法 JSON/代码）
+        for m_meta in _META_TAIL_RE.finditer(self._held):
+            if any(protected[m_meta.start() : m_meta.end()]):
+                continue
+            brace_idx = self._held.rfind("}", m_meta.start(), m_meta.end())
+            if brace_idx != -1 and orphan[brace_idx]:
+                cuts.append((m_meta.start(), f"英文收尾自检残渣({_short_reason_preview(m_meta.group(0))})"))
+                break
+
+        # 4. 同义词轮换型收尾恐慌循环（即使没有 }，连续 3 句即熔断；单句出现先暂扣观察）
+        pending: Optional[int] = None
+        m_panic = _PANIC_CLOSURE_LOOP_RE.search(self._held)
+        if m_panic is not None:
+            if not end_probe.fence or len(re.findall(_PANIC_CLOSURE_CLAUSE, m_panic.group(0), re.IGNORECASE)) >= 5:
+                cuts.append((m_panic.start(), f"工具收尾恐慌循环({_short_reason_preview(m_panic.group(0))})"))
+        elif not end_probe.fence:
+            m_p1 = _PANIC_CLOSURE_SINGLE_RE.search(self._held)
+            if m_p1 is not None and len(self._held) - m_p1.start() < TAIL_SUSPECT:
+                pending = m_p1.start()
+
+        # 5. 句末孤立 } + 400 字多语种收尾念叨观察窗
+        while True:
+            brace = self._stray_close(self._held, protected, orphan)
+            if brace is None:
+                break
+            after = self._held[brace + 1 :]
+            if _is_chatter(after):
+                cuts.append((brace, _STRAY_BRACE_REASON))
+            elif len(after) < TAIL_SUSPECT:
+                pending = brace if pending is None else min(pending, brace)
+            else:
+                self._ok_abs = self._released + brace
+                continue
+            break
+
+        if cuts:
+            cut, why = min(cuts, key=lambda x: x[0])
+            out = self._held[:cut].rstrip(" \t")
+            self._halt(why)
+            return self._release(out)
+
+        # 6. 严格周期死循环检测（连续 >=12 次 且 >=600 字，回看 1600 字已放行历史）
+        window = self._sent_tail + self._held
+        rep_cut = find_runaway_repetition(window)
+        if rep_cut is not None and not any((self._sent_code + protected)[rep_cut:]):
+            keep = max(0, rep_cut - len(self._sent_tail))
+            out = self._held[:keep]
+            self._halt("同一小段文字无限重复（≥12次/600字）")
+            return self._release(out)
+
+        hold_from = len(self._held) - TAIL_HOLD
+        if pending is not None:
+            hold_from = min(hold_from, pending - TAIL_HOLD)
+        if hold_from <= 0:
+            return ""
+        out, self._held = self._held[:hold_from], self._held[hold_from:]
+        return self._release(out)
+
+    def flush(self, full_text_so_far: str = "") -> str:
+        """流/调用结束时放行暂扣尾窗，并仅在全文最末尾清理孤立未配对闭合残渣与念叨。"""
+        if self.halted:
+            return ""
+        out, self._held = self._held, ""
+        if not out:
+            return ""
+
+        protected, orphan, end_probe = _scan_tail_window(self._state, out)
+
+        # 0. 流末围栏未换行直接粘连工具溢出尾巴（如 ```")} ）
+        if end_probe.fence:
+            last_nl = out.rfind("\n")
+            line_start = last_nl + 1
+            last_line = out[line_start:]
+            m_glue = _FENCE_GLUED_OVERFLOW_RE.match(last_line)
+            if m_glue:
+                f_chars = m_glue.group(2)
+                if f_chars[0] == end_probe.fence and len(f_chars) >= end_probe.fence_len:
+                    keep_end = line_start + len(m_glue.group(1)) + len(f_chars)
+                    self.trimmed_at_eof = True
+                    self.reason = f"清理围栏末尾粘连工具尾({_short_reason_preview(out[keep_end:])})"
+                    return self._release(out[:keep_end])
+
+        # 1. 句末孤立 } 后跟着念叨，或流就停在一个孤立多余的 } 上
+        while out:
+            brace = self._stray_close(out, protected, orphan)
+            if brace is None:
+                break
+            after = out[brace + 1 :]
+            if (_is_chatter(after) or not after.strip()) and (full_text_so_far + out[:brace]).strip():
+                self.trimmed_at_eof = True
+                if _is_chatter(after):
+                    self.chatter_trimmed = True
+                    self.reason = _STRAY_BRACE_REASON
+                else:
+                    self.reason = "去掉了正文末尾孤立多余的 }"
+                out = out[:brace].rstrip(" \t")
+                return self._release(out)
+            self._ok_abs = self._released + brace
+
+        # 2. 流末 Done!}}] 或全未配对孤立右括号残渣（如 "]}) / ]})}"）
+        for pattern in (_DONE_TAIL_RE, _CLOSURE_TAIL_RE):
+            m = pattern.search(out)
+            if m is None:
+                continue
+            if any(protected[m.start() : m.end()]):
+                continue
+            closer_positions = [k for k in range(m.start(), m.end()) if out[k] in _CLOSER_CHARS]
+            if not closer_positions or not all(orphan[k] for k in closer_positions):
+                continue
+            if not (full_text_so_far + out[: m.start()]).strip():
+                continue
+            cluster = out[m.start() : m.end()]
+            closer_types = {out[k] for k in closer_positions}
+            # 若并非 Done! 且未以引号开头，要求至少 3 个混合括号且含 } 或 ]，避免误切正文正常单/双括号
+            if pattern is _CLOSURE_TAIL_RE and cluster[0] not in ('"', "'"):
+                if not (len(closer_positions) >= 3 and len(closer_types) >= 2 and ("}" in closer_types or "]" in closer_types)):
+                    continue
+            self.trimmed_at_eof = True
+            self.reason = f"去掉了正文末尾多余的闭合残片({_short_reason_preview(cluster)})"
+            out = out[: m.start()]
+            break
+
+        return self._release(out)
+
+
+def clean_synthetic_complete_text(
+    text: str,
+    tool_name: str = DEFAULT_SYNTHETIC_TOOL_NAME,
+    prefill_text: str = "",
+) -> Tuple[str, bool, str]:
+    """一次性清洗完整文本（非流式/假流式）。返回 (干净正文, 是否命中跑飞熔断, 原因)。"""
+    if not text:
+        return "", False, ""
+    use_pf = prefill_text if (prefill_text and not prefill_appears_repeated(prefill_text, text)) else ""
+    guard = SyntheticTailGuard(tool_name=tool_name, prefill_text=use_pf)
+    out = guard.feed(text)
+    out += guard.flush(out)
+    runaway_cut = bool(guard.halted or guard.chatter_trimmed)
+    return out, runaway_cut, guard.reason
+
+
 def analyze_synthetic_tail(
     text: str,
     emit_tool_name: str = DEFAULT_SYNTHETIC_TOOL_NAME,
@@ -971,318 +1407,30 @@ def analyze_synthetic_tail(
     at_eof: bool = True,
     reason_out: Optional[List[str]] = None,
 ) -> Tuple[str, bool, bool]:
-    """词法状态感知 + 分期尾窗检测与清洗核心引擎。
-    返回: (干净文本, 是否触发了溢出切除, 流中是否需扩容隔离窗口暂缓吐出)
+    """兼容旧签名的尾部检测入口（底层统一委托 SyntheticTailGuard）。
+    返回: (干净文本, 是否触发了溢出切除, 流中是否需暂扣观察)
     """
     if not text:
         return "", False, False
-
-    def _note_reason(msg: str) -> None:
-        if reason_out is not None:
-            reason_out.append(msg)
-
-    lex = base_lex.clone() if base_lex is not None else LexicalState()
-    metas, end_lex = lex.scan(text)
-    n = len(text)
-
-    # 消解同段内已配对闭合直双引号的 orphan_dquote 标记
-    open_dq_idx = -1
-    prev_bs = base_lex.prev_backslash if base_lex is not None else False
-    dq_open = base_lex.dquote_open if base_lex is not None else False
-    for i, ch in enumerate(text):
-        if metas[i].in_code:
-            prev_bs = False
-            continue
-        if ch == "\n":
-            dq_open = False
-            open_dq_idx = -1
-            prev_bs = False
-            continue
-        if ch == '"' and not prev_bs:
-            if dq_open:
-                dq_open = False
-                if open_dq_idx != -1:
-                    metas[open_dq_idx].orphan_dquote = False
-                    open_dq_idx = -1
-                metas[i].orphan_dquote = False
-            else:
-                dq_open = True
-                open_dq_idx = i
-                metas[i].orphan_dquote = True
-        prev_bs = (ch == "\\" and not prev_bs)
-
-    # 0. EOF 特判：最后一行闭合围栏未换行直接粘连工具溢出尾巴（如 ```")} ）
-    if at_eof and end_lex.in_fence:
-        last_nl = text.rfind("\n")
-        line_start = last_nl + 1
-        last_line = text[line_start:]
-        m_glue = _FENCE_GLUED_OVERFLOW_RE.match(last_line)
-        if m_glue:
-            f_chars = m_glue.group(2)
-            if f_chars[0] == end_lex.fence_char and len(f_chars) >= end_lex.fence_len:
-                keep_end = line_start + len(m_glue.group(1)) + len(f_chars)
-                _note_reason(f"围栏粘连工具尾({_short_reason_preview(text[keep_end:])})")
-                return text[:keep_end], True, False
-
-    # 1. 显式工具自检独白与控制伪词拦截（仅在代码块与行内代码作用域之外生效）
-    for m in _SELF_CHECK_RE.finditer(text):
-        start_pos = m.start()
-        if start_pos < n and not metas[start_pos].in_code:
-            matched_str = m.group(0)
-            if matched_str.lstrip("\"'}])\t !?").lower().startswith("done!"):
-                orphan_cnt = sum(
-                    1 for k in range(m.start(), m.end())
-                    if text[k] in _CLOSER_CHARS and metas[k].is_orphan_closer
-                )
-                if orphan_cnt < 2:
-                    continue
-            cut_pos = start_pos
-            if cut_pos < m.end() and text[cut_pos] == '"' and not metas[cut_pos].orphan_dquote:
-                cut_pos += 1
-            while (
-                cut_pos < m.end()
-                and text[cut_pos] in _CLOSER_CHARS
-                and not metas[cut_pos].is_orphan_closer
-            ):
-                cut_pos += 1
-            _note_reason(f"显式工具自检/控制词泄漏({_short_reason_preview(text[cut_pos:m.end()])})")
-            return text[:cut_pos], True, False
-
-    # 1b. 同义词轮换型收尾恐慌循环拦截（如 Let's stop.!》?>}] Let's end.!》?>}] Let's finish.!》?>}]）
-    m_panic = _PANIC_CLOSURE_LOOP_RE.search(text)
-    if m_panic is not None:
-        if not end_lex.in_fence or len(re.findall(_PANIC_CLOSURE_CLAUSE, m_panic.group(0), re.IGNORECASE)) >= 5:
-            cut_pos = m_panic.start()
-            _note_reason(f"工具收尾恐慌循环({_short_reason_preview(m_panic.group(0))})")
-            return text[:cut_pos], True, False
-
-    if emit_tool_name and emit_tool_name not in ("compose_reply", "router_emit") and emit_tool_name in text:
-        dyn_pat = re.compile(
-            r"(?:[\"']?[ \t]*[}\])]+[!?\s]*)?(?:\bLet['’]s\s+[^\n]{0,100}?\b"
-            + re.escape(emit_tool_name)
-            + r"\b|\}\s*"
-            + re.escape(emit_tool_name)
-            + r"\b)",
-            re.IGNORECASE,
-        )
-        for m_dyn in dyn_pat.finditer(text):
-            if not metas[m_dyn.start()].in_code:
-                cut_pos = m_dyn.start()
-                if cut_pos < m_dyn.end() and text[cut_pos] == '"' and not metas[cut_pos].orphan_dquote:
-                    cut_pos += 1
-                while (
-                    cut_pos < m_dyn.end()
-                    and text[cut_pos] in _CLOSER_CHARS
-                    and not metas[cut_pos].is_orphan_closer
-                ):
-                    cut_pos += 1
-                _note_reason(f"合成工具名自检泄漏({_short_reason_preview(text[cut_pos:m_dyn.end()])})")
-                return text[:cut_pos], True, False
-
-    # 2. 悬空多余闭合标签刷屏检测（完整保留合法配对的 </div>，仅切掉超出开启深度的多余闭合标签）
-    idx_scan = n - 1
-    while idx_scan >= 0 and text[idx_scan] in " \t\r\n":
-        idx_scan -= 1
-    if idx_scan >= 0 and text[idx_scan] == ">" and metas[idx_scan].orphan_close_tag_start != -1:
-        orphan_tag_starts: List[int] = []
-        pos = idx_scan
-        first_tag_norm = None
-        while pos >= 0:
-            while pos >= 0 and text[pos] in " \t\r\n":
-                pos -= 1
-            if pos < 0 or text[pos] != ">" or metas[pos].orphan_close_tag_start == -1:
-                break
-            t_start = metas[pos].orphan_close_tag_start
-            raw_tag = re.sub(r"\s+", "", text[t_start : pos + 1]).lower()
-            if first_tag_norm is None:
-                first_tag_norm = raw_tag
-            elif raw_tag != first_tag_norm:
-                break
-            orphan_tag_starts.append(t_start)
-            pos = t_start - 1
-
-        orphan_tag_cnt = len(orphan_tag_starts)
-        halt_tag_thresh = 8 if at_eof else 12
-        if orphan_tag_cnt >= halt_tag_thresh:
-            cut_at = orphan_tag_starts[-1]
-            while cut_at > 0 and text[cut_at - 1] in " \t":
-                cut_at -= 1
-            if cut_at > 0 and text[cut_at - 1] == "\n":
-                cut_at -= 1
-            _note_reason(f"悬空闭合标签刷屏({first_tag_norm}×{orphan_tag_cnt})")
-            return text[:cut_at], True, False
-        if not at_eof and orphan_tag_cnt >= 4:
-            return text, False, True
-
-    # 3. 单字符悬空右括号刷屏死循环（保留前面合法配对的括号，仅从首个悬空右括号切起）
-    p = n - 1
-    while p >= 0 and text[p] in " \t\r\n":
-        p -= 1
-    if p >= 0 and text[p] in _CLOSER_CHARS and not metas[p].in_code and metas[p].is_orphan_closer:
-        orphan_closer_indices: List[int] = []
-        q = p
-        while q >= 0 and (text[q] in _CLOSER_CHARS or text[q] in " \t"):
-            if text[q] in _CLOSER_CHARS:
-                if metas[q].in_code or not metas[q].is_orphan_closer:
-                    break
-                orphan_closer_indices.append(q)
-            q -= 1
-        if len(orphan_closer_indices) >= 16:
-            first_orphan = orphan_closer_indices[-1]
-            if first_orphan > 0 and text[first_orphan - 1] == '"' and metas[first_orphan - 1].orphan_dquote:
-                first_orphan -= 1
-            _note_reason(f"悬空右括号刷屏(×{len(orphan_closer_indices)})")
-            return text[:first_orphan], True, False
-        if not at_eof and len(orphan_closer_indices) >= 3:
-            return text, False, True
-
-    # 4. 本原周期退化死循环检测
-    suspect_hold = False
-    max_u = min(48, n // 2)
-    best_cut: Optional[int] = None
-    best_cut_reason: str = ""
-
-    def _update_best(cut_pos: int, r_msg: str) -> None:
-        nonlocal best_cut, best_cut_reason
-        if best_cut is None or cut_pos < best_cut:
-            best_cut = cut_pos
-            best_cut_reason = r_msg
-
-    for ulen in range(2, max_u + 1):
-        unit = text[n - ulen :]
-        if _primitive_period(unit) != ulen:
-            continue
-        non_ws = [c for c in unit if c not in " \t\r\n"]
-        if not non_ws:
-            continue
-        if _is_pure_layout_unit(non_ws):
-            continue
-
-        repeats = 1
-        curr = n - ulen
-        while curr >= ulen and text[curr - ulen : curr] == unit:
-            repeats += 1
-            curr -= ulen
-
-        if repeats < 2:
-            continue
-
-        total_rep_chars = repeats * ulen
-        unit_low = unit.lower()
-
-        if any(tok in unit_low for tok in _KNOWN_LEAK_TOKENS) or (
-            emit_tool_name and emit_tool_name.lower() in unit_low
-        ):
-            if not metas[curr].in_code:
-                _update_best(curr, f"工具控制词周期泄漏({_short_reason_preview(unit)}×{repeats})")
-                continue
-
-        if all(c in " \t\r\n}])\"'`" for c in unit) and any(c in _CLOSER_CHARS for c in unit):
-            first_all_orphan_rep_start: Optional[int] = None
-            orphan_reps = 0
-            for r_idx in range(repeats):
-                seg_start = curr + r_idx * ulen
-                seg_end = seg_start + ulen
-                closers_in_seg = [
-                    k for k in range(seg_start, seg_end) if text[k] in _CLOSER_CHARS
-                ]
-                if closers_in_seg and all(
-                    (not metas[k].in_code and metas[k].is_orphan_closer) for k in closers_in_seg
-                ):
-                    if first_all_orphan_rep_start is None:
-                        first_all_orphan_rep_start = seg_start
-                    orphan_reps += 1
-                else:
-                    first_all_orphan_rep_start = None
-                    orphan_reps = 0
-
-            if orphan_reps >= 2 and first_all_orphan_rep_start is not None:
-                if at_eof or (orphan_reps >= 4 and orphan_reps * ulen >= 10):
-                    _update_best(
-                        first_all_orphan_rep_start,
-                        f"悬空括号周期刷屏({_short_reason_preview(unit)}×{orphan_reps})",
-                    )
-                    continue
-                else:
-                    suspect_hold = True
-
-        stripped_u = unit.strip()
-        if stripped_u.startswith("</") and stripped_u.endswith(">"):
-            continue
-        # 若重复片段中包含已合法配对闭合的 HTML/XML 标签（如多层状态栏闭合 </div></section>），予以周期裁剪豁免
-        if any(metas[k].paired_close_tag for k in range(curr, n)):
-            continue
-
-        is_table_row_seg = ("|" in unit and "\n" not in unit)
-        has_unclosed_container = any(v > 0 for v in end_lex.html_open_counts.values())
-        in_code_block = bool(metas[curr].in_code or end_lex.is_currently_in_code())
-        if is_table_row_seg or in_code_block or (not at_eof and has_unclosed_container):
-            # 表格、代码块及未闭合 XML/HTML 容器内部放宽重复阈值，避免误杀合法结构化内容
-            min_total_len = 320
-            min_reps = 20
-        elif not at_eof:
-            # 流中普通文本在 14 次 / 180 字处止损，兼顾防误杀与及时切断复读死循环
-            min_total_len = 180
-            min_reps = 14
-        else:
-            min_total_len = 160
-            min_reps = 12
-
-        if repeats >= min_reps and total_rep_chars >= min_total_len:
-            _update_best(curr, f"周期重复退化(单元='{_short_reason_preview(unit, 24)}', 重复{repeats}次/{total_rep_chars}字)")
-        elif not at_eof and repeats >= (8 if (has_unclosed_container or in_code_block) else 5) and total_rep_chars >= (80 if (has_unclosed_container or in_code_block) else 48):
-            suspect_hold = True
-
-    if best_cut is not None:
-        _note_reason(best_cut_reason or "周期退化熔断")
-        return text[:best_cut], True, False
-
-    # 5. 流末 (at_eof=True) 专属：切除全文最末尾单发悬空工具闭合残片（如 ")} 、 "]})} 、 ]})) 、 """) ）
-    if at_eof and not end_lex.is_currently_in_code():
-        m_eof = _EOF_CLOSER_CLUSTER_RE.search(text)
-        if m_eof:
-            c_start, c_end = m_eof.span()
-            if not metas[c_start].in_code:
-                closer_positions = [
-                    k for k in range(c_start, c_end) if text[k] in _CLOSER_CHARS
-                ]
-                if closer_positions and all(metas[k].is_orphan_closer for k in closer_positions):
-                    cluster = text[c_start:c_end]
-                    closer_types = {text[k] for k in closer_positions}
-                    starts_with_quote = cluster[0] in ('"', "'")
-
-                    should_trim = False
-                    if starts_with_quote:
-                        if cluster.startswith(('"""', "'''")) and len(closer_positions) >= 1:
-                            should_trim = True
-                        elif cluster[0] == '"' and metas[c_start].orphan_dquote:
-                            if ("}" in closer_types or ")" in closer_types) and (
-                                len(closer_positions) >= 2 or "}" in closer_types
-                            ):
-                                should_trim = True
-                    else:
-                        if len(closer_positions) >= 3 and len(closer_types) >= 2 and (
-                            "}" in closer_types or "]" in closer_types
-                        ):
-                            should_trim = True
-
-                    if should_trim:
-                        _note_reason(f"流末悬空闭合残片({_short_reason_preview(cluster)})")
-                        return text[:c_start], True, False
-
-    # 6. 流中 (at_eof=False) 检查末尾是否有半截自检前缀或单发恐慌闭合残句，需暂扣在隔离窗口观察
-    if not at_eof:
-        tail_probe = text[-180:] if n > 180 else text
-        if not end_lex.in_fence and _PANIC_CLOSURE_SINGLE_RE.search(tail_probe):
-            suspect_hold = True
-        elif not end_lex.is_currently_in_code():
-            m_susp = _SUSPECT_SELF_CHECK_PREFIX_RE.search(tail_probe)
-            if m_susp:
-                abs_pos = (n - len(tail_probe)) + m_susp.start()
-                if not metas[abs_pos].in_code:
-                    suspect_hold = True
-
-    return text, False, suspect_hold
+    guard = SyntheticTailGuard(tool_name=emit_tool_name)
+    if base_lex is not None:
+        guard._state.fence = base_lex.fence_char if base_lex.in_fence else ""
+        guard._state.fence_len = base_lex.fence_len if base_lex.in_fence else 0
+        guard._state.inline = base_lex.inline_tick_len
+        guard._state.stack = list(base_lex.bracket_stack)
+    emitted = guard.feed(text)
+    if guard.halted:
+        if reason_out is not None and guard.reason:
+            reason_out.append(guard.reason)
+        return emitted, True, False
+    if at_eof:
+        flushed = guard.flush(emitted)
+        full = emitted + flushed
+        trimmed = bool(guard.trimmed_at_eof or guard.chatter_trimmed)
+        if trimmed and reason_out is not None and guard.reason:
+            reason_out.append(guard.reason)
+        return full, trimmed, False
+    return text, False, len(guard._held) > TAIL_HOLD
 
 
 def sanitize_synthetic_tail(
@@ -1291,9 +1439,7 @@ def sanitize_synthetic_tail(
     base_lex: Optional[LexicalState] = None,
     at_eof: bool = True,
 ) -> Tuple[str, bool]:
-    """检测并平滑切除尾部闭合溢出（兼容原函数签名，内部委托词法感知引擎）。
-    返回: (干净文本, 是否触发了闭合熔断)
-    """
+    """检测并平滑切除尾部闭合溢出（兼容原函数签名）。"""
     clean, halted, _ = analyze_synthetic_tail(
         text,
         emit_tool_name=emit_tool_name or DEFAULT_SYNTHETIC_TOOL_NAME,
@@ -1301,6 +1447,85 @@ def sanitize_synthetic_tail(
         at_eof=at_eof,
     )
     return clean, halted
+
+
+def _scan_truncated_json_content(raw: str) -> Optional[str]:
+    """当字符串形式的 args 被截断导致 json.loads 失败时，有界提取 "content" 字符串已生成部分。"""
+    s = (raw or "").strip()
+    if not s.startswith("{") or '"content"' not in s:
+        return None
+    key_idx = s.find('"content"')
+    rest = s[key_idx + len('"content"') :]
+    colon = rest.find(":")
+    if colon < 0:
+        return None
+    rest = rest[colon + 1 :].lstrip(" \t\r\n")
+    if not rest.startswith('"'):
+        return None
+    rest = rest[1:]
+    out: List[str] = []
+    esc = False
+    uni = 0
+    uni_val = 0
+    surr = 0
+    for c in rest:
+        if uni > 0:
+            if "0" <= c <= "9":
+                v = ord(c) - ord("0")
+            elif "a" <= c <= "f":
+                v = ord(c) - ord("a") + 10
+            elif "A" <= c <= "F":
+                v = ord(c) - ord("A") + 10
+            else:
+                v = -1
+            if v >= 0:
+                uni_val = (uni_val << 4) | v
+                uni -= 1
+                if uni == 0:
+                    if surr != 0:
+                        if 0xDC00 <= uni_val <= 0xDFFF:
+                            out.append(chr(((surr - 0xD800) << 10) + (uni_val - 0xDC00) + 0x10000))
+                        else:
+                            out.append("\ufffd")
+                            out.append(chr(uni_val))
+                        surr = 0
+                    elif 0xD800 <= uni_val <= 0xDBFF:
+                        surr = uni_val
+                    else:
+                        out.append(chr(uni_val))
+                    uni_val = 0
+            else:
+                out.append("\ufffd")
+                uni = 0
+                uni_val = 0
+                surr = 0
+        elif esc:
+            esc = False
+            if c in ('"', "\\", "/"):
+                out.append(c)
+            elif c == "b":
+                out.append("\b")
+            elif c == "f":
+                out.append("\f")
+            elif c == "n":
+                out.append("\n")
+            elif c == "r":
+                out.append("\r")
+            elif c == "t":
+                out.append("\t")
+            elif c == "u":
+                uni = 4
+                uni_val = 0
+            else:
+                out.append("\ufffd")
+        elif c == "\\":
+            esc = True
+        elif c == '"':
+            break
+        else:
+            out.append(c)
+    res = "".join(out)
+    return res if res else None
 
 
 def _unwrap_nested_json_if_needed(text: str, emit_tool_name: str = DEFAULT_SYNTHETIC_TOOL_NAME) -> str:
@@ -1315,14 +1540,12 @@ def _unwrap_nested_json_if_needed(text: str, emit_tool_name: str = DEFAULT_SYNTH
             parsed = json.loads(s)
             if isinstance(parsed, dict) and parsed:
                 keys = set(parsed.keys())
-                # 情况 1: 纯单键 {"content": "..."} 或双键 {"content": "...", "done": true} 双重序列化
                 if (
                     keys in ({"content"}, {"content", "done"})
                     and isinstance(parsed.get("content"), str)
                     and parsed["content"]
                 ):
                     return parsed["content"]
-                # 情况 2: 显式携带合成工具名的自包装对象 {"name": "compose_reply", "arguments": ...}
                 p_name = str(parsed.get("name") or parsed.get("tool") or "").strip()
                 if p_name and p_name in (emit_tool_name, DEFAULT_SYNTHETIC_TOOL_NAME):
                     inner = parsed.get("args") or parsed.get("arguments") or parsed
@@ -1338,11 +1561,15 @@ def _unwrap_nested_json_if_needed(text: str, emit_tool_name: str = DEFAULT_SYNTH
                                 return val
         except Exception:
             pass
+    elif s.startswith("{"):
+        recovered = _scan_truncated_json_content(s)
+        if recovered:
+            return recovered
     return text
 
 
 def extract_raw_synthetic_text(args: Any, emit_tool_name: str = DEFAULT_SYNTHETIC_TOOL_NAME) -> str:
-    """从合成工具 args 中提取未经尾部裁剪的原始文本（供流式组装器统一经词法追踪器处理）。"""
+    """从合成工具 args 中提取未经尾部裁剪的原始文本（供流式组装器统一经尾部保护器处理）。"""
     if args is None:
         return ""
     if isinstance(args, str):
@@ -1362,18 +1589,19 @@ def extract_synthetic_content(
     args: Any,
     emit_tool_name: str = DEFAULT_SYNTHETIC_TOOL_NAME,
     prefill_text: str = "",
+    halted_out: Optional[List[str]] = None,
 ) -> str:
-    """从合成工具的 args 字典中提取正文 content，并基于词法状态精确清理尾部闭合溢出残片。"""
+    """从合成工具的 args 字典中提取正文 content，并经融合尾部保护器精确清理跑飞内容与残片。"""
     raw_val = extract_raw_synthetic_text(args, emit_tool_name=emit_tool_name)
     if not raw_val:
         return ""
-    base_lex: Optional[LexicalState] = None
-    if prefill_text and not prefill_appears_repeated(prefill_text, raw_val):
-        base_lex = LexicalState()
-        base_lex.feed(prefill_text)
-    clean_val, _ = sanitize_synthetic_tail(
-        raw_val, emit_tool_name=emit_tool_name, base_lex=base_lex, at_eof=True
+    clean_val, runaway_cut, reason = clean_synthetic_complete_text(
+        raw_val,
+        tool_name=emit_tool_name or DEFAULT_SYNTHETIC_TOOL_NAME,
+        prefill_text=prefill_text,
     )
+    if runaway_cut and halted_out is not None:
+        halted_out.append(reason or "跑飞截断")
     return clean_val
 
 

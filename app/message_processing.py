@@ -17,7 +17,7 @@ from signature_store import (
 )
 from synthetic_wrapper import (
     LexicalState,
-    analyze_synthetic_tail,
+    SyntheticTailGuard,
     build_sandbox_control_instruction,
     extract_raw_synthetic_text,
     extract_synthetic_content,
@@ -1053,10 +1053,10 @@ def _set_json_path_value(root: Dict[str, Any], tokens: List[Any], value: Any, ap
 class FunctionCallStreamAssembler:
     """将 Gemini streamFunctionCallArguments 的分片 FunctionCall (partialArgs / willContinue)
     安全聚合成完整的函数调用事件，同时支持合成传输工具 (compose_reply) 的实时流式直通拆包、
-    词法状态追踪（保护 Python 代码与酒馆前端美化）及动态隔离尾窗防闭合溢出熔断。"""
+    融合低误杀尾部保护（SyntheticTailGuard）与二次重复调用前缀抑制。"""
 
-    _TAIL_HOLD_CHARS = 96
-    _MAX_QUARANTINE_CHARS = 640
+    _SAME_DRAFT_PROBE = 40
+    _MAX_FULL_TRACK = 200_000
 
     def __init__(self, synthetic_tool_name: str = "", prefill_text: str = ""):
         self._pending: Optional[Dict[str, Any]] = None
@@ -1072,14 +1072,21 @@ class FunctionCallStreamAssembler:
         self._synth_signature: Optional[bytes] = None
         self._turn_signature: Optional[bytes] = None
         self._real_calls_emitted: int = 0
-        self._synth_tail_buf: str = ""
         self._synth_total_received: int = 0
         self._cur_synth_call_head: str = ""
         self._cur_synth_call_len: int = 0
         self._last_synth_call_head: str = ""
         self._last_synth_call_len: int = 0
-        self._lex_state: LexicalState = LexicalState()
-        self._lex_seeded: bool = not bool(self.prefill_text)
+        self._full_emitted: str = ""
+        self._head_sample: str = ""
+        self._prefill_checked: bool = not bool(self.prefill_text)
+        self._tail_guard: SyntheticTailGuard = SyntheticTailGuard(tool_name=self.synthetic_tool_name)
+        # 第二次重复调用探测状态（流式下先扣住前 40 字确认是否从头复述第一遍正文）
+        self._dup_probe: Optional[str] = None
+        self._dup_probe_base: str = ""
+        self._dup_base: Optional[str] = None
+        self._dup_acc: str = ""
+        self._dup_sent: int = 0
 
     def note_turn_signature(self, sig: Optional[bytes]) -> None:
         """记录本轮候选在普通文本/思考 Part 或收尾块上收到的真实思考签名，供同轮无独立签名的首个工具调用自动继承。"""
@@ -1096,22 +1103,62 @@ class FunctionCallStreamAssembler:
             self._real_calls_emitted += 1
         return calls
 
-    def _ensure_lex_seeded(self, force: bool = False) -> None:
-        if self._lex_seeded:
+    def _ensure_guard_seeded(self, force: bool = False) -> None:
+        if self._prefill_checked:
             return
         probe_target = min(len(self.prefill_text.lstrip(" \t\r\n")), 24)
-        cur_non_ws = len(self._synth_tail_buf.lstrip(" \t\r\n"))
+        cur_non_ws = len(self._head_sample.lstrip(" \t\r\n"))
         if not force and cur_non_ws < max(4, probe_target):
             return
-        self._lex_seeded = True
-        if not prefill_appears_repeated(self.prefill_text, self._synth_tail_buf):
-            self._lex_state.feed(self.prefill_text)
+        self._prefill_checked = True
+        if not prefill_appears_repeated(self.prefill_text, self._head_sample):
+            self._tail_guard.seed_prefill(self.prefill_text)
+
+    def _record_emitted(self, text: str) -> str:
+        if text and len(self._full_emitted) < self._MAX_FULL_TRACK:
+            self._full_emitted += text[: self._MAX_FULL_TRACK - len(self._full_emitted)]
+        return text
+
+    def _filter_duplicate_call(self, delta: str, final: bool = False) -> Tuple[str, bool]:
+        """处理同轮第二次 compose_reply 调用的重复前缀抑制与差值续接。返回 (放行增量, 是否应立即收口熔断)。"""
+        if self._dup_probe is not None:
+            self._dup_probe += delta or ""
+            if len(self._dup_probe.strip()) < self._SAME_DRAFT_PROBE and not final:
+                return "", False
+            probe, self._dup_probe = self._dup_probe, None
+            p_strip = probe.strip()
+            head = min(self._SAME_DRAFT_PROBE, len(p_strip))
+            if head >= 20 and self._dup_probe_base[:head] == p_strip[:head]:
+                print("⚠️ [抗截断保护] 检测到模型重复发起 compose_reply 复述正文，已自动抑制重复前缀。")
+                self._dup_base = self._dup_probe_base
+                self._dup_acc = ""
+                self._dup_sent = 0
+                delta = probe
+            else:
+                delta = probe
+
+        if self._dup_base is not None:
+            self._dup_acc += delta or ""
+            acc = self._dup_acc.lstrip()
+            base = self._dup_base
+            if len(acc) <= len(base):
+                if base.startswith(acc.rstrip()) or base.startswith(acc):
+                    return "", False
+                return "", True
+            if acc.startswith(base):
+                extra = acc[len(base) :]
+                out_extra = extra[self._dup_sent :]
+                self._dup_sent = len(extra)
+                return out_extra, False
+            return "", True
+
+        return delta, False
 
     def has_pending(self) -> bool:
         return self._pending is not None
 
     def has_received_synthetic_text(self) -> bool:
-        return self._synth_total_received > 0 or bool(self._synth_tail_buf)
+        return self._synth_total_received > 0 or bool(self._tail_guard._held)
 
     def has_unclosed_synthetic(self) -> bool:
         return bool(self._pending_is_synthetic)
@@ -1123,25 +1170,31 @@ class FunctionCallStreamAssembler:
         return sig
 
     def flush_synthetic_tail(self) -> str:
-        """冲刷合成工具滑动尾窗中剩余的文本（流结束时调用，执行 EOF 级词法感知修剪）。"""
+        """冲刷合成工具滑动尾窗中剩余的文本（流结束时调用，执行 EOF 级孤立闭合残片与收尾念叨修剪）。"""
         self._saw_synth_partial = False
         self._pending_is_synthetic = False
         self._last_synth_path = ""
-        if not self._synth_tail_buf:
+        if self.synthetic_halted:
             return ""
-        raw = self._synth_tail_buf
-        self._synth_tail_buf = ""
-        if self.synthetic_halted or self._synth_eof_sealed:
-            return ""
-        self._ensure_lex_seeded(force=True)
-        clean, _halted, _ = analyze_synthetic_tail(
-            raw,
-            emit_tool_name=self.synthetic_tool_name,
-            base_lex=self._lex_state,
-            at_eof=True,
-        )
-        self._lex_state.feed(clean)
-        return clean
+        extra_out = ""
+        if self._dup_probe is not None or self._dup_base is not None:
+            rem_d, dup_stop = self._filter_duplicate_call("", final=True)
+            if rem_d:
+                self._ensure_guard_seeded(force=True)
+                extra_out += self._tail_guard.feed(rem_d)
+            if dup_stop and not self._tail_guard.halted:
+                self.synthetic_halted = True
+                self.synthetic_halt_reason = "模型重复发起 compose_reply 并复述正文"
+        if self._tail_guard.halted:
+            self.synthetic_halted = True
+            self.synthetic_halt_reason = self._tail_guard.reason or "闭合溢出"
+            return self._record_emitted(extra_out)
+        self._ensure_guard_seeded(force=True)
+        flushed = self._tail_guard.flush(self._full_emitted + extra_out)
+        if self._tail_guard.chatter_trimmed and not self.synthetic_halted:
+            self.synthetic_halted = True
+            self.synthetic_halt_reason = self._tail_guard.reason or "收尾念叨切除"
+        return self._record_emitted(extra_out + flushed)
 
     def feed_with_synthetic(
         self, fc: Any, thought_signature: Optional[bytes] = None
@@ -1184,13 +1237,17 @@ class FunctionCallStreamAssembler:
                 return [], "", None
 
             if self._synth_eof_sealed:
-                # 若同轮显式发起了一次全新的 compose_reply 调用（而非上一次调用的无名/空收尾残片），解除封口续接后半段正文
+                # 若同轮显式发起了一次全新的 compose_reply 调用（而非上一次调用的无名/空收尾残片），解除封口并启用重复探测
                 if fc_name == self.synthetic_tool_name and (has_args or has_partial or fc_will_continue):
                     self._synth_eof_sealed = False
                     self._saw_synth_partial = False
                     self._last_synth_path = ""
                     self._cur_synth_call_head = ""
                     self._cur_synth_call_len = 0
+                    base_prev = self._full_emitted.strip()
+                    if len(base_prev) >= self._SAME_DRAFT_PROBE and self._dup_probe is None and self._dup_base is None:
+                        self._dup_probe = ""
+                        self._dup_probe_base = base_prev
                 else:
                     if thought_signature:
                         self._synth_signature = thought_signature
@@ -1229,7 +1286,6 @@ class FunctionCallStreamAssembler:
                         has_done_val, done_val, p_wc = _extract_partial_arg_value(parg)
                         if p_wc:
                             any_parg_wc = True
-                        # 仅当 done 为真（或省略布尔值）时才视作收敛信号；done=false 表示仍在分段续写，不可提前封口
                         if not has_done_val or done_val is not False:
                             saw_done_signal = True
                         continue
@@ -1258,22 +1314,44 @@ class FunctionCallStreamAssembler:
 
             incoming_text = "".join(synth_deltas)
             if incoming_text:
-                self._synth_tail_buf += incoming_text
                 self._synth_total_received += len(incoming_text)
                 self._cur_synth_call_len += len(incoming_text)
                 if len(self._cur_synth_call_head) < 120:
                     need_h = 120 - len(self._cur_synth_call_head)
                     self._cur_synth_call_head += incoming_text[:need_h]
+                if len(self._head_sample) < 64:
+                    self._head_sample += incoming_text[: 64 - len(self._head_sample)]
 
             should_seal = bool(
                 saw_done_signal
                 or (not has_partial and not eff_will_continue)
             )
-            self._ensure_lex_seeded(force=should_seal)
+
+            filtered_text, dup_stop = self._filter_duplicate_call(incoming_text, final=should_seal)
+            self._ensure_guard_seeded(force=(should_seal or dup_stop or len(self._head_sample) >= 24))
+
+            out_text = ""
+            if filtered_text:
+                out_text = self._tail_guard.feed(filtered_text)
+
+            if self._tail_guard.halted or dup_stop:
+                if dup_stop and not self._tail_guard.halted:
+                    out_text += self._tail_guard.flush(self._full_emitted + out_text)
+                    self.synthetic_halt_reason = "模型重复发起 compose_reply 并复述正文"
+                else:
+                    self.synthetic_halt_reason = self._tail_guard.reason or "闭合溢出"
+                self.synthetic_halted = True
+                self._pending_is_synthetic = False
+                self._saw_synth_partial = False
+                self._last_synth_path = ""
+                self._synth_eof_sealed = True
+                sig_to_emit = self._synth_signature
+                self._synth_signature = None
+                return ready_real, self._record_emitted(out_text), sig_to_emit
 
             if should_seal:
                 # 仅在收到 $.done=true、非分片整包结束或显式空收尾帧时才进入收口并冲刷尾窗；
-                # 若分片流中某个 $.content 块漏带 will_continue 且尚未收到 $.done，绝不提前按 EOF 裁剪或封口丢弃后续正文！
+                # 若分片流中某个 $.content 块漏带 will_continue 且尚未收到收尾帧，绝不提前按 EOF 裁剪或封口丢弃后续正文！
                 self._last_synth_path = ""
                 if not eff_will_continue:
                     self._saw_synth_partial = False
@@ -1282,70 +1360,28 @@ class FunctionCallStreamAssembler:
                         self._last_synth_call_len = self._cur_synth_call_len
                         self._cur_synth_call_head = ""
                         self._cur_synth_call_len = 0
-                clean_buf, trimmed, _ = analyze_synthetic_tail(
-                    self._synth_tail_buf,
-                    emit_tool_name=self.synthetic_tool_name,
-                    base_lex=self._lex_state,
-                    at_eof=True,
-                )
-                self._synth_tail_buf = ""
-                self._lex_state.feed(clean_buf)
-                if (not eff_will_continue) or trimmed:
+                flushed = self._tail_guard.flush(self._full_emitted + out_text)
+                out_text += flushed
+                if self._tail_guard.chatter_trimmed:
+                    self.synthetic_halted = True
+                    self.synthetic_halt_reason = self._tail_guard.reason or "收尾念叨切除"
+                if (not eff_will_continue) or self._tail_guard.trimmed_at_eof or self._tail_guard.halted:
                     self._synth_eof_sealed = True
                 sig_to_emit = self._synth_signature
                 self._synth_signature = None
-                return ready_real, clean_buf, sig_to_emit
-
-            # 流式进行期 (fc_will_continue=True)：仅拦截高置信工具泄漏与真退化死循环，对疑似片段启用动态隔离窗口
-            if not self._lex_seeded:
-                base_for_check = LexicalState()
-                if self.prefill_text and not prefill_appears_repeated(self.prefill_text, self._synth_tail_buf):
-                    base_for_check.feed(self.prefill_text)
-            else:
-                base_for_check = self._lex_state
-
-            halt_reasons: List[str] = []
-            clean_buf, halted, suspect_hold = analyze_synthetic_tail(
-                self._synth_tail_buf,
-                emit_tool_name=self.synthetic_tool_name,
-                base_lex=base_for_check,
-                at_eof=False,
-                reason_out=halt_reasons,
-            )
-            if halted:
-                self.synthetic_halted = True
-                self.synthetic_halt_reason = halt_reasons[0] if halt_reasons else "闭合溢出"
-                self._pending_is_synthetic = False
-                self._saw_synth_partial = False
-                self._last_synth_path = ""
-                self._synth_tail_buf = ""
-                self._ensure_lex_seeded(force=True)
-                self._lex_state.feed(clean_buf)
-                sig_to_emit = self._synth_signature
-                self._synth_signature = None
-                return ready_real, clean_buf, sig_to_emit
-
-            hold_limit = self._MAX_QUARANTINE_CHARS if suspect_hold else self._TAIL_HOLD_CHARS
-            if len(self._synth_tail_buf) > hold_limit:
-                self._ensure_lex_seeded(force=True)
-                cut = len(self._synth_tail_buf) - hold_limit
-                out_text = self._synth_tail_buf[:cut]
-                self._synth_tail_buf = self._synth_tail_buf[cut:]
-                self._lex_state.feed(out_text)
-            else:
-                out_text = ""
+                return ready_real, self._record_emitted(out_text), sig_to_emit
 
             sig_to_emit = None
             if out_text:
                 sig_to_emit = self._synth_signature
                 self._synth_signature = None
-            return ready_real, out_text, sig_to_emit
+            return ready_real, self._record_emitted(out_text), sig_to_emit
 
         # 若此前处于合成工具分片但本块切换到了真实工具名，先冲刷合成尾窗再处理真实工具调用
         flushed_synth = ""
         flushed_sig: Optional[bytes] = None
         if fc_name and self.synthetic_tool_name and fc_name != self.synthetic_tool_name:
-            if self._synth_tail_buf:
+            if self._tail_guard._held or self._dup_probe is not None:
                 flushed_synth = self.flush_synthetic_tail()
                 flushed_sig = self.pop_synth_signature()
             self._pending_is_synthetic = False
@@ -2356,6 +2392,7 @@ def process_gemini_response_to_openai_dict(
 
             # 预扫描是否命中了合成输出工具
             synthetic_texts: List[str] = []
+            synthetic_halted_reasons: List[str] = []
             synthetic_hit = False
             if synthetic_tool_name:
                 for p_chk in parts_in_order:
@@ -2366,12 +2403,17 @@ def process_gemini_response_to_openai_dict(
                             getattr(fc_chk, "args", None),
                             emit_tool_name=synthetic_tool_name,
                             prefill_text=prefill_text,
+                            halted_out=synthetic_halted_reasons,
                         )
                         if extracted:
                             synthetic_texts.append(extracted)
             if synthetic_hit:
                 # 单一事实来源（防拼接）：使用合成工具提取出的 content 覆盖普通文本，保留 reasoning_str
                 normal_content_str = "".join(synthetic_texts)
+                if synthetic_halted_reasons and normal_content_str.strip() and openai_finish_reason == "length":
+                    # 长度是被正文后面的跑飞尾巴烧完的，正文已完整清理，按正常 stop 交付避免前端误报 max_tokens
+                    print(f"⚠️ [抗截断保护] 非流式/假流式已切除正文尾部跑飞内容（{synthetic_halted_reasons[0]}），恢复 finish_reason=stop。")
+                    openai_finish_reason = "stop"
 
             if app_state.get_setting("safety_score", app_config.SAFETY_SCORE) and hasattr(candidate, "safety_ratings") and candidate.safety_ratings:
                 normal_content_str += _create_safety_ratings_html(candidate.safety_ratings)
