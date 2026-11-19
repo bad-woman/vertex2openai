@@ -25,13 +25,17 @@
 - **非流式续传轮询返回完整 `payload`（`GET /v1/resumable/{stream_id}`）**：针对 `buf.kind == "json"` 在完成后直接返回 `payload` 与 `status_code`，且仅在实际交付非错误有效 `payload` 后才执行 `mark_delivered()`，解决轮询拿到空 `events: []` 却误标已交付导致同 ID 重试重复调用上游的问题；
 - **Express 假流式支持 `stream_options: {"include_usage": true}`**：`_chunk_openai_response_dict_for_sse` 新增 `include_usage` 参数并在调用处透传 `wants_usage(exp_req_obj)` 与守恒校核后的 `usage`，开启时在 `[DONE]` 前下发 `choices: []` 的 `usage` 帧，关闭时保持原帧序列完全不变。
 
-### 4. 流式抗截断防误杀、分段续接与上游静默断流识别（`app/synthetic_wrapper.py`、`app/message_processing.py`、`app/api_helpers.py`、`app/upstreams/cookie_proxy.py`）
-- **大幅降低流中熔断误杀**：
-  - `LexicalState` 单个 HTML 开标签追踪上限由 256 放宽至 2048 字符并支持超长自闭合标签识别，解决酒馆长 `style` 美化卡片开标签漏记引发的 `</div>` 悬空误切；悬空闭合标签熔断阈值提升至 `8(EOF)/12(流中)`；
-  - 新增 Unicode 排版/装饰符号豁免（`_is_pure_layout_unit`），`✦ ◆ ◇ ★ ☆ · • █ ░ ▒ ▓ ╭ ╯` 等分割线与进度条不再触发周期重复误杀，同时保持对悬空 `})]` 与工具控制词的高敏拦截；
-  - 流中普通周期重复门槛由 `10 次/120 字` 提升至 `20 次/320 字`（表格、代码块及未闭合 HTML/XML 容器内为 `24 次/400 字`），在 640 字隔离窗内仍可止损真复读机死循环，大幅减少正常长文与代码误切。
-- **支持同轮二次 `compose_reply` 续接 & 修复 `$.done=false` 提前封口**：`FunctionCallStreamAssembler` 允许同轮显式发起的新 `compose_reply` 解除封口续接后半段（带重复调用去重保护），且仅当 `$.done` 为真时触发收敛冲刷。
-- **上游静默断流识别与日志透明化**：当上游流未返回任何 `finish_reason` 即提前断开时，不再伪装补发 `finish_reason="stop"`，改标 `finish_reason="length"` 并输出明确告警；抗截断熔断日志附带具体命中规则与片段预览，收尾日志准确区分「抗截断提前收口 / 上游静默断流 / 达上限截断 / 正常完成」。
+### 4. 流式抗截断防误杀、收尾恐慌循环拦截与日志精准化（`app/synthetic_wrapper.py`、`app/message_processing.py`、`app/api_helpers.py`、`app/upstreams/cookie_proxy.py`、`app/main.py`）
+- **根治 Gemini 4 工具收尾恐慌死循环**：
+  - 修复 `LexicalState` 单行未闭合反引号（`` ` ``）长期停留在 `in_code=True` 导致整段防溢出规则失明的 Bug（行内反引号超 200 字或跨行超 80 字自动失效），并排除数学小于号 `< 5` 干扰 HTML 标签追踪；
+  - 扩展 `_SELF_CHECK_RE` 与 `_SUSPECT_SELF_CHECK_PREFIX_RE`，覆盖 `Let's finish/close/end/stop/fix ... tool call / function call / JSON / done:true}` 及裸漏 `,done:true}`；
+  - 新增同义词轮换型收尾恐慌循环检测（`_PANIC_CLOSURE_LOOP_RE`），在 `Let's stop.!》?>}] Let's end.!》?>}] Let's finish.!》?>}]` 类非固定周期循环的第 3 句立即熔断止损，防止刷爆 `MAX_TOKENS`。
+- **精准区分装饰符号与乱码、降低误截断**：
+  - `LexicalState` 单个 HTML 开标签追踪上限放宽至 2048 字符并支持超长自闭合标签识别，悬空闭合标签熔断门槛提升至 `8(EOF)/12(流中)`；
+  - 收窄 `_is_pure_layout_unit` 仅豁免真正的排版分割线/进度条/装饰符号（`─━═█░✦◆·` 等），不再误豁免 `! ? > < 》 »` 乱码；流中普通周期重复平衡至 `14 次/180 字`（表格、代码块及未闭合 HTML/XML 容器内为 `20 次/320 字`）。
+- **防分片提前封口 & 消除假 `max_tokens` 误报**：
+  - `FunctionCallStreamAssembler` 合并 `partialArgs[].willContinue`，在 `$.content` 分片未收到 `$.done=true` 时绝不因单帧漏带 `will_continue` 永久封口吞掉后续正文；支持同轮显式二次 `compose_reply` 续接（含去重）并修复 `$.done=false` 提前封口；
+  - 取消上游静默断流强制伪造 `finish_reason="length"`（仅在日志告警，避免客户端误报 `max_tokens`），并在日志与调用记录面板明确打印上游原始 `finish_reason`（区分真实 `MAX_TOKENS` 与 `MALFORMED_FUNCTION_CALL`）。
 
 ---
 

@@ -1793,7 +1793,7 @@ function renderRecStatusBadge(r){
   var rt = Number(r.retries || 0);
   if(b === 'ok') return '<span class="pill pill-mint" style="font-size:11.5px;padding:2px 8.5px">● 成功</span>';
   if(b === 'retry_ok') return '<span class="pill pill-apricot" style="font-size:11.5px;padding:2px 8.5px">● 成功 · 重试×' + rt + '</span>';
-  if(b === 'trunc') return '<span class="pill pill-apricot" style="font-size:11.5px;padding:2px 8.5px" title="触发 max_tokens 长度上限">' + (rt > 0 ? ('⚠️ 截断 · 重试×' + rt) : '⚠️ 达上限截断') + '</span>';
+  if(b === 'trunc') return '<span class="pill pill-apricot" style="font-size:11.5px;padding:2px 8.5px" title="触发输出长度上限 (MAX_TOKENS) 或上游解码格式中断 (MALFORMED_FUNCTION_CALL)">' + (rt > 0 ? ('⚠️ 截断 · 重试×' + rt) : '⚠️ 截断/达上限') + '</span>';
   if(b === 'cancel') return '<span class="pill" style="font-size:11.5px;padding:2px 8.5px">⏹ 已取消</span>';
   var code = r.code || 500;
   return '<span class="pill pill-coral" style="font-size:11.5px;padding:2px 8.5px">✕ 失败(' + code + ')' + (rt > 0 ? (' · 重试×' + rt) : '') + '</span>';
