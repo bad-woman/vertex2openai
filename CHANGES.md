@@ -1,3 +1,40 @@
+## 2026-11-19 新增 `gemini-4-neon`、模型分类配置驱动与双通道 Function Calling / 思考签名深度修复
+
+### 1. 新增 `gemini-4-neon` & `vertexModels.json` 分类能力驱动（`vertexModels.json`、`app/model_loader.py`、`app/model_capabilities.py`、`app/main.py`、`README.md`）
+- **`gemini-4-neon` 完整适配**：纳入四档思考（`low / medium / high / xhigh`，原生默认 `high`）及一元非流式 / 假流式 `64K`（`65536`）输出上限，与 `gemini-4-hydrogen` 同级；
+- **向后兼容的分类配置架构**：`vertexModels.json` 新增 `categories` 分组与分类级 `capabilities` 声明，同时保留顶层扁平 `models` 列表确保向下兼容；后续新增同类 Gemini 4 机型仅需在对应分类加入模型名即可自动继承 `xhigh` / 一元上限，无需改动 Python 代码；
+- **控制台分组下拉与能力徽章**：`#model-sel` 按分类渲染 `<optgroup>` 分组并新增 `一元上限 64K / 32K` 能力徽章；同步细化生图模型官方宽高比白名单（`gemini-3-pro-image` 10 项、`gemini-3.1-flash-image` 14 项、`gemini-nano-banana-2.1` 15 项）。
+
+### 2. Function Calling、思考签名与结构化输出协议修复（Express SDK & Cookie 双通道）
+- **自定义工具与联网搜索冲突防护（`app/synthetic_wrapper.py`、`app/api_helpers.py`、`app/upstreams/express_sdk.py`、`app/upstreams/cookie_proxy.py`）**：
+  - 新增 `is_builtin_search_tool()`，带有效 `parameters.properties` 的客户端自定义 `search / browse / web_search` 函数不再被误劫持为内置 Google Search；
+  - Express `-search` 后缀请求若已携带 `function_declarations`，自动跳过注入 `google_search`，避免触发 Vertex AI 400（不支持自定义函数与内置搜索同请求混用）；
+  - 抗截断沙箱在 `tool_choice="none"` 且对话历史含工具轮次时保留工具声明并仅允许 `compose_reply`，避免历史校验失败。
+- **流式并行同名工具调用与 `willContinue=false` 收尾帧（`app/message_processing.py`、`app/upstreams/cookie_proxy.py`）**：
+  - 升级 `FunctionCallStreamAssembler.feed()`，支持无 `id` 场景下并行调用同一函数（如同时查多个城市天气）的精准拆包与防误合，同时兼容重复 `name` 收尾帧不产生幽灵空调用；
+  - Cookie `_extract_from_results` 识别显式 `{"willContinue": false}` 收尾帧，同时保留空 `functionCall: {}` 上的 `thoughtSignature` 透传。
+- **工具返回 Pydantic 解包与多模态工具结果（`app/message_processing.py`）**：
+  - 新增 `_extract_tool_response_payload()`，正确解包分段 `ContentPartText / ContentPartImage` 列表，彻底修复对象 `repr()` 泄漏；Express 通道支持将工具返回图片封装为官方 `FunctionResponsePart(inline_data=FunctionResponseBlob(...))`（含安全回退），Cookie 通道保守保持纯文本占位以兼容 `batchGraphql` 协议。
+- **思考签名拓扑、孤儿工具自愈与结构化输出（`app/api_helpers.py`、`app/message_processing.py`、`app/upstreams/cookie_proxy.py`、`app/schema_validation.py`）**：
+  - 禁止将后续文本/思考增量合并到已带 `thought_signature` 的 Part 上；Cookie `signature_only` 块独立追加不再覆盖前序签名；`sanitize_orphan_tool_turns` 降级孤儿调用时同步清空陈旧 `extra_content / reasoning_content` 并保留重复 `tool_call_id` 响应；
+  - Cookie `_cookie_ui_schema` 升级为严格 OpenAPI `Schema` 白名单（支持本地 `$ref` 展开与环保护、可空 `anyOf/oneOf` 折叠、`const` 转 `STRING` `enum`、剥离非法 JSON Schema 键、省略无参 `OBJECT` 的 `parameters`、避免下发未验证的 `propertyOrdering`）；修复 dict 型无名 `tool_choice` 误强制 `ANY`；
+  - Express `response_format={"type": "json_schema"}` 优先使用官方 `response_json_schema`（递归剥离 `$schema`）；Cookie 非生图文本模型补齐 `responseMimeType` + `responseSchema`（仅在显式传 `response_format` 时生效）；
+  - 双通道全链路（含 `apply_prefill_compat` 预填充兼容）支持 OpenAI `role="developer"` 映射至 `system_instruction`（并修复 Cookie 未知角色误映 `model`）；补齐全量安全拦截 `finish_reason`（`PROHIBITED_CONTENT / RECITATION / BLOCKLIST / SPII / IMAGE_SAFETY` → `content_filter`）与 `MALFORMED_*` → `length` 映射；`schema_validation` 兼容大写 OpenAPI 类型名。
+
+### 3. 续传轮询与假流式用量修复（`app/routes/chat_api.py`、`app/api_helpers.py`）
+- **非流式续传轮询返回完整 `payload`（`GET /v1/resumable/{stream_id}`）**：针对 `buf.kind == "json"` 在完成后直接返回 `payload` 与 `status_code`，且仅在实际交付非错误有效 `payload` 后才执行 `mark_delivered()`，解决轮询拿到空 `events: []` 却误标已交付导致同 ID 重试重复调用上游的问题；
+- **Express 假流式支持 `stream_options: {"include_usage": true}`**：`_chunk_openai_response_dict_for_sse` 新增 `include_usage` 参数并在调用处透传 `wants_usage(exp_req_obj)` 与守恒校核后的 `usage`，开启时在 `[DONE]` 前下发 `choices: []` 的 `usage` 帧，关闭时保持原帧序列完全不变。
+
+### 4. 流式抗截断防误杀、分段续接与上游静默断流识别（`app/synthetic_wrapper.py`、`app/message_processing.py`、`app/api_helpers.py`、`app/upstreams/cookie_proxy.py`）
+- **大幅降低流中熔断误杀**：
+  - `LexicalState` 单个 HTML 开标签追踪上限由 256 放宽至 2048 字符并支持超长自闭合标签识别，解决酒馆长 `style` 美化卡片开标签漏记引发的 `</div>` 悬空误切；悬空闭合标签熔断阈值提升至 `8(EOF)/12(流中)`；
+  - 新增 Unicode 排版/装饰符号豁免（`_is_pure_layout_unit`），`✦ ◆ ◇ ★ ☆ · • █ ░ ▒ ▓ ╭ ╯` 等分割线与进度条不再触发周期重复误杀，同时保持对悬空 `})]` 与工具控制词的高敏拦截；
+  - 流中普通周期重复门槛由 `10 次/120 字` 提升至 `20 次/320 字`（表格、代码块及未闭合 HTML/XML 容器内为 `24 次/400 字`），在 640 字隔离窗内仍可止损真复读机死循环，大幅减少正常长文与代码误切。
+- **支持同轮二次 `compose_reply` 续接 & 修复 `$.done=false` 提前封口**：`FunctionCallStreamAssembler` 允许同轮显式发起的新 `compose_reply` 解除封口续接后半段（带重复调用去重保护），且仅当 `$.done` 为真时触发收敛冲刷。
+- **上游静默断流识别与日志透明化**：当上游流未返回任何 `finish_reason` 即提前断开时，不再伪装补发 `finish_reason="stop"`，改标 `finish_reason="length"` 并输出明确告警；抗截断熔断日志附带具体命中规则与片段预览，收尾日志准确区分「抗截断提前收口 / 上游静默断流 / 达上限截断 / 正常完成」。
+
+---
+
 ## 2026-11-18 流式抗截断（`compose_reply`）`MALFORMED_FUNCTION_CALL` 源头治本与末尾状态栏闭合标签保护
 
 ### 1. 保留双必填门栓 + 移除过严 `parameters_json_schema` 扩展（`app/synthetic_wrapper.py`）

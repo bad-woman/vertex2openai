@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, Optional
 
 from models import normalize_content_part
+from model_loader import get_cached_model_capability_override
 
 SAMPLING_KEYS = {
     "temperature", "top_p", "top_k",
@@ -23,16 +24,21 @@ PENALTY_KEYS = {
     "presence_penalty", "frequency_penalty",
 }
 
-# 生图模型支持的 15 种官方宽高比（gemini-3-pro-image / gemini-3.1-flash-image / gemini-nano-banana-2.1）
-_IMAGE_ARS = {
-    "1:1", "3:2", "2:3", "3:4", "1:4", "4:1", "4:3", "4:5", "5:4",
-    "1:8", "8:1", "9:16", "16:9", "21:9", "9:21",
+# 生图模型官方宽高比白名单（对照 Google Cloud generative-ai 官方文档精细区分）
+_IMAGE_ARS_PRO = {
+    "1:1", "3:2", "2:3", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9",
 }
+_IMAGE_ARS_FLASH = _IMAGE_ARS_PRO | {"1:4", "4:1", "1:8", "8:1"}
+_IMAGE_ARS = _IMAGE_ARS_FLASH | {"9:21"}
 
 _LEVEL_ORDER = ["minimal", "low", "medium", "high", "xhigh"]
 
 # 3.6 及更早的非 Pro 机型支持 MINIMAL；3.7 及更新机型（含 4.x 全系）最低统一发送 LOW
 _MINIMAL_MAX_VERSION = (3, 6)
+
+# 内置兜底：当模型未在 vertexModels.json 分类能力表中声明时，识别已知支持 XHIGH 与 64K 一元输出的 Gemini 4 机型
+_G4_XHIGH_FALLBACK_KEYWORDS = ("hydrogen", "neon")
+_G4_64K_NONSTREAM_FALLBACK_KEYWORDS = ("hydrogen", "neon")
 
 
 def _supports_minimal(major: int, minor: int, is_pro: bool) -> bool:
@@ -94,8 +100,48 @@ def _temp_deprecated(name: str) -> bool:
     return False
 
 
+def _apply_config_capability_override(profile: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """将 vertexModels.json 中按分类或单模型声明的 capabilities 覆盖叠加到正则基础档案上。"""
+    ov = get_cached_model_capability_override(name)
+    if not ov:
+        return profile
+
+    prof = dict(profile)
+    if "family" in ov:
+        prof["family"] = ov["family"]
+    if "is_image" in ov:
+        prof["is_image"] = ov["is_image"]
+    if "thinking_levels" in ov:
+        levels = {str(lv).strip().lower() for lv in ov["thinking_levels"] if str(lv).strip()}
+        if levels:
+            prof["thinking_levels"] = levels
+    if "max_nonstream_output_tokens" in ov:
+        prof["max_nonstream_output_tokens"] = ov["max_nonstream_output_tokens"]
+    if "supports_search" in ov:
+        prof["supports_search"] = ov["supports_search"]
+    if "supports_stream_fc_args" in ov:
+        prof["supports_stream_fc_args"] = ov["supports_stream_fc_args"]
+    if "requires_user_last_turn" in ov:
+        prof["requires_user_last_turn"] = ov["requires_user_last_turn"]
+    if "image_sizes" in ov:
+        prof["image_sizes"] = set(ov["image_sizes"])
+    if "image_aspect_ratios" in ov:
+        prof["image_aspect_ratios"] = set(ov["image_aspect_ratios"])
+    if "sampling_deprecated" in ov and not prof.get("is_image"):
+        allowed = set(prof.get("allowed_sampling", set()))
+        if ov["sampling_deprecated"]:
+            allowed -= {"temperature", "top_p", "top_k"}
+            prof["sampling_advice"] = "deprecated"
+        else:
+            allowed |= {"temperature", "top_p", "top_k"}
+            allowed.discard("candidate_count")
+            prof["sampling_advice"] = "recommend_default"
+        prof["allowed_sampling"] = allowed
+    return prof
+
+
 def get_profile(model_name: str) -> Dict[str, Any]:
-    """返回给定模型的能力档案。"""
+    """返回给定模型的能力档案（优先以正则/家族推导为底，再叠加 vertexModels.json 分类能力声明）。"""
     raw = (model_name or "").lower()
     name = _strip_known_suffixes(raw)
 
@@ -107,29 +153,34 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         if is_nano:
             sizes = {"1K", "2K", "4K"}
             thinking_levels = {"minimal", "medium", "high"}
+            aspect_ratios = _IMAGE_ARS
         elif is_lite:
             sizes = {"1K"}
             thinking_levels = {"minimal", "high"}
+            aspect_ratios = _IMAGE_ARS_FLASH
         elif is_flash:
             sizes = {"512", "1K", "2K", "4K"}
             thinking_levels = {"minimal", "high"}
+            aspect_ratios = _IMAGE_ARS_FLASH
         else:
             sizes = {"1K", "2K", "4K"}
             thinking_levels = {"high"}
-        return {
+            aspect_ratios = _IMAGE_ARS_PRO
+        profile = {
             "family": "image",
             "is_image": True,
             "thinking_kind": "level",
             "thinking_levels": thinking_levels,
             "default_level": None,
             "allowed_sampling": set(),
-            "image_aspect_ratios": _IMAGE_ARS,
+            "image_aspect_ratios": aspect_ratios,
             "image_sizes": sizes,
             "supports_search": True,
             "supports_stream_fc_args": False,
             "max_nonstream_output_tokens": None,
             "requires_user_last_turn": True,
         }
+        return _apply_config_capability_override(profile, name)
 
     # ---- 文本 / 多模态（Gemini 3.x / 4.x）----
     m = re.search(r"gemini-(\d+)(?:\.(\d+))?", name)
@@ -139,8 +190,8 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     family = f"g{major}"
 
     levels = {"low", "medium", "high"}
-    # 仅 gemini-4-hydrogen 支持 xhigh；4-argon / 4-carbon 等不支持，需保持在 high 内以便自动降级
-    if major >= 4 and "hydrogen" in name:
+    # 内置兜底：4-hydrogen / 4-neon 支持 xhigh；4-argon / 4-carbon 等保持在 high 内（也可由 vertexModels.json 分类覆盖）
+    if major >= 4 and any(k in name for k in _G4_XHIGH_FALLBACK_KEYWORDS):
         levels = levels | {"xhigh"}
     if _supports_minimal(major, minor, is_pro):
         levels = levels | {"minimal"}
@@ -152,11 +203,13 @@ def get_profile(model_name: str) -> Dict[str, Any]:
     if temp_dep:
         allowed -= {"temperature", "top_p", "top_k"}
     supports_sfc = bool(major >= 3 and not (major == 3 and minor == 1 and "flash-lite" in name))
-    # Gemini 4 非流式/假流式输出上限：仅 4-hydrogen 支持 64K (65536)，4-argon / 4-carbon 等最高为 32K (32768)
+    # Gemini 4 非流式/假流式输出上限：4-hydrogen / 4-neon 支持 64K (65536)，4-argon / 4-carbon 等最高为 32K (32768)
     max_nonstream_tokens: Optional[int] = None
     if major >= 4:
-        max_nonstream_tokens = 65536 if "hydrogen" in name else 32768
-    return {
+        max_nonstream_tokens = (
+            65536 if any(k in name for k in _G4_64K_NONSTREAM_FALLBACK_KEYWORDS) else 32768
+        )
+    profile = {
         "family": family,
         "is_image": False,
         "thinking_kind": "level",
@@ -170,6 +223,7 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         "max_nonstream_output_tokens": max_nonstream_tokens,
         "requires_user_last_turn": True,
     }
+    return _apply_config_capability_override(profile, name)
 
 
 _EFFORT_ALIASES = {
@@ -368,7 +422,7 @@ def clamp_max_output_tokens(
     """按模型家族与真实传输模式安全夹紧 max_output_tokens：
     - 真流式（streamGenerateContent）：保持原值（Gemini 4 全系流式支持 64K，SDK >= 2.30.0 超 64K 自动 Long Decode）；
     - 非流式与假流式（底层调用一元 generateContent）：
-        • gemini-4-hydrogen 最高 65536 (64K)；
+        • gemini-4-neon / gemini-4-hydrogen（及 vertexModels.json 中配置为 64K 一元的机型）最高 65536 (64K)；
         • gemini-4-argon / gemini-4-carbon 等其他 4.x 最高 32768 (32K)，防止酒馆拉满 64K 触发上游 400 或未闭合截断。
     """
     if max_tokens is None:
@@ -403,4 +457,5 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
         "image_aspect_ratios": sorted(prof.get("image_aspect_ratios", set())),
         "image_sizes": sorted(prof.get("image_sizes", set())),
         "supports_search": prof["supports_search"],
+        "max_nonstream_output_tokens": prof.get("max_nonstream_output_tokens"),
     }

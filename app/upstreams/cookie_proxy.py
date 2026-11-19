@@ -50,6 +50,7 @@ from synthetic_wrapper import (
     build_emit_tool_declaration,
     create_sandbox_spec,
     extract_synthetic_content,
+    is_builtin_search_tool,
     make_bad_woman_response_id,
     supports_stream_fc_args,
 )
@@ -370,11 +371,12 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
     for t in (tools or []):
         if not isinstance(t, dict):
             continue
-        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
-        name = str(fn.get("name") or t.get("name") or t.get("type") or "").strip()
-        if name.lower().replace("-", "_") in _BUILTIN_SEARCH_NAMES:
+        if is_builtin_search_tool(t):
             builtin_search = True
-        elif name:
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        name = str(fn.get("name") or t.get("name") or "").strip()
+        if name:
             custom_names.append(name)
 
     history = False
@@ -390,43 +392,137 @@ def classify_tool_traffic(messages: list, tools: Any = None) -> dict:
 _SCHEMA_TYPES = {
     "object": "OBJECT", "array": "ARRAY", "string": "STRING",
     "integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN",
-    "null": "NULL",
+}
+
+_COOKIE_SCHEMA_SCALAR_KEYS = {
+    "format", "title", "description", "nullable", "pattern",
+    "minimum", "maximum", "minLength", "maxLength",
+    "minItems", "maxItems", "minProperties", "maxProperties",
 }
 
 
-def _cookie_ui_schema(schema: Any) -> Any:
+def _resolve_local_schema_ref(ref: str, root: dict) -> Optional[dict]:
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return None
+    curr: Any = root
+    for seg in ref[2:].split("/"):
+        seg = seg.replace("~1", "/").replace("~0", "~")
+        if isinstance(curr, dict) and seg in curr:
+            curr = curr[seg]
+        else:
+            return None
+    return curr if isinstance(curr, dict) else None
+
+
+def _is_null_schema(node: Any) -> bool:
+    if not isinstance(node, dict):
+        return False
+    t = node.get("type")
+    return isinstance(t, str) and t.lower() == "null"
+
+
+def _cookie_ui_schema(schema: Any, _root: Optional[dict] = None, _seen_refs: Optional[set] = None) -> Any:
+    """将标准 JSON Schema 安全转换为 batchGraphql 严格 OpenAPI Schema（白名单字段 + $ref 展开 + nullable anyOf 折叠）。"""
     if not isinstance(schema, dict):
         return schema
+    root = _root if _root is not None else schema
+    seen_refs = _seen_refs if _seen_refs is not None else set()
 
-    out = {}
+    if isinstance(schema.get("$ref"), str):
+        ref = schema["$ref"]
+        if ref not in seen_refs:
+            resolved = _resolve_local_schema_ref(ref, root)
+            if resolved is not None:
+                merged = dict(resolved)
+                for k, v in schema.items():
+                    if k != "$ref" and k not in merged:
+                        merged[k] = v
+                return _cookie_ui_schema(merged, root, seen_refs | {ref})
+
+    out: Dict[str, Any] = {}
+
+    # 折叠 Pydantic v2 / OpenAI 常见的可空联合类型 anyOf/oneOf: [T, {"type": "null"}]
+    for union_key in ("anyOf", "oneOf"):
+        branches = schema.get(union_key)
+        if isinstance(branches, list) and branches:
+            non_null = [b for b in branches if not _is_null_schema(b)]
+            had_null = len(non_null) != len(branches)
+            if len(non_null) == 1 and isinstance(non_null[0], dict):
+                folded = dict(non_null[0])
+                for k, v in schema.items():
+                    if k != union_key and k not in folded:
+                        folded[k] = v
+                res = _cookie_ui_schema(folded, root, seen_refs)
+                if isinstance(res, dict) and had_null:
+                    res["nullable"] = True
+                return res
+
     raw_type = schema.get("type")
     if isinstance(raw_type, list):
-        non_null = [t for t in raw_type if str(t).lower() != "null"]
-        raw_type = non_null[0] if non_null else "null"
-        if len(non_null) != len(schema.get("type") or []):
+        non_null_t = [t for t in raw_type if str(t).lower() != "null"]
+        raw_type = non_null_t[0] if non_null_t else "string"
+        if len(non_null_t) != len(schema.get("type") or []):
             out["nullable"] = True
     if not raw_type:
         if isinstance(schema.get("properties"), dict):
             raw_type = "object"
         elif "items" in schema:
             raw_type = "array"
+        elif "const" in schema:
+            cv = schema["const"]
+            if isinstance(cv, bool):
+                raw_type = "boolean"
+            elif isinstance(cv, int):
+                raw_type = "integer"
+            elif isinstance(cv, float):
+                raw_type = "number"
+            else:
+                raw_type = "string"
+        elif isinstance(schema.get("enum"), list) and schema["enum"]:
+            raw_type = "string"
     if raw_type:
-        out["type"] = _SCHEMA_TYPES.get(str(raw_type).lower(), str(raw_type).upper())
+        mapped_t = _SCHEMA_TYPES.get(str(raw_type).lower())
+        if mapped_t:
+            out["type"] = mapped_t
 
+    if "const" in schema and "enum" not in schema and out.get("type") == "STRING":
+        out["enum"] = [str(schema["const"])]
+
+    prop_names: set[str] = set()
     for key, value in schema.items():
-        if key in ("type", "$schema"):
-            continue
-        if key == "additionalProperties" and isinstance(value, bool):
-            continue
         if key == "properties" and isinstance(value, dict):
-            out[key] = [{"key": name, "value": _cookie_ui_schema(child)}
-                        for name, child in value.items()]
-        elif key in {"items", "additionalProperties", "not"} and isinstance(value, dict):
-            out[key] = _cookie_ui_schema(value)
-        elif key in {"oneOf", "anyOf", "allOf", "prefixItems"} and isinstance(value, list):
-            out[key] = [_cookie_ui_schema(item) for item in value]
-        else:
+            prop_names = set(value.keys())
+            out["properties"] = [
+                {"key": name, "value": _cookie_ui_schema(child, root, seen_refs)}
+                for name, child in value.items()
+            ]
+        elif key == "items" and isinstance(value, dict):
+            out["items"] = _cookie_ui_schema(value, root, seen_refs)
+        elif key in ("anyOf", "oneOf") and isinstance(value, list):
+            non_null_b = [b for b in value if not _is_null_schema(b)]
+            if len(non_null_b) != len(value):
+                out["nullable"] = True
+            if non_null_b:
+                out["anyOf"] = [_cookie_ui_schema(item, root, seen_refs) for item in non_null_b]
+        elif key == "enum" and isinstance(value, list):
+            # Vertex OpenAPI Schema 仅允许在 STRING 类型上使用 enum
+            if out.get("type") == "STRING":
+                out["enum"] = [str(v) for v in value]
+        elif key == "required" and isinstance(value, list):
+            out["required"] = [str(r) for r in value if isinstance(r, str)]
+        elif key in _COOKIE_SCHEMA_SCALAR_KEYS:
             out[key] = value
+
+    if "required" in out:
+        if prop_names:
+            filtered_req = [r for r in out["required"] if r in prop_names]
+            if filtered_req:
+                out["required"] = filtered_req
+            else:
+                out.pop("required", None)
+        else:
+            out.pop("required", None)
+
     return out
 
 
@@ -449,17 +545,22 @@ def _build_function_declarations(tools: Any) -> tuple[list[dict], bool]:
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
+        if is_builtin_search_tool(tool):
+            builtin_search = True
+            continue
         name = _normalized_tool_name(tool)
         if not name:
-            continue
-        if _is_builtin_search_name(name):
-            builtin_search = True
             continue
         fn = _tool_function(tool)
         declaration = {"name": name}
         if fn.get("description") is not None:
             declaration["description"] = fn["description"]
-        declaration["parameters"] = _cookie_ui_schema(fn.get("parameters") or {"type": "object"})
+        raw_params = fn.get("parameters")
+        if isinstance(raw_params, dict):
+            converted = _cookie_ui_schema(raw_params)
+            # Vertex OpenAPI Schema 对无参 OBJECT 建议省略 parameters，避免空 properties 触发 400
+            if isinstance(converted, dict) and (converted.get("properties") or converted.get("type") != "OBJECT"):
+                declaration["parameters"] = converted
         declarations.append(declaration)
     return declarations, builtin_search
 
@@ -477,14 +578,19 @@ def _build_tool_config(tool_choice: Any, function_names: list[str]) -> Optional[
             mode, allowed = "AUTO", None
     elif isinstance(tool_choice, dict):
         name = _normalized_tool_name(tool_choice)
-        if name and _is_builtin_search_name(name):
-            mode, allowed = "ANY", None
-        elif name and name in function_names:
+        t_type = str(tool_choice.get("type") or "").strip().lower()
+        if name and name in function_names:
             mode, allowed = "ANY", [name]
+        elif name and _is_builtin_search_name(name):
+            mode, allowed = "ANY", None
         elif name:
             mode, allowed = "AUTO", None
-        else:
+        elif t_type == "none":
+            mode, allowed = "NONE", None
+        elif t_type in ("required", "any"):
             mode, allowed = "ANY", (function_names or None)
+        else:
+            mode, allowed = "AUTO", None
     else:
         mode, allowed = "AUTO", None
 
@@ -660,7 +766,7 @@ def _convert_messages_to_contents(
     for msg in messages:
         role = msg.role
         content = msg.content
-        if role == "system":
+        if role in ("system", "developer"):
             if isinstance(content, str):
                 system_parts.append(content)
             else:
@@ -770,7 +876,7 @@ def _convert_messages_to_contents(
             contents.append({"role": "model", "parts": parts})
             continue
 
-        gemini_role = "user" if role == "user" else "model"
+        gemini_role = "model" if role in ("assistant", "model") else "user"
         is_model_turn = (gemini_role == "model")
         parts = (_ordinary_wire_parts_from_extra(msg)
                  if is_model_turn else None)
@@ -906,6 +1012,24 @@ def _build_batch_graphql_body(
         if thinking_config:
             gen_config["thinkingConfig"] = thinking_config
 
+        if getattr(request, "response_format", None) is not None:
+            fmt = request.response_format
+            fmt_type = fmt.get("type", "") if isinstance(fmt, dict) else getattr(fmt, "type", "")
+            if fmt_type == "json_object":
+                gen_config["responseMimeType"] = "application/json"
+            elif fmt_type == "json_schema":
+                gen_config["responseMimeType"] = "application/json"
+                json_schema_obj = fmt.get("json_schema") if isinstance(fmt, dict) else getattr(fmt, "json_schema", None)
+                schema = (
+                    json_schema_obj.get("schema")
+                    if isinstance(json_schema_obj, dict)
+                    else getattr(json_schema_obj, "schema", None)
+                )
+                if isinstance(schema, dict) and schema:
+                    converted_schema = _cookie_ui_schema(schema)
+                    if isinstance(converted_schema, dict) and converted_schema:
+                        gen_config["responseSchema"] = converted_schema
+
     _want_scores = bool(app_state.get_setting("safety_score", app_config.SAFETY_SCORE))
     _threshold = "BLOCK_NONE" if _want_scores else "OFF"
     safety_settings = [
@@ -941,7 +1065,12 @@ def _build_batch_graphql_body(
         declarations = []
 
     choice_name = _normalized_tool_name(request.tool_choice) if isinstance(request.tool_choice, dict) else ""
-    forced_search = bool(choice_name and _is_builtin_search_name(choice_name))
+    declared_custom_names = {item["name"] for item in declarations}
+    forced_search = bool(
+        choice_name
+        and choice_name not in declared_custom_names
+        and _is_builtin_search_name(choice_name)
+    )
     tools_disabled = isinstance(request.tool_choice, str) and request.tool_choice.lower() == "none"
     _wants_search = (force_search or declared_search or forced_search
                      or (hasattr(request, 'model') and request.model.endswith("-search")))
@@ -1158,7 +1287,8 @@ def _extract_from_results(obj: dict):
                     fc_args = function_call.get("args") if isinstance(function_call.get("args"), dict) else {}
                     fc_partial = function_call.get("partialArgs") if isinstance(function_call.get("partialArgs"), list) else []
                     fc_wc = bool(function_call.get("willContinue"))
-                    if fc_name or fc_args or fc_partial or fc_wc:
+                    fc_explicit_end = (function_call.get("willContinue") is False)
+                    if fc_name or fc_args or fc_partial or fc_wc or fc_explicit_end:
                         yield ("function_call", {
                             "id": str(function_call.get("id") or "").strip() or None,
                             "name": fc_name,
@@ -1260,7 +1390,7 @@ def _append_merged_ordinary_meta(
         and order_list[-1].get("index") == len(ordinary_list) - 1
         and kind in ("text", "thought")
         and ordinary_list[-1].get("kind") == kind
-        and not (ordinary_list[-1].get("thought_signature") and metadata.get("thought_signature"))
+        and not ordinary_list[-1].get("thought_signature")
     ):
         prev = ordinary_list[-1]
         add_txt = metadata.get("text") or ""
@@ -1732,7 +1862,11 @@ class CookieProxyUpstream(BaseUpstream):
         _tool_info = classify_tool_traffic(request_obj.messages, request_obj.tools)
         force_builtin_search = bool(_tool_info["builtin_search"])
         _choice_name = _normalized_tool_name(request_obj.tool_choice) if isinstance(request_obj.tool_choice, dict) else ""
-        _forced_search = bool(_choice_name and _is_builtin_search_name(_choice_name))
+        _forced_search = bool(
+            _choice_name
+            and _choice_name not in set(_tool_info["custom_names"])
+            and _is_builtin_search_name(_choice_name)
+        )
         native_custom_tools = bool(_tool_info["custom_names"] or _tool_info["history"])
 
         model_display = (request_obj.model or "").strip()
@@ -2091,7 +2225,8 @@ class CookieProxyUpstream(BaseUpstream):
                                     tool_call_index += 1
                                     got_tool_call = True
                                 if fc_assembler.synthetic_halted:
-                                    print(f"🛑 [Studio 抗截断保护] 检测到 {base_model_name} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
+                                    _ck_h_reason = fc_assembler.synthetic_halt_reason or "闭合溢出"
+                                    print(f"🛑 [Studio 抗截断保护] 检测到 {base_model_name} 触发熔断（{_ck_h_reason}），已平滑切除并立即断开上游流。")
                                     break
 
                             elif status == "thought_signature":
@@ -2109,9 +2244,19 @@ class CookieProxyUpstream(BaseUpstream):
                                         if not image_signature_store.get(ib):
                                             image_signature_store.put(ib, signature)
                                 if signature:
-                                    if stream_ordinary_metadata:
+                                    p_kind = data.get("part_kind")
+                                    can_attach_prev = (
+                                        p_kind in ("text", "thought")
+                                        and bool(stream_ordinary_metadata)
+                                        and bool(stream_part_order)
+                                        and stream_part_order[-1].get("type") == "ordinary"
+                                        and stream_part_order[-1].get("index") == len(stream_ordinary_metadata) - 1
+                                        and stream_ordinary_metadata[-1].get("kind") == p_kind
+                                        and not stream_ordinary_metadata[-1].get("thought_signature")
+                                    )
+                                    if can_attach_prev:
                                         stream_ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(signature)
-                                    elif data.get("part_kind") == "signature_only":
+                                    else:
                                         _append_merged_ordinary_meta(
                                             stream_ordinary_metadata,
                                             stream_part_order,
@@ -2241,6 +2386,7 @@ class CookieProxyUpstream(BaseUpstream):
                             except Exception:
                                 pass
 
+                    had_unclosed_synth = fc_assembler.has_unclosed_synthetic()
                     rem_synth = fc_assembler.flush_synthetic_tail()
                     rem_sig = fc_assembler.pop_synth_signature()
                     if rem_synth or rem_sig:
@@ -2341,10 +2487,20 @@ class CookieProxyUpstream(BaseUpstream):
                                 google["thought_signature_part"] = last_signed["kind"]
                             final_extra = {"google": google}
 
+                    silent_eof_truncated = bool(
+                        not finish_raw
+                        and not got_tool_call
+                        and not fc_assembler.synthetic_halted
+                        and (not fc_assembler.synthetic_hit or had_unclosed_synth)
+                    )
                     final_fr_stream = (
                         "tool_calls"
                         if got_tool_call
-                        else ("stop" if fc_assembler.synthetic_halted else _map_finish_reason(finish_raw))
+                        else (
+                            "stop"
+                            if fc_assembler.synthetic_halted
+                            else ("length" if silent_eof_truncated else _map_finish_reason(finish_raw))
+                        )
                     )
                     yield _make_openai_chunk(
                         response_id,
@@ -2388,7 +2544,15 @@ class CookieProxyUpstream(BaseUpstream):
                     elapsed = time.time() - start_time
                     if debug_outbound:
                         print(f"🔎 [Studio 尾包原始结构] {sampler.dump()}")
-                    print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
+                    if fc_assembler.synthetic_halted:
+                        _ck_h_fin = fc_assembler.synthetic_halt_reason or "闭合溢出"
+                        print(f"⚠️ [Studio] {base_model_name} | 抗截断保护提前收口（{_ck_h_fin}）| 耗时 {elapsed:.1f}s")
+                    elif silent_eof_truncated:
+                        print(f"⚠️ [Studio] {base_model_name} | 上游静默断流（未收到 finishReason，正文可能不完整），已标 finish_reason=length | 耗时 {elapsed:.1f}s")
+                    elif final_fr_stream == "length":
+                        print(f"⚠️ [Studio] {base_model_name} | 流式传输结束（finish_reason=length，已达上限或截断）| 耗时 {elapsed:.1f}s")
+                    else:
+                        print(f"✅ [Studio] {base_model_name} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
 
             return StreamingResponse(stream_generator_once(), media_type="text/event-stream")
 
@@ -2496,9 +2660,10 @@ class CookieProxyUpstream(BaseUpstream):
                         )
                     elif event_type == "thought":
                         reasoning_text += data
-                        _append_merged_ordinary_meta(
-                            ordinary_metadata, part_order, ordinary_part_metadata("thought", data, None)
-                        )
+                        if not strip_thoughts:
+                            _append_merged_ordinary_meta(
+                                ordinary_metadata, part_order, ordinary_part_metadata("thought", data, None)
+                            )
                     elif event_type == "image":
                         img_md = data["markdown"] if isinstance(data, dict) else str(data)
                         img_b = data.get("raw_bytes", b"") if isinstance(data, dict) else b""
@@ -2540,10 +2705,20 @@ class CookieProxyUpstream(BaseUpstream):
                                 if not image_signature_store.get(ib):
                                     image_signature_store.put(ib, sig)
                         if sig:
-                            message_extra = thought_signature_extra(sig, data.get("part_kind"))
-                            if ordinary_metadata:
+                            p_kind = data.get("part_kind")
+                            message_extra = thought_signature_extra(sig, p_kind)
+                            can_attach_prev = (
+                                p_kind in ("text", "thought")
+                                and bool(ordinary_metadata)
+                                and bool(part_order)
+                                and part_order[-1].get("type") == "ordinary"
+                                and part_order[-1].get("index") == len(ordinary_metadata) - 1
+                                and ordinary_metadata[-1].get("kind") == p_kind
+                                and not ordinary_metadata[-1].get("thought_signature")
+                            )
+                            if can_attach_prev:
                                 ordinary_metadata[-1]["thought_signature"] = _encode_wire_signature(sig)
-                            elif data.get("part_kind") == "signature_only":
+                            else:
                                 _append_merged_ordinary_meta(
                                     ordinary_metadata,
                                     part_order,

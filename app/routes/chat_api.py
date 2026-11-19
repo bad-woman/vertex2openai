@@ -287,7 +287,26 @@ async def resumable_poll(stream_id: str, fastapi_request: Request,
                 404, f"未找到响应缓冲 {stream_id}（可能已过期被清理）。", "not_found"))
     limit = max(1, min(limit, 500))
     if wait > 0 and not buf.done:
-        await buf.wait_for(max(0, from_), min(wait, 25.0))
+        await buf.wait_for(max(0, from_) if buf.kind != "json" else 0, min(wait, 25.0))
+    if buf.kind == "json":
+        done = buf.done
+        resp_body = {
+            "id": stream_id,
+            "model": buf.model,
+            "kind": buf.kind,
+            "status": buf.status,
+            "status_code": buf.status_code,
+            "error": buf.error,
+            "events": [],
+            "next": 0,
+            "done": done,
+        }
+        if done and buf.payload is not None:
+            resp_body["payload"] = buf.payload
+            if buf.status != "error" and buf.status_code < 400:
+                buf.mark_delivered()
+        return JSONResponse(content=resp_body)
+
     start = max(0, from_)
     events = buf.snapshot(start, limit)
     end = start + len(events)

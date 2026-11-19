@@ -48,7 +48,7 @@ def validate_json_schema(schema: Any, *, label: str = "schema") -> None:
             raw_type = node.get("type")
             types = raw_type if isinstance(raw_type, list) else [raw_type]
             if raw_type is not None:
-                if not types or any(not isinstance(t, str) or t not in _JSON_SCHEMA_TYPES for t in types):
+                if not types or any(not isinstance(t, str) or t.lower() not in _JSON_SCHEMA_TYPES for t in types):
                     raise SchemaValidationError(f"{path}.type contains an unsupported JSON Schema type")
             required = node.get("required")
             if required is not None and (not isinstance(required, list)

@@ -316,23 +316,86 @@ def _extract_markdown_images_to_parts(
     return parts, remaining_text
 
 
-def _coerce_tool_response(content: Any) -> Dict[str, Any]:
-    """把 OpenAI 工具结果安全地转成 function_response 需要的对象。"""
+def _extract_tool_response_payload(content: Any, *, extract_media: bool = False) -> Tuple[Dict[str, Any], List[Tuple[bytes, str]]]:
+    """把 OpenAI role='tool' 内容安全归一为 (function_response 字典, 可选多模态图片列表 [(bytes, mime)])。
+    自动解包 Pydantic ContentPartText / ContentPartImage，彻底杜绝 Python repr 泄漏给上游。"""
+    media_items: List[Tuple[bytes, str]] = []
     if content is None:
-        return {"result": ""}
+        return {"result": ""}, media_items
+
+    if isinstance(content, dict):
+        return content, media_items
+
+    if isinstance(content, list):
+        text_chunks: List[str] = []
+        raw_dicts: List[Any] = []
+        for item in content:
+            norm = normalize_content_part(item)
+            if isinstance(norm, str):
+                text_chunks.append(norm)
+            elif isinstance(norm, dict):
+                t = norm.get("type")
+                if t == "text" and isinstance(norm.get("text"), str):
+                    text_chunks.append(norm["text"])
+                elif t == "image_url":
+                    img_obj = norm.get("image_url") or {}
+                    url = img_obj.get("url", "") if isinstance(img_obj, dict) else (getattr(img_obj, "url", "") or "")
+                    if extract_media and isinstance(url, str) and url:
+                        if url.startswith("data:"):
+                            m = re.match(r"data:([^;]+);base64,(.+)", url, re.DOTALL)
+                            if m:
+                                try:
+                                    raw_b = base64.b64decode(m.group(2))
+                                    opt_b, opt_m = optimize_image_bytes(raw_b, m.group(1))
+                                    media_items.append((opt_b, opt_m))
+                                except Exception:
+                                    pass
+                        elif url.startswith(("http://", "https://")):
+                            fetched = fetch_remote_image(url)
+                            if fetched:
+                                opt_b, opt_m = optimize_image_bytes(*fetched)
+                                media_items.append((opt_b, opt_m))
+                    else:
+                        text_chunks.append("[工具返回图片]")
+                else:
+                    raw_dicts.append(norm)
+            else:
+                text_chunks.append(str(norm))
+
+        if text_chunks and not raw_dicts:
+            joined = "\n".join(text_chunks)
+            resp_dict, _ = _extract_tool_response_payload(joined, extract_media=False)
+            return resp_dict, media_items
+        if media_items and not text_chunks and not raw_dicts:
+            return {"result": "Multimodal content attached."}, media_items
+        if raw_dicts:
+            payload = raw_dicts if not text_chunks else {"text": "\n".join(text_chunks), "items": raw_dicts}
+            return {"result": payload}, media_items
+        return {"result": ""}, media_items
+
     if not isinstance(content, str):
+        norm = normalize_content_part(content)
+        if isinstance(norm, dict):
+            return norm, media_items
         try:
-            return {"result": json.dumps(content, ensure_ascii=False)}
+            return {"result": json.dumps(norm, ensure_ascii=False)}, media_items
         except Exception:
-            return {"result": str(content)}
+            return {"result": str(norm)}, media_items
+
     s = content.strip()
     if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
         try:
             parsed = json.loads(s)
-            return parsed if isinstance(parsed, dict) else {"result": parsed}
+            return (parsed if isinstance(parsed, dict) else {"result": parsed}), media_items
         except json.JSONDecodeError:
-            return {"result": content}
-    return {"result": content}
+            return {"result": content}, media_items
+    return {"result": content}, media_items
+
+
+def _coerce_tool_response(content: Any) -> Dict[str, Any]:
+    """把 OpenAI 工具结果安全地转成 function_response 需要的对象。"""
+    resp_dict, _ = _extract_tool_response_payload(content, extract_media=False)
+    return resp_dict
 
 
 def _message_text(content: Any) -> str:
@@ -394,7 +457,7 @@ def apply_console_injection(
     if system_text:
         insert_at = 0
         for i, m in enumerate(new_msgs):
-            if m.role == "system":
+            if m.role in ("system", "developer"):
                 insert_at = i + 1
         new_msgs.insert(insert_at, OpenAIMessage(role="system", content=system_text))
         notes.append(f"💉 [控制台注入] 已追加 system 指令（{len(system_text)} 字）。")
@@ -598,9 +661,9 @@ def apply_prefill_compat(
             return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
-    # 倒序寻找最后一条非空且非 system 的实际对话消息（因为 system 会被抽入 system_instruction，不进入 contents）
+    # 倒序寻找最后一条非空且非 system/developer 的实际对话消息（因为它们会被抽入 system_instruction，不进入 contents）
     idx = len(messages) - 1
-    while idx >= 0 and (_is_empty_message(messages[idx]) or messages[idx].role == "system"):
+    while idx >= 0 and (_is_empty_message(messages[idx]) or messages[idx].role in ("system", "developer")):
         idx -= 1
     if idx < 0:
         if synthetic_tool_name:
@@ -623,26 +686,26 @@ def apply_prefill_compat(
             return _append_control_to_last_user(messages, ctrl), "", False
         return messages, "", False
 
-    # 向上收集末尾所有连续的 assistant 预填充消息（穿透中间夹杂的空消息或 system 消息）
+    # 向上收集末尾所有连续的 assistant 预填充消息（穿透中间夹杂的空消息或 system/developer 消息）
     start_idx = idx
     while start_idx > 0:
         prev_m = messages[start_idx - 1]
-        if _is_empty_message(prev_m) or prev_m.role == "system":
+        if _is_empty_message(prev_m) or prev_m.role in ("system", "developer"):
             start_idx -= 1
             continue
         if prev_m.role == "assistant" and not getattr(prev_m, "tool_calls", None):
             start_idx -= 1
             continue
         break
-    # 将 start_idx 向前收紧到第一条实际的 assistant 预填充处（其前面的 system 留在 prefix_msgs 中）
-    while start_idx < idx and (messages[start_idx].role == "system" or _is_empty_message(messages[start_idx])):
+    # 将 start_idx 向前收紧到第一条实际的 assistant 预填充处（其前面的 system/developer 留在 prefix_msgs 中）
+    while start_idx < idx and (messages[start_idx].role in ("system", "developer") or _is_empty_message(messages[start_idx])):
         start_idx += 1
 
     prefill_segments: List[str] = []
     trailing_system_msgs: List[OpenAIMessage] = []
     for k in range(start_idx, len(messages)):
         m_item = messages[k]
-        if m_item.role == "system":
+        if m_item.role in ("system", "developer"):
             if not _is_empty_message(m_item):
                 trailing_system_msgs.append(m_item)
         elif not _is_empty_message(m_item) and m_item.role == "assistant":
@@ -719,9 +782,9 @@ def apply_prefill_compat(
     instruction = intro + "\n\n" + prefill
     join_sep = "\n\n"
 
-    # 在 prefix_msgs 中倒序查找最后一条非 system 的对话消息，若为 user 则直接合并
+    # 在 prefix_msgs 中倒序查找最后一条非 system/developer 的对话消息，若为 user 则直接合并
     last_non_sys_idx = len(prefix_msgs) - 1
-    while last_non_sys_idx >= 0 and prefix_msgs[last_non_sys_idx].role == "system":
+    while last_non_sys_idx >= 0 and prefix_msgs[last_non_sys_idx].role in ("system", "developer"):
         last_non_sys_idx -= 1
 
     new_msgs = list(prefix_msgs) + trailing_system_msgs
@@ -927,6 +990,23 @@ def _extract_partial_arg_value(parg: Any) -> Tuple[bool, Any, bool]:
     return False, None, wc
 
 
+def _json_path_exists(root: Any, tokens: List[Any]) -> bool:
+    """检查 RFC 9535 JSONPath 对应的叶子键是否已在当前 args 字典中存在（用于识别同名并行工具调用边界）。"""
+    if not tokens:
+        return False
+    curr: Any = root
+    for key in tokens:
+        if isinstance(key, int):
+            if not isinstance(curr, list) or key < 0 or key >= len(curr) or curr[key] is None:
+                return False
+            curr = curr[key]
+        else:
+            if not isinstance(curr, dict) or key not in curr:
+                return False
+            curr = curr[key]
+    return True
+
+
 def _set_json_path_value(root: Dict[str, Any], tokens: List[Any], value: Any, append_string: bool = False) -> None:
     """在嵌套字典/列表中按路径写入或追加（用于流式字符串分片）值。"""
     if not tokens:
@@ -984,6 +1064,7 @@ class FunctionCallStreamAssembler:
         self.prefill_text: str = prefill_text or ""
         self.synthetic_hit: bool = False
         self.synthetic_halted: bool = False
+        self.synthetic_halt_reason: str = ""
         self._synth_eof_sealed: bool = False
         self._pending_is_synthetic: bool = False
         self._saw_synth_partial: bool = False
@@ -993,6 +1074,10 @@ class FunctionCallStreamAssembler:
         self._real_calls_emitted: int = 0
         self._synth_tail_buf: str = ""
         self._synth_total_received: int = 0
+        self._cur_synth_call_head: str = ""
+        self._cur_synth_call_len: int = 0
+        self._last_synth_call_head: str = ""
+        self._last_synth_call_len: int = 0
         self._lex_state: LexicalState = LexicalState()
         self._lex_seeded: bool = not bool(self.prefill_text)
 
@@ -1027,6 +1112,9 @@ class FunctionCallStreamAssembler:
 
     def has_received_synthetic_text(self) -> bool:
         return self._synth_total_received > 0 or bool(self._synth_tail_buf)
+
+    def has_unclosed_synthetic(self) -> bool:
+        return bool(self._pending_is_synthetic)
 
     def pop_synth_signature(self) -> Optional[bytes]:
         """取出尚未随增量发出的合成工具思考签名（用于短回复在 flush_synthetic_tail 收尾时无损补挂签名）。"""
@@ -1085,12 +1173,30 @@ class FunctionCallStreamAssembler:
                 is_synth = True
 
         if is_synth:
-            if self.synthetic_halted or self._synth_eof_sealed:
+            has_args = isinstance(fc_args, dict) and len(fc_args) > 0
+            has_partial = isinstance(fc_partial, list) and len(fc_partial) > 0
+
+            if self.synthetic_halted:
                 if thought_signature:
                     self._synth_signature = thought_signature
                     self._turn_signature = thought_signature
                 self._pending_is_synthetic = bool(fc_will_continue)
                 return [], "", None
+
+            if self._synth_eof_sealed:
+                # 若同轮显式发起了一次全新的 compose_reply 调用（而非上一次调用的无名/空收尾残片），解除封口续接后半段正文
+                if fc_name == self.synthetic_tool_name and (has_args or has_partial or fc_will_continue):
+                    self._synth_eof_sealed = False
+                    self._saw_synth_partial = False
+                    self._last_synth_path = ""
+                    self._cur_synth_call_head = ""
+                    self._cur_synth_call_len = 0
+                else:
+                    if thought_signature:
+                        self._synth_signature = thought_signature
+                        self._turn_signature = thought_signature
+                    self._pending_is_synthetic = bool(fc_will_continue)
+                    return [], "", None
 
             ready_real: List[Dict[str, Any]] = []
             if self._pending is not None:
@@ -1104,8 +1210,6 @@ class FunctionCallStreamAssembler:
             if ready_real:
                 self._attach_fallback_synth_sig(ready_real)
 
-            has_args = isinstance(fc_args, dict) and len(fc_args) > 0
-            has_partial = isinstance(fc_partial, list) and len(fc_partial) > 0
             synth_deltas: List[str] = []
             saw_done_signal = False
 
@@ -1121,7 +1225,10 @@ class FunctionCallStreamAssembler:
                         self._last_synth_path = path_str
                     tokens = _parse_json_path_tokens(path_str)
                     if is_done_json_path(tokens, path_str):
-                        saw_done_signal = True
+                        has_done_val, done_val, _ = _extract_partial_arg_value(parg)
+                        # 仅当 done 为真（或省略布尔值）时才视作收敛信号；done=false 表示仍在分段续写，不可提前封口
+                        if not has_done_val or done_val is not False:
+                            saw_done_signal = True
                         continue
                     has_val, val, _ = _extract_partial_arg_value(parg)
                     if has_val and isinstance(val, str) and val:
@@ -1131,21 +1238,38 @@ class FunctionCallStreamAssembler:
             elif has_args and not self._saw_synth_partial:
                 raw_extracted = extract_raw_synthetic_text(fc_args, emit_tool_name=self.synthetic_tool_name)
                 if raw_extracted:
-                    synth_deltas.append(raw_extracted)
+                    is_dup_full = bool(
+                        self._last_synth_call_head
+                        and (
+                            (len(raw_extracted) == self._last_synth_call_len and raw_extracted[:120] == self._last_synth_call_head)
+                            or (len(self._last_synth_call_head) >= 80 and raw_extracted.startswith(self._last_synth_call_head))
+                        )
+                    )
+                    if not is_dup_full:
+                        synth_deltas.append(raw_extracted)
 
             incoming_text = "".join(synth_deltas)
             if incoming_text:
                 self._synth_tail_buf += incoming_text
                 self._synth_total_received += len(incoming_text)
+                self._cur_synth_call_len += len(incoming_text)
+                if len(self._cur_synth_call_head) < 120:
+                    need_h = 120 - len(self._cur_synth_call_head)
+                    self._cur_synth_call_head += incoming_text[:need_h]
 
             self._ensure_lex_seeded(force=(not fc_will_continue or saw_done_signal))
 
             if not fc_will_continue or saw_done_signal:
-                # 合成工具本轮调用正常收敛结束（或已收到 $.done 信号）：冲刷当前尾窗，但仅在 not fc_will_continue 或实锤裁剪时才封死 _synth_eof_sealed，
+                # 合成工具本轮调用正常收敛结束（或已收到 $.done=true 信号）：冲刷当前尾窗，但仅在 not fc_will_continue 或实锤裁剪时才封死 _synth_eof_sealed，
                 # 防止 $.done 提前到达时吞掉紧随其后的尾随闭合标签分片（如 </affinity> / </status>）！
                 self._last_synth_path = ""
                 if not fc_will_continue:
                     self._saw_synth_partial = False
+                    if self._cur_synth_call_head:
+                        self._last_synth_call_head = self._cur_synth_call_head
+                        self._last_synth_call_len = self._cur_synth_call_len
+                        self._cur_synth_call_head = ""
+                        self._cur_synth_call_len = 0
                 clean_buf, trimmed, _ = analyze_synthetic_tail(
                     self._synth_tail_buf,
                     emit_tool_name=self.synthetic_tool_name,
@@ -1168,14 +1292,17 @@ class FunctionCallStreamAssembler:
             else:
                 base_for_check = self._lex_state
 
+            halt_reasons: List[str] = []
             clean_buf, halted, suspect_hold = analyze_synthetic_tail(
                 self._synth_tail_buf,
                 emit_tool_name=self.synthetic_tool_name,
                 base_lex=base_for_check,
                 at_eof=False,
+                reason_out=halt_reasons,
             )
             if halted:
                 self.synthetic_halted = True
+                self.synthetic_halt_reason = halt_reasons[0] if halt_reasons else "闭合溢出"
                 self._pending_is_synthetic = False
                 self._saw_synth_partial = False
                 self._last_synth_path = ""
@@ -1238,9 +1365,30 @@ class FunctionCallStreamAssembler:
 
         ready: List[Dict[str, Any]] = []
 
+        same_id = bool(fc_id and self._pending and self._pending.get("id") and fc_id == self._pending.get("id"))
+        starts_new_same_name_call = False
+        if self._pending is not None and fc_name and not same_id:
+            if not has_partial and has_args:
+                # 完整非分片 args 到达时，必为一次新调用
+                starts_new_same_name_call = True
+            elif not has_partial and not has_args and fc_will_continue and self._pending.get("has_payload"):
+                # 前一调用已有参数负载，此时又收到带 name + willContinue=True 的起始帧，说明进入下一次并行同名调用
+                starts_new_same_name_call = True
+            elif has_partial and self._pending.get("has_payload") and not self._pending.get("string_continuing"):
+                first_parg = fc_partial[0]
+                first_raw_path = (
+                    first_parg.get("jsonPath", first_parg.get("json_path"))
+                    if isinstance(first_parg, dict)
+                    else getattr(first_parg, "json_path", getattr(first_parg, "jsonPath", None))
+                )
+                first_tokens = _parse_json_path_tokens(str(first_raw_path or "").strip())
+                if first_tokens and _json_path_exists(self._pending.get("args"), first_tokens):
+                    starts_new_same_name_call = True
+
         if self._pending is not None and (
             (fc_name and self._pending["name"] and fc_name != self._pending["name"])
             or (fc_id and self._pending.get("id") and fc_id != self._pending["id"])
+            or starts_new_same_name_call
         ):
             ready.append(self._finalize_pending())
 
@@ -1261,6 +1409,7 @@ class FunctionCallStreamAssembler:
                 "thought_signature": thought_signature,
                 "last_path": "",
                 "string_continuing": False,
+                "has_payload": bool(has_args or has_partial),
             }
         else:
             if fc_id and not self._pending.get("id"):
@@ -1271,6 +1420,9 @@ class FunctionCallStreamAssembler:
                 self._pending["thought_signature"] = thought_signature
             if has_args and not has_partial:
                 self._pending["args"].update(fc_args)
+                self._pending["has_payload"] = True
+            if has_partial:
+                self._pending["has_payload"] = True
 
         if has_partial:
             for parg in fc_partial:
@@ -1346,7 +1498,7 @@ def sanitize_orphan_tool_turns(messages: List[OpenAIMessage]) -> List[OpenAIMess
             while j < n:
                 nxt = messages[j]
                 nxt_role = getattr(nxt, "role", "")
-                if nxt_role == "system":
+                if nxt_role in ("system", "developer"):
                     interleaved_sys.append(nxt)
                     j += 1
                     continue
@@ -1368,7 +1520,12 @@ def sanitize_orphan_tool_turns(messages: List[OpenAIMessage]) -> List[OpenAIMess
                         f"[已中断的工具调用 · {fn.get('name') or 'tool'}({fn.get('arguments') or '{}'})]"
                     )
                 downgraded = msg.model_copy(
-                    update={"content": "\n".join(summary_lines), "tool_calls": None}
+                    update={
+                        "content": "\n".join(summary_lines),
+                        "tool_calls": None,
+                        "extra_content": None,
+                        "reasoning_content": None,
+                    }
                 )
                 out.append(downgraded)
                 out.extend(interleaved_sys)
@@ -1419,8 +1576,12 @@ def sanitize_orphan_tool_turns(messages: List[OpenAIMessage]) -> List[OpenAIMess
             out.append(msg)
             out.extend(interleaved_sys)
             out.extend(aligned_tools)
-            # 多余未配对的孤立 tool 消息降级为普通文本观测
-            for extra_tm in unmatched_queue:
+            # 多余未配对（或重复 ID 溢出）的孤立 tool 消息降级为普通文本观测
+            leftover_tools: List[OpenAIMessage] = []
+            for bucket in by_id.values():
+                leftover_tools.extend(bucket)
+            leftover_tools.extend(unmatched_queue)
+            for extra_tm in leftover_tools:
                 t_body = _message_text(extra_tm.content)
                 out.append(
                     OpenAIMessage(
@@ -1470,7 +1631,7 @@ def create_gemini_prompt(
 
     for idx, message in enumerate(messages):
         role = message.role
-        if role == "system":
+        if role in ("system", "developer"):
             continue
 
         parts = []
@@ -1482,22 +1643,47 @@ def create_gemini_prompt(
             function_name = message.name or tool_name_by_id.get(tool_call_id_str) or tool_name_by_id.get(real_tool_id)
 
             if not function_name:
-                mock_text = f"[System Observation - Tool Result]:\n{message.content}"
+                mock_text = f"[System Observation - Tool Result]:\n{_message_text(message.content) or message.content}"
                 parts.append(types.Part.from_text(text=mock_text))
                 current_gemini_role = "user"
             else:
-                tool_output_data = _coerce_tool_response(message.content)
+                tool_output_data, fr_media_items = _extract_tool_response_payload(
+                    message.content, extract_media=True
+                )
 
                 func_resp_kwargs = {"name": function_name, "response": tool_output_data}
                 if real_tool_id and real_tool_id.startswith("function-call-"):
                     func_resp_kwargs["id"] = real_tool_id
 
+                fr_parts = []
+                if fr_media_items and hasattr(types, "FunctionResponsePart") and hasattr(types, "FunctionResponseBlob"):
+                    for m_bytes, m_mime in fr_media_items:
+                        try:
+                            fr_parts.append(
+                                types.FunctionResponsePart(
+                                    inline_data=types.FunctionResponseBlob(mime_type=m_mime, data=m_bytes)
+                                )
+                            )
+                        except Exception:
+                            pass
+                if fr_parts:
+                    func_resp_kwargs["parts"] = fr_parts
+
                 try:
                     resp_part = types.Part(
                         function_response=types.FunctionResponse(**func_resp_kwargs))
                 except Exception as e:
-                    print(f"⚠️ [工具调用] 构造 FunctionResponse 失败，将回退为基础形式：{e}")
-                    resp_part = types.Part.from_function_response(name=function_name, response=tool_output_data)
+                    if "parts" in func_resp_kwargs:
+                        func_resp_kwargs.pop("parts", None)
+                        try:
+                            resp_part = types.Part(
+                                function_response=types.FunctionResponse(**func_resp_kwargs))
+                        except Exception as e2:
+                            print(f"⚠️ [工具调用] 构造 FunctionResponse 失败，将回退为基础形式：{e2}")
+                            resp_part = types.Part.from_function_response(name=function_name, response=tool_output_data)
+                    else:
+                        print(f"⚠️ [工具调用] 构造 FunctionResponse 失败，将回退为基础形式：{e}")
+                        resp_part = types.Part.from_function_response(name=function_name, response=tool_output_data)
 
                 parts.append(resp_part)
                 current_gemini_role = "user"
@@ -1537,9 +1723,19 @@ def create_gemini_prompt(
                 except Exception as e:
                     print(f"⚠️ [工具调用] 构造 FunctionCall 失败，将回退为基础形式：{e}")
                     fc_part = types.Part.from_function_call(name=function_name, args=parsed_arguments)
+                    if thought_sig_bytes:
+                        try:
+                            fc_part = fc_part.model_copy(update={"thought_signature": thought_sig_bytes})
+                        except Exception:
+                            pass
                 tool_parts.append(fc_part)
 
             ordinary_parts = ordinary_parts_from_extra(message)
+            if ordinary_parts is not None:
+                msg_sig_chk, _ = signature_from_extra(message)
+                has_any_ord_sig = any(getattr(ep, "thought_signature", None) for ep in ordinary_parts) or bool(msg_sig_chk)
+                if not has_any_ord_sig:
+                    ordinary_parts = [ep for ep in ordinary_parts if not getattr(ep, "thought", None)]
             if ordinary_parts is None:
                 ordinary_parts = []
                 message_sig, signature_kind = signature_from_extra(message)
@@ -1554,6 +1750,16 @@ def create_gemini_prompt(
                     if clean_text:
                         ordinary_parts.append(types.Part.from_text(text=clean_text))
                     ordinary_parts.extend(image_parts)
+                elif isinstance(message.content, list):
+                    for part_item in message.content:
+                        part_item = normalize_content_part(part_item)
+                        if isinstance(part_item, dict) and part_item.get("type") == "text":
+                            txt_c = part_item.get("text", "")
+                            if txt_c:
+                                img_ps, clean_t = _extract_markdown_images_to_parts(txt_c, for_model_role=True)
+                                if clean_t:
+                                    ordinary_parts.append(types.Part.from_text(text=clean_t))
+                                ordinary_parts.extend(img_ps)
 
                 if message_sig:
                     target = None
@@ -2109,9 +2315,21 @@ def process_gemini_response_to_openai_dict(
 
                 if raw_gemini_finish_reason_str == "STOP":
                     openai_finish_reason = "stop"
-                elif raw_gemini_finish_reason_str == "MAX_TOKENS":
+                elif raw_gemini_finish_reason_str in (
+                    "MAX_TOKENS",
+                    "MALFORMED_FUNCTION_CALL",
+                    "MALFORMED_RESPONSE",
+                    "UNEXPECTED_TOOL_CALL",
+                ):
                     openai_finish_reason = "length"
-                elif raw_gemini_finish_reason_str == "SAFETY":
+                elif raw_gemini_finish_reason_str in (
+                    "SAFETY",
+                    "PROHIBITED_CONTENT",
+                    "RECITATION",
+                    "BLOCKLIST",
+                    "SPII",
+                    "IMAGE_SAFETY",
+                ):
                     openai_finish_reason = "content_filter"
                 elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]:
                     openai_finish_reason = "tool_calls"

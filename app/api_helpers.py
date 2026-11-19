@@ -27,6 +27,7 @@ from logger import stats, call_recorder
 from synthetic_wrapper import (
     _BUILTIN_SEARCH_NAMES,
     extract_synthetic_content,
+    is_builtin_search_tool,
     is_malformed_tool_finish,
     is_stream_fc_args_unsupported_error,
     make_bad_woman_response_id,
@@ -63,6 +64,20 @@ def _sdk_supports_params_json_schema() -> bool:
 
 
 _USE_PARAMS_JSON_SCHEMA = _sdk_supports_params_json_schema()
+
+
+def _sdk_supports_response_json_schema() -> bool:
+    try:
+        fields = getattr(types.GenerateContentConfig, "model_fields", None) or {}
+        if "response_json_schema" in fields:
+            return True
+        ann = getattr(types.GenerateContentConfig, "__annotations__", None) or {}
+        return "response_json_schema" in ann
+    except Exception:
+        return False
+
+
+_USE_RESPONSE_JSON_SCHEMA = _sdk_supports_response_json_schema()
 
 
 def _safety_score_enabled() -> bool:
@@ -359,7 +374,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
 
     system_texts = []
     for msg in request.messages:
-        if msg.role == "system" and msg.content:
+        if msg.role in ("system", "developer") and msg.content:
             if isinstance(msg.content, str):
                 system_texts.append(msg.content)
             elif isinstance(msg.content, list):
@@ -425,8 +440,11 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
             if isinstance(json_schema_obj, dict):
                 schema = json_schema_obj.get("schema")
             if isinstance(schema, dict):
-                schema = {k: v for k, v in schema.items() if k != "$schema"}
-                config["response_schema"] = schema
+                schema = _strip_json_schema_meta(schema)
+                if _USE_RESPONSE_JSON_SCHEMA:
+                    config["response_json_schema"] = schema
+                else:
+                    config["response_schema"] = schema
 
     safety_threshold = "BLOCK_NONE"
 
@@ -457,8 +475,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         else:
             fn_name = ""
 
-        norm_name = fn_name.lower().replace("-", "_") if fn_name else ""
-        if t_type in _BUILTIN_SEARCH_NAMES or norm_name in _BUILTIN_SEARCH_NAMES:
+        if is_builtin_search_tool(tool):
             declared_search = True
             continue
         if func_data is not None and fn_name and (t_type in ("", "function") or "function" in tool or "parameters" in tool):
@@ -475,7 +492,11 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
                 if _USE_PARAMS_JSON_SCHEMA:
                     declaration["parameters_json_schema"] = parameters
                 else:
-                    declaration["parameters"] = parameters
+                    # 旧版 OpenAPI Schema 对无参 OBJECT 要求省略 parameters，避免空 properties 触发 400
+                    if isinstance(parameters, dict) and not parameters.get("properties") and str(parameters.get("type", "")).lower() == "object":
+                        pass
+                    else:
+                        declaration["parameters"] = parameters
             declaration = {k: v for k, v in declaration.items() if v is not None}
             function_declarations.append(declaration)
 
@@ -485,7 +506,12 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     if isinstance(choice, dict):
         _choice_fn = choice.get("function") if isinstance(choice.get("function"), dict) else {}
         _choice_name = str(_choice_fn.get("name") or choice.get("name") or "").strip()
-    _forced_search = bool(_choice_name and _choice_name.lower().replace("-", "_") in _BUILTIN_SEARCH_NAMES)
+    _declared_custom_names = {d["name"] for d in function_declarations}
+    _forced_search = bool(
+        _choice_name
+        and _choice_name not in _declared_custom_names
+        and _choice_name.lower().replace("-", "_") in _BUILTIN_SEARCH_NAMES
+    )
 
     tools_list = []
     active_function_names: list[str] = []
@@ -511,7 +537,7 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         if (declared_search or _forced_search) and not _tools_disabled and profile.get("supports_search"):
             tools_list = [{"google_search": {}}]
 
-        for key in ["response_mime_type", "response_schema", "response_logprobs", "logprobs"]:
+        for key in ["response_mime_type", "response_schema", "response_json_schema", "response_logprobs", "logprobs"]:
             config.pop(key, None)
     else:
         if config.get("temperature") is None and settings.get("default_temperature") is not None:
@@ -795,9 +821,9 @@ def print_outbound_debug_report(
     if messages:
         first = messages[0]
         f_role = getattr(first, "role", "") if hasattr(first, "role") else (first.get("role") if isinstance(first, dict) else "")
-        if f_role == "system":
+        if f_role in ("system", "developer"):
             f_content = _plain_text_preview(getattr(first, "content", "") if hasattr(first, "content") else first.get("content"))
-            lines.append(f"  📜 [第 1 轮 system]: \"{_format_preview(f_content, 120)}\"")
+            lines.append(f"  📜 [第 1 轮 {f_role}]: \"{_format_preview(f_content, 120)}\"")
 
         last = messages[-1]
         l_role = getattr(last, "role", "unknown") if hasattr(last, "role") else (last.get("role", "unknown") if isinstance(last, dict) else "unknown")
@@ -926,8 +952,9 @@ def wants_usage(request_obj: Any) -> bool:
     return False
 
 
-def make_usage_chunk(response_id: str, model: str, usage: dict) -> str:
-    chunk = {"id": response_id, "object": "chat.completion.chunk", "created": int(time.time()),
+def make_usage_chunk(response_id: str, model: str, usage: dict, created: Optional[int] = None) -> str:
+    chunk = {"id": response_id, "object": "chat.completion.chunk",
+             "created": int(created if created is not None else time.time()),
              "model": model, "choices": [], "usage": usage}
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
@@ -1087,6 +1114,14 @@ class ToolCallIndexer:
         asm = self._assemblers.get(candidate_index)
         return bool(asm and asm.synthetic_halted)
 
+    def synthetic_halt_reason(self, candidate_index: int = 0) -> str:
+        asm = self._assemblers.get(candidate_index)
+        return (asm.synthetic_halt_reason if asm else "") or ""
+
+    def has_unclosed_synthetic(self, candidate_index: int = 0) -> bool:
+        asm = self._assemblers.get(candidate_index)
+        return bool(asm and asm.has_unclosed_synthetic())
+
     def flush_synthetic_tail(self, candidate_index: int = 0) -> str:
         asm = self._assemblers.get(candidate_index)
         return asm.flush_synthetic_tail() if asm else ""
@@ -1129,7 +1164,7 @@ class ToolCallIndexer:
             and orders[-1].get("index") == len(items) - 1
             and kind in ("text", "thought")
             and items[-1].get("kind") == kind
-            and not (items[-1].get("thought_signature") and metadata.get("thought_signature"))
+            and not items[-1].get("thought_signature")
         ):
             prev = items[-1]
             add_txt = metadata.get("text") or ""
@@ -1207,7 +1242,14 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
                 "UNEXPECTED_TOOL_CALL",
             ):
                 openai_finish_reason = "length"
-            elif raw_gemini_finish_reason_str == "SAFETY":
+            elif raw_gemini_finish_reason_str in (
+                "SAFETY",
+                "PROHIBITED_CONTENT",
+                "RECITATION",
+                "BLOCKLIST",
+                "SPII",
+                "IMAGE_SAFETY",
+            ):
                 openai_finish_reason = "content_filter"
             elif raw_gemini_finish_reason_str in ["TOOL_CODE", "FUNCTION_CALL"]:
                 openai_finish_reason = "tool_calls"
@@ -1381,7 +1423,8 @@ def convert_chunk_to_openai(chunk: Any, model_name: str, response_id: str, candi
 async def _chunk_openai_response_dict_for_sse(
     openai_response_dict: Dict[str, Any],
     response_id_override: Optional[str] = None,
-    model_name_override: Optional[str] = None
+    model_name_override: Optional[str] = None,
+    include_usage: bool = False,
 ):
     resp_id = response_id_override or openai_response_dict.get("id", f"chatcmpl-fakestream-{int(time.time())}")
     model_name = model_name_override or openai_response_dict.get("model", "unknown")
@@ -1445,6 +1488,11 @@ async def _chunk_openai_response_dict_for_sse(
         if message.get("extra_content") is not None:
             fin_delta["extra_content"] = message["extra_content"]
         yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': choice_idx, 'delta': fin_delta, 'finish_reason': final_finish_reason}]}, ensure_ascii=False)}\n\n"
+
+    if include_usage:
+        usage = openai_response_dict.get("usage")
+        if isinstance(usage, dict):
+            yield make_usage_chunk(resp_id, model_name, usage, created=created_time)
 
     yield "data: [DONE]\n\n"
 
@@ -2334,13 +2382,25 @@ async def execute_unified_completion(
                                 _msg0 = _ch0.get("message") or {}
                                 _raw_gen_chars = len(_msg0.get("content") or "")
                                 usage_info = _record_usage(raw_gemini_response, visible_chars=_raw_gen_chars)
+                                if usage_info["prompt_tokens"] or usage_info["completion_tokens"]:
+                                    _u_fake: Dict[str, Any] = {
+                                        "prompt_tokens": usage_info["prompt_tokens"],
+                                        "completion_tokens": usage_info["completion_tokens"],
+                                        "total_tokens": usage_info["total_tokens"],
+                                    }
+                                    if usage_info["thoughts_tokens"] > 0:
+                                        _u_fake["completion_tokens_details"] = {"reasoning_tokens": usage_info["thoughts_tokens"]}
+                                    openai_response_dict["usage"] = _u_fake
                                 _prepend_prefill(openai_response_dict, prefill_text)
 
                                 _fin0 = _ch0.get("finish_reason") or "stop"
                                 _has_tc0 = bool(_msg0.get("tool_calls"))
                                 _out_c0 = len(_msg0.get("content") or "")
 
-                                async for chunk_sse in _chunk_openai_response_dict_for_sse(openai_response_dict=openai_response_dict):
+                                async for chunk_sse in _chunk_openai_response_dict_for_sse(
+                                    openai_response_dict=openai_response_dict,
+                                    include_usage=wants_usage(exp_req_obj),
+                                ):
                                     has_yielded_output = True
                                     any_output_yielded = True
                                     yield chunk_sse
@@ -2406,6 +2466,8 @@ async def execute_unified_completion(
                                         deduper = PrefillDeduper(prefill_text) if (prefill_text and (exp_req_obj.n or 1) == 1) else None
                                         prefill_emitted = not bool(prefill_text)
                                         emitted_finish_reason = False
+                                        saw_upstream_finish_reason = False
+                                        silent_eof_truncated = False
                                         last_finish_reason_str = "stop"
                                         last_stream_chunk_obj = None
                                         raw_p_max, raw_th_max, raw_out_max, raw_tool_p_max, raw_tot_max = 0, 0, 0, 0, 0
@@ -2413,6 +2475,13 @@ async def execute_unified_completion(
                                         async for chunk_item_call in stream_gen_obj:
                                             received_any_stream_chunk = True
                                             last_stream_chunk_obj = chunk_item_call
+                                            for _cand_fr_chk in (getattr(chunk_item_call, "candidates", None) or []):
+                                                _fr_val = getattr(_cand_fr_chk, "finish_reason", None)
+                                                if _fr_val is not None:
+                                                    _fr_nm = str(getattr(_fr_val, "name", _fr_val) or "").strip().upper()
+                                                    if _fr_nm and not _fr_nm.endswith("UNSPECIFIED"):
+                                                        saw_upstream_finish_reason = True
+                                                        break
                                             _has_m_tok, _has_m_th = _chunk_has_model_token(
                                                 chunk_item_call, include_thoughts=tracker.include_thoughts
                                             )
@@ -2513,7 +2582,8 @@ async def execute_unified_completion(
                                                         last_finish_reason_str = "tool_calls"
                                                 yield sse_chunk
                                             if tool_indexer.has_synthetic_halted(0):
-                                                print(f"🛑 [抗截断保护] 检测到 {model_to_call} 工具闭合溢出特征，已平滑切除并立即断开上游流。")
+                                                _h_reason = tool_indexer.synthetic_halt_reason(0) or "闭合溢出"
+                                                print(f"🛑 [抗截断保护] 检测到 {model_to_call} 触发熔断（{_h_reason}），已平滑切除并立即断开上游流。")
                                                 last_finish_reason_str = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
                                                 break
 
@@ -2642,7 +2712,16 @@ async def execute_unified_completion(
                                             raise err_empty_stream
 
                                         if has_yielded_output and not emitted_finish_reason:
-                                            _fin_reason = "tool_calls" if tool_indexer.has_tool_calls(0) else "stop"
+                                            if tool_indexer.has_tool_calls(0):
+                                                _fin_reason = "tool_calls"
+                                            elif tool_indexer.has_synthetic_halted(0):
+                                                _fin_reason = "stop"
+                                            elif not saw_upstream_finish_reason:
+                                                # 上游未下发任何 finish_reason 即静默结束流：按截断上报 finish_reason=length，避免客户端误以为完整收尾
+                                                _fin_reason = "length"
+                                                silent_eof_truncated = True
+                                            else:
+                                                _fin_reason = "stop"
                                             last_finish_reason_str = _fin_reason
                                             _fin_delta_eof: Dict[str, Any] = {}
                                             if not tool_indexer.has_emitted_extra(0):
@@ -2726,7 +2805,15 @@ async def execute_unified_completion(
                                             out_tk=final_out_tk,
                                             out_chars=_stream_chars,
                                         )
-                                        print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
+                                        if tool_indexer.has_synthetic_halted(0):
+                                            _h_fin = tool_indexer.synthetic_halt_reason(0) or "闭合溢出"
+                                            print(f"⚠️ [Express] {request_obj.model} | 抗截断保护提前收口（{_h_fin}）| 耗时 {elapsed:.1f}s")
+                                        elif silent_eof_truncated:
+                                            print(f"⚠️ [Express] {request_obj.model} | 上游静默断流（未收到 finish_reason，正文可能不完整），已标 finish_reason=length | 耗时 {elapsed:.1f}s")
+                                        elif last_finish_reason_str == "length":
+                                            print(f"⚠️ [Express] {request_obj.model} | 流式传输结束（finish_reason=length，已达上限或截断）| 耗时 {elapsed:.1f}s")
+                                        else:
+                                            print(f"✅ [Express] {request_obj.model} | 流式传输顺利完毕 | 耗时 {elapsed:.1f}s")
                                         return
                                     except _MalformedSandboxFallback:
                                         sandbox_downgraded = True

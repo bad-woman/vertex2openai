@@ -18,7 +18,7 @@ from logger import rt_logger, stats, call_recorder
 import config
 from runtime_state import app_state
 import model_capabilities as mc
-from model_loader import get_express_models
+from model_loader import get_express_models, get_model_categories
 
 from cookie_auth import validate_cookie
 import express_key_probe
@@ -716,7 +716,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                   <option value="low">low（轻量思考）</option>
                   <option value="medium">medium（均衡思考）</option>
                   <option value="high">high（深度思考）</option>
-                  <option value="xhigh">xhigh（超高思考 · 仅 4-hydrogen，其余降级 high）</option>
+                  <option value="xhigh">xhigh（超高思考 · 仅支持四档思考的 4.x 机型，其余降级 high）</option>
                 </select>
               </div>
               <div>
@@ -1487,8 +1487,35 @@ async function loadParams(){
     var c=await (await fetch('/api/capabilities')).json();
     CAPS=c.capabilities||{};
     OVERRIDES=c.overrides||{};
-    $('model-sel').innerHTML='<option value="__global__">＊ 全局默认（对所有模型）</option>'
-      + (c.models||[]).map(function(m){var star=OVERRIDES[m]?' ★':''; return '<option value="' + m + '">' + m + star + '</option>';}).join('');
+    var selHtml='<option value="__global__">＊ 全局默认（对所有模型）</option>';
+    var allModels=c.models||[];
+    var cats=Array.isArray(c.categories)?c.categories:[];
+    if(cats.length){
+      var grouped={};
+      cats.forEach(function(cat){
+        var ms=(cat&&Array.isArray(cat.models))?cat.models:[];
+        if(!ms.length) return;
+        selHtml+='<optgroup label="'+escH(cat.label||cat.id||'模型分组')+'">';
+        ms.forEach(function(m){
+          grouped[m]=true;
+          var star=OVERRIDES[m]?' ★':'';
+          selHtml+='<option value="'+escH(m)+'">'+escH(m)+star+'</option>';
+        });
+        selHtml+='</optgroup>';
+      });
+      var extras=allModels.filter(function(m){return !grouped[m];});
+      if(extras.length){
+        selHtml+='<optgroup label="其他模型">';
+        extras.forEach(function(m){
+          var star=OVERRIDES[m]?' ★':'';
+          selHtml+='<option value="'+escH(m)+'">'+escH(m)+star+'</option>';
+        });
+        selHtml+='</optgroup>';
+      }
+    } else {
+      selHtml+=allModels.map(function(m){var star=OVERRIDES[m]?' ★':''; return '<option value="' + escH(m) + '">' + escH(m) + star + '</option>';}).join('');
+    }
+    $('model-sel').innerHTML=selHtml;
     renderCaps();
   }catch(e){ renderCaps(); }
 }
@@ -1590,7 +1617,7 @@ function renderCaps(){
     $('caps-summary').innerHTML = chip('🌐 作用域：全局默认', true) + chip('切换具体模型可查看其能力白名单');
     ['thinking_g3_level','image_size','image_aspect_ratio'].forEach(function(id){var el=$(id); if(el) el.disabled=false;});
     $('wrap-g3level').style.opacity='1';
-    $('think-note').textContent='全局默认：选「自动」时采用模型官方原生默认档位；压制思考或选 minimal 时，3.7+ 及 4.x 全系最低自动发送 low；仅 4-hydrogen 支持 xhigh，其余模型选或传入 xhigh 时自动降级为 high。';
+    $('think-note').textContent='全局默认：选「自动」时采用模型官方原生默认档位；压制思考或选 minimal 时，3.7+ 及 4.x 全系最低自动发送 low；仅支持四档思考的 4.x 机型（如 4-neon / 4-hydrogen）生效 xhigh，其余模型自动降级为 high。';
     $('image-note').textContent='全局默认：分辨率与宽高比仅在调用生图模型（-image / nano-banana）时生效。';
     $('sampling-note').textContent='全局默认：遇到已废弃采样参数的模型（如 Gemini 3.6+ / 4.x）会自动剥离以防报错。';
     return;
@@ -1607,6 +1634,7 @@ function renderCaps(){
     sum.push(chip('生图专用'));
   } else {
     sum.push(chip('采样 '+(cap.sampling_advice==='deprecated'?'已废弃·自动剥离':cap.sampling_advice==='recommend_default'?'可调·建议默认':'可调')));
+    if(cap.max_nonstream_output_tokens) sum.push(chip('一元上限 '+Math.round(cap.max_nonstream_output_tokens/1024)+'K'));
     sum.push(chip('支持函数调用'));
   }
   if(cap.supports_search) sum.push(chip('支持联网搜索'));
@@ -2020,11 +2048,13 @@ async def update_settings_api(request: Request, _auth: bool = Depends(require_au
 async def get_capabilities_api(_auth: bool = Depends(require_auth)):
     try:
         models = await get_express_models()
+        categories = await get_model_categories()
     except Exception:
         models = []
+        categories = []
     caps = {m: mc.capabilities_summary(m, app_state.get_effective_settings(m)) for m in models}
     overrides = app_state.get_model_overrides()
-    return JSONResponse(content={"models": models, "capabilities": caps, "overrides": overrides})
+    return JSONResponse(content={"models": models, "categories": categories, "capabilities": caps, "overrides": overrides})
 
 
 @app.get("/api/model-overrides")
