@@ -265,11 +265,21 @@
       overflow-x: clip;
     }
     body {
-      background-image: var(--starfield), var(--bg-mesh);
-      background-attachment: fixed;
-      transition: background-color 0.28s var(--ease-out), color 0.22s var(--ease-out);
+      background-color: var(--bg-base);
+      transition: background-color 0.24s var(--ease-out), color 0.2s var(--ease-out);
       line-height: 1.5;
       font-size: 14px;
+    }
+    /* 独立静态 GPU 背景层：彻底替代 body background-attachment:fixed，杜绝手机端每帧 CPU 重绘卡顿 */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background-color: var(--bg-base);
+      background-image: var(--starfield), var(--bg-mesh);
+      transform: translateZ(0);
     }
     button, input, select, textarea {
       font-family: inherit;
@@ -367,13 +377,13 @@
       height: 7px;
       border-radius: 50%;
       background: var(--success);
-      box-shadow: 0 0 0 0 var(--success-soft);
       animation: breathe 2.4s ease-in-out infinite;
       flex-shrink: 0;
+      will-change: transform, opacity;
     }
     @keyframes breathe {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45); opacity: 1; }
-      50% { box-shadow: 0 0 0 5px rgba(52, 211, 153, 0); opacity: 0.78; }
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(0.82); opacity: 0.52; }
     }
 
     /* Sidebar Navigation */
@@ -545,15 +555,16 @@
        ===================================================================== */
     .glass-card {
       background: var(--surface);
-      backdrop-filter: blur(18px) saturate(1.22);
-      -webkit-backdrop-filter: blur(18px) saturate(1.22);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       border: 1px solid var(--border);
       border-radius: var(--radius-xl);
       box-shadow: var(--shadow-card), inset 0 1px 0 var(--top-highlight);
       padding: 20px;
       position: relative;
       min-width: 0;
-      transition: border-color 0.2s, box-shadow 0.2s;
+      contain: layout style;
+      transition: border-color 0.2s;
     }
     .card-header {
       display: flex;
@@ -1840,6 +1851,8 @@
       padding: 14px 16px;
       height: 410px;
       overflow-y: auto;
+      overscroll-behavior-y: contain;
+      -webkit-overflow-scrolling: touch;
     }
     .log-line { padding: 2px 0; word-break: break-word; }
     .log-ts { color: var(--terminal-muted); margin-right: 8px; }
@@ -1973,10 +1986,11 @@
         height: var(--mobile-top-h);
         padding: 0 14px;
         background: var(--sidebar-bg);
-        backdrop-filter: blur(20px) saturate(1.25);
-        -webkit-backdrop-filter: blur(20px) saturate(1.25);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
         border-bottom: 1px solid var(--border);
         z-index: 45;
+        transform: translateZ(0);
       }
       .mobile-brand {
         display: flex;
@@ -1999,15 +2013,82 @@
         flex-shrink: 0;
       }
 
+      .app-shell {
+        min-height: calc(100dvh - var(--mobile-top-h));
+      }
       .main-stage {
         margin-left: 0;
         width: 100%;
       }
       .stage-inner {
-        padding: 16px 14px calc(var(--mobile-nav-h) + 96px + env(safe-area-inset-bottom));
+        padding: 14px 12px calc(var(--mobile-nav-h) + 14px + env(safe-area-inset-bottom));
       }
+      body.has-dirty-bar .stage-inner {
+        padding-bottom: calc(var(--mobile-nav-h) + 88px + env(safe-area-inset-bottom));
+      }
+      .page-header { margin-bottom: 14px; gap: 10px; }
       .page-title { font-size: 19px; }
-      .glass-card { padding: 15px; border-radius: 16px; }
+
+      /* Mobile Live Terminal: 锁定为整屏 flex 视口，杜绝底部空白与双层滚动锁死 */
+      html:has(body.mobile-term-open),
+      body.mobile-term-open {
+        height: 100dvh;
+        overflow: hidden;
+      }
+      body.mobile-term-open .app-shell,
+      body.mobile-term-open .main-stage {
+        height: calc(100dvh - var(--mobile-top-h));
+        min-height: 0;
+        overflow: hidden;
+      }
+      body.mobile-term-open .stage-inner {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        padding: 12px 12px calc(var(--mobile-nav-h) + 10px + env(safe-area-inset-bottom));
+        overflow: hidden;
+      }
+      body.mobile-term-open #panel-logs.active {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+      }
+      body.mobile-term-open #panel-logs .page-header {
+        margin-bottom: 10px;
+        flex-shrink: 0;
+      }
+      body.mobile-term-open #panel-logs .page-desc {
+        display: none;
+      }
+      body.mobile-term-open #logsSubTerminal {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        padding: 12px;
+      }
+      body.mobile-term-open #logsSubTerminal .log-toolbar {
+        margin-bottom: 10px;
+        gap: 7px;
+        flex-shrink: 0;
+      }
+      body.mobile-term-open #logsSubTerminal .terminal-box {
+        flex: 1;
+        height: auto;
+        min-height: 0;
+        padding: 10px 12px;
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+      }
+      .glass-card {
+        padding: 15px;
+        border-radius: 16px;
+        background: var(--surface-strong);
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        box-shadow: 0 4px 14px -4px rgba(15, 23, 42, 0.08), inset 0 1px 0 var(--top-highlight);
+      }
       .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
       .kpi-card { padding: 14px; }
       .kpi-val { font-size: 22px; }
@@ -2046,10 +2127,11 @@
         bottom: 0;
         padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
         background: var(--sidebar-bg);
-        backdrop-filter: blur(22px) saturate(1.3);
-        -webkit-backdrop-filter: blur(22px) saturate(1.3);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
         border-top: 1px solid var(--border);
         z-index: 50;
+        transform: translateZ(0);
       }
       .mob-tab {
         display: flex;
