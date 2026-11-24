@@ -5,6 +5,7 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
+  let currentTab = "overview";
 
   const THEMES = [
     { id: "sky-day", name: "晴空汽水", swatch: "swatch-sky-day" },
@@ -136,11 +137,14 @@
   let modelSort = "calls";
   let showAllModels = false;
   let lastStatsPayload = null;
+  let lastStatsSig = "";
+  let overviewDirty = false;
   let lastRecordsVersion = -1;
   let lastLiveCount = 0;
 
   window.setRange = function (range) {
     currentRange = range;
+    lastStatsSig = "";
     document.querySelectorAll("[data-range]").forEach((b) => b.classList.toggle("active", b.dataset.range === range));
     fetchStats();
   };
@@ -162,7 +166,25 @@
       if (!r.ok) return;
       const d = await r.json();
       lastStatsPayload = d;
-      renderOverview(d);
+      const uptimeH = (Number(d.uptime || 0) / 3600).toFixed(1);
+      if ($("sideUptimeText")) $("sideUptimeText").textContent = `已运行 ${uptimeH} h`;
+      if ($("mobUptimeText")) $("mobUptimeText").textContent = `已运行 ${uptimeH} h`;
+
+      const sig = JSON.stringify([
+        currentRange, d.total, d.success, d.retries, d.error,
+        d.prompt_tokens, d.cached_tokens, d.completion_tokens,
+        d.thought_tokens, d.output_tokens, d.records_version,
+        d.models ? d.models.length : 0
+      ]);
+      if (sig !== lastStatsSig) {
+        lastStatsSig = sig;
+        if (currentTab === "overview") {
+          renderOverview(d);
+          overviewDirty = false;
+        } else {
+          overviewDirty = true;
+        }
+      }
       if (typeof d.records_version === "number" && d.records_version !== lastRecordsVersion) {
         fetchRecords();
       }
@@ -1176,8 +1198,10 @@
     const diff = countDirtyDiffs();
     const isParamsActive = $("panel-params").classList.contains("active");
     const wrap = $("dirtyBarWrap");
+    const show = diff > 0 && isParamsActive;
     $("dirtyBarText").textContent = `检测到 ${diff} 项未保存的配置改动`;
-    wrap.classList.toggle("show", diff > 0 && isParamsActive);
+    wrap.classList.toggle("show", show);
+    document.body.classList.toggle("has-dirty-bar", show);
   }
 
   window.onParamChange = function () {
@@ -1946,13 +1970,27 @@
   let recFilter = "all";
   let openRecIds = {};
 
+  let logsSubMode = "records";
+
+  function syncMobileTermLock() {
+    const lock = currentTab === "logs" && logsSubMode === "terminal";
+    document.body.classList.toggle("mobile-term-open", lock);
+  }
+
   window.setLogsSub = function (sub) {
-    const isRec = sub === "records";
+    logsSubMode = sub === "terminal" ? "terminal" : "records";
+    const isRec = logsSubMode === "records";
     $("logsSubRecBtn").classList.toggle("active", isRec);
     $("logsSubTermBtn").classList.toggle("active", !isRec);
     $("logsSubRecords").style.display = isRec ? "block" : "none";
-    $("logsSubTerminal").style.display = isRec ? "none" : "block";
-    if (!isRec && termAutoscroll) scrollTerminalBottom();
+    $("logsSubTerminal").style.display = isRec ? "none" : "flex";
+    $("logsSubTerminal").style.flexDirection = "column";
+    syncMobileTermLock();
+    if (!isRec) {
+      window.renderTerminal();
+      window.scrollTo({ top: 0, behavior: "instant" });
+      if (termAutoscroll) scrollTerminalBottom();
+    }
   };
 
   window.setRecFilter = function (f) {
@@ -2106,12 +2144,37 @@
 
   /* ── Live SSE Terminal ── */
   let termAutoscroll = true;
+  let termProgScroll = false;
   let LOG_RAW_LINES = [];
+
+  function setTermAutoscroll(on) {
+    termAutoscroll = Boolean(on);
+    if ($("termPauseBtn")) {
+      $("termPauseBtn").textContent = termAutoscroll ? "自动置底：开" : "自动置底：关";
+    }
+  }
 
   function scrollTerminalBottom() {
     const box = $("terminalBox");
     if (!box) return;
-    requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
+    requestAnimationFrame(() => {
+      termProgScroll = true;
+      box.scrollTop = box.scrollHeight;
+      requestAnimationFrame(() => { termProgScroll = false; });
+    });
+  }
+
+  if ($("terminalBox")) {
+    $("terminalBox").addEventListener("scroll", function () {
+      if (termProgScroll) return;
+      const box = this;
+      const distFromBottom = box.scrollHeight - box.scrollTop - box.clientHeight;
+      if (distFromBottom > 40 && termAutoscroll) {
+        setTermAutoscroll(false);
+      } else if (distFromBottom <= 10 && !termAutoscroll) {
+        setTermAutoscroll(true);
+      }
+    }, { passive: true });
   }
 
   function classifyLogLevel(line) {
@@ -2166,8 +2229,7 @@
   };
 
   window.toggleTermPause = function () {
-    termAutoscroll = !termAutoscroll;
-    $("termPauseBtn").textContent = termAutoscroll ? "自动置底：开" : "自动置底：关";
+    setTermAutoscroll(!termAutoscroll);
     if (termAutoscroll) scrollTerminalBottom();
   };
 
@@ -2177,6 +2239,19 @@
     showToast("已清空当前终端面板");
   };
 
+  let termRafPending = false;
+
+  function scheduleTerminalRender() {
+    if (termRafPending) return;
+    termRafPending = true;
+    requestAnimationFrame(() => {
+      termRafPending = false;
+      if (currentTab === "logs" && logsSubMode === "terminal") {
+        window.renderTerminal();
+      }
+    });
+  }
+
   function connectLogSSE() {
     try {
       const es = new EventSource("/stream-logs");
@@ -2184,7 +2259,7 @@
         if (!e.data || e.data.includes("keep-alive")) return;
         if (LOG_RAW_LINES.length >= 250) LOG_RAW_LINES.shift();
         LOG_RAW_LINES.push(e.data);
-        window.renderTerminal();
+        scheduleTerminalRender();
       };
     } catch (e) {}
   }
@@ -2192,7 +2267,6 @@
   /* =====================================================================
      7. NAVIGATION, COPY /V1, LOGOUT & POLLING LOOP
      ===================================================================== */
-  let currentTab = "overview";
 
   function applyTab(tab) {
     currentTab = tab;
@@ -2200,9 +2274,16 @@
     $("panel-" + tab).classList.add("active");
     document.querySelectorAll("[data-tab]").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
     refreshDirtyState();
-    if (tab === "logs") {
+    syncMobileTermLock();
+    if (tab === "overview" && overviewDirty && lastStatsPayload) {
+      renderOverview(lastStatsPayload);
+      overviewDirty = false;
+    } else if (tab === "logs") {
       fetchRecords();
-      if ($("logsSubTerminal").style.display !== "none" && termAutoscroll) scrollTerminalBottom();
+      if (logsSubMode === "terminal") {
+        window.renderTerminal();
+        if (termAutoscroll) scrollTerminalBottom();
+      }
     } else if (tab === "channel") {
       loadExpressKeysQuiet();
       loadRuntime();
