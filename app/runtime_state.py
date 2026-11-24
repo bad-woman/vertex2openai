@@ -230,6 +230,11 @@ class AppState:
                 for k, v in stored.items():
                     if k in merged:
                         merged[k] = copy.deepcopy(v)
+            # 采样参数与策略已彻底废弃：始终静默剥离，输出上限交由模型原生默认控制（避免旧 web_state.json 残留生效）
+            merged["sampling_policy"] = "auto"
+            merged["default_temperature"] = None
+            merged["default_top_p"] = None
+            merged["default_max_tokens"] = None
             return merged
 
     def get_setting(self, key: str, default=None):
@@ -319,6 +324,11 @@ class AppState:
             for k in app_config.PER_MODEL_KEYS:
                 if k in ov:
                     base[k] = ov[k]
+        # 始终保持采样参数静默自动剥离与模型默认最大输出上限，忽略旧版残留覆盖值
+        base["sampling_policy"] = "auto"
+        base["default_temperature"] = None
+        base["default_top_p"] = None
+        base["default_max_tokens"] = None
         return base
 
 

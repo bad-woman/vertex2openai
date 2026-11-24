@@ -24,6 +24,32 @@ import model_capabilities as mc
 from runtime_state import app_state
 from schema_validation import SchemaValidationError, validate_request_schemas
 from logger import stats, call_recorder
+from error_utils import (
+    get_retry_settings,
+    _mask_key_short,
+    create_openai_error_response,
+    _diagnose_express_error,
+    extract_upstream_error,
+    extract_retry_after_seconds,
+    _describe_empty_gemini_response,
+    is_retryable_exception,
+    is_express_auth_or_billing_error,
+    is_location_pin_failure,
+    _emit_credential_invalid_warning,
+)
+from call_tracker import (
+    _um_get_int,
+    _extract_raw_usage_fields,
+    _extract_cached_tokens,
+    _reconcile_usage_counts,
+    _extract_usage_detail,
+    _extract_usage,
+    _record_usage,
+    _short_cred_name,
+    _format_thinking_for_record,
+    _chunk_has_model_token,
+    CallTraceTracker,
+)
 from synthetic_wrapper import (
     _BUILTIN_SEARCH_NAMES,
     extract_synthetic_content,
@@ -87,286 +113,7 @@ def _safety_score_enabled() -> bool:
         return bool(app_config.SAFETY_SCORE)
 
 
-def get_retry_settings() -> tuple[int, float]:
-    """读取重试配置。总请求次数 = retry_max + 1。"""
-    try:
-        retry_max = int(app_state.get_setting("retry_max", app_config.DEFAULT_SETTINGS["retry_max"]))
-    except (TypeError, ValueError):
-        retry_max = app_config.DEFAULT_SETTINGS["retry_max"]
-    try:
-        backoff = float(app_state.get_setting(
-            "retry_backoff_seconds", app_config.DEFAULT_SETTINGS["retry_backoff_seconds"]))
-    except (TypeError, ValueError):
-        backoff = app_config.DEFAULT_SETTINGS["retry_backoff_seconds"]
-    return max(0, min(50, retry_max)), max(0.0, min(120.0, backoff))
-
-
-def _mask_key_short(key: str) -> str:
-    k = str(key or "").strip()
-    if len(k) <= 10:
-        return "****"
-    return f"{k[:6]}…{k[-4:]}"
-
-
-def create_openai_error_response(status_code: int, message: str, error_type: str) -> Dict[str, Any]:
-    safe_message = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", message)
-    return {
-        "error": {
-            "message": safe_message,
-            "type": error_type,
-            "code": status_code,
-            "param": None
-        }
-    }
-
-
-def _diagnose_express_error(code: int, msg: str, status_str: str = "") -> str:
-    """为 Express SDK 通道的常见报错生成清晰的中文诊断说明。"""
-    low = f"{status_str} {msg}".lower()
-    if any(k in low for k in (
-        "提示词阶段拦截", "block_reason", "静默过滤", "prohibited_content",
-        "finish_reason=safety", "image_safety", "recitation", "blocklist",
-    )):
-        return "请求或回复被 Google 安全策略拦截（不可重试），请检查提示词内容"
-    if any(k in low for k in (
-        "只返回了思考过程", "返回了空内容", "返回了空对象", "未返回任何有效内容",
-        "解码格式异常", "malformed_response", "malformed_function_call",
-    )):
-        return "模型未输出有效正文（思考耗尽额度、返回空候选或解码格式异常，不可重试）"
-    if any(k in low for k in (
-        "remoteprotocolerror", "connecterror", "readerror", "writeerror",
-        "proxyerror", "pooltimeout", "server disconnected", "connection reset",
-    )):
-        return "本地到 Google 上游的网络或代理连接中断"
-    if "requires billing" in low or "billing to be enabled" in low:
-        return "该项目未开启计费（Billing），请确认此 Key 关联的 Project ID 已启用计费，或更换/删除该 Key"
-    if "api_key_invalid" in low or "api key not valid" in low or code == 401:
-        return "Express API Key 无效或已失效（401），请在「通道与凭证」页检查或更换 Key"
-    if code == 403 or "permission_denied" in low or ("permission" in low and "denied" in low):
-        return "权限被拒绝（403）：该 API Key 无权访问目标项目/模型，或该 Key 所属项目受限"
-    if code == 404 or "not found" in low:
-        if "publisher model" in low or "locations/" in low:
-            return "目标模型在当前区域（location）或项目中不存在（404），建议将「标准模式 location」设为 global 或默认"
-        return "请求的模型名称不存在或尚未在 Express 通道开放（404）"
-    if code == 429 or "resource_exhausted" in low or "quota" in low or "rate limit" in low:
-        return "触发上游配额或并发频率限制（429 Resource Exhausted）"
-    if code == 400 or "invalid_argument" in low:
-        if "model turn" in low:
-            return "当前模型不支持以 assistant 预填充结尾（400），请在控制台开启「预填充兼容模式」"
-        if "thinking" in low:
-            return "当前模型不支持所请求的思考档位或思考参数冲突（400）"
-        return "请求参数不被上游模型接受（400 Invalid Argument）"
-    if code in (500, 502, 503, 504) or "unavailable" in low or "overloaded" in low or "internal" in low:
-        return f"Google 上游服务内部错误或暂时繁忙（HTTP {code}）"
-    return f"上游调用异常（HTTP {code}）"
-
-
-def extract_upstream_error(e: Exception) -> tuple[int, str]:
-    """从上游异常里精准提取 (HTTP 状态码, 含中文诊断与完整 details 的清晰错误说明)。"""
-    code = getattr(e, "code", None) or getattr(e, "status_code", None)
-    status_str = str(getattr(e, "status", "") or "").strip()
-
-    clean_msg = getattr(e, "message", None)
-    if not isinstance(clean_msg, str) or not clean_msg.strip():
-        raw = str(e)
-        m = (
-            re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-            or re.search(r"'message'\s*:\s*\"((?:[^\"\\]|\\.)*)\"", raw)
-            or re.search(r"'message'\s*:\s*'((?:[^'\\]|\\.)*)'", raw)
-        )
-        clean_msg = m.group(1) if m else raw
-
-    details_obj = getattr(e, "details", None)
-    extra_detail_str = ""
-    if details_obj:
-        try:
-            if isinstance(details_obj, dict):
-                err_inner = details_obj.get("error") if isinstance(details_obj.get("error"), dict) else details_obj
-                det_list = err_inner.get("details")
-                if det_list:
-                    extra_detail_str = f" | details={json.dumps(det_list, ensure_ascii=False)[:1200]}"
-                else:
-                    d_str = json.dumps(details_obj, ensure_ascii=False)
-                    if d_str and str(clean_msg) not in d_str:
-                        extra_detail_str = f" | 详情: {d_str[:1200]}"
-            elif isinstance(details_obj, list):
-                extra_detail_str = f" | details={json.dumps(details_obj, ensure_ascii=False)[:1200]}"
-            else:
-                d_str = str(details_obj).strip()
-                if d_str and str(clean_msg) not in d_str:
-                    extra_detail_str = f" | 详情: {d_str[:1200]}"
-        except Exception:
-            pass
-
-    clean_msg = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***HIDDEN_API_KEY***", str(clean_msg).strip() + extra_detail_str)
-
-    if not isinstance(code, int) or not (400 <= code <= 599):
-        low = f"{type(e).__name__} {status_str} {clean_msg}".lower()
-        if any(k in low for k in (
-            "提示词阶段拦截", "block_reason", "静默过滤", "prohibited_content",
-            "finish_reason=safety", "image_safety", "recitation", "blocklist",
-        )):
-            code = 400
-        elif any(k in low for k in (
-            "只返回了思考过程", "返回了空内容", "返回了空对象", "未返回任何有效内容",
-            "解码格式异常", "malformed_response", "malformed_function_call", "unexpected_tool_call",
-        )):
-            code = 502
-        elif "not found" in low or "404" in low:
-            code = 404
-        elif "permission" in low or "403" in low or "denied" in low:
-            code = 403
-        elif "unauthenticated" in low or "401" in low or "api_key_invalid" in low:
-            code = 401
-        elif "429" in low or "resource_exhausted" in low or "quota" in low or "too many requests" in low:
-            code = 429
-        elif "invalid" in low or "400" in low:
-            code = 400
-        elif "503" in low or "unavailable" in low or "overloaded" in low:
-            code = 503
-        elif any(k in low for k in (
-            "remoteprotocolerror", "connecterror", "readerror", "writeerror",
-            "proxyerror", "pooltimeout", "server disconnected", "connection reset", "502", "504",
-        )):
-            code = 502
-        else:
-            code = 500
-
-    diag = _diagnose_express_error(code, clean_msg, status_str)
-    status_tag = f" [{status_str}]" if status_str and status_str not in clean_msg else ""
-    formatted = f"【{diag}】{status_tag} {clean_msg}"
-    return code, formatted
-
-
-def extract_retry_after_seconds(err: Any, msg: str = "") -> Optional[float]:
-    """从上游 429 / 503 异常响应头或 RetryInfo 中提取 Google 明确返回的短建议秒数（仅在短于控制台设定秒数时作参考，不强制长阻塞）。"""
-    resp = getattr(err, "response", None)
-    headers = getattr(resp, "headers", None) if resp is not None else getattr(err, "headers", None)
-    if headers and hasattr(headers, "get"):
-        ra = headers.get("retry-after") or headers.get("Retry-After")
-        if ra is not None:
-            try:
-                val = float(str(ra).strip())
-                if 0 < val <= 60:
-                    return val
-            except (TypeError, ValueError):
-                pass
-
-    raw_pool = f"{msg} {getattr(err, 'details', '')} {err}"
-    for pat in (
-        r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"',
-        r"'retryDelay'\s*:\s*'(\d+(?:\.\d+)?)s'",
-        r"retry\s+in\s+(\d+(?:\.\d+)?)\s*(?:s|sec|seconds)\b",
-    ):
-        m = re.search(pat, raw_pool, re.IGNORECASE)
-        if m:
-            try:
-                val = float(m.group(1))
-                if 0 < val <= 60:
-                    return val
-            except (TypeError, ValueError):
-                pass
-    return None
-
-
-def _describe_empty_gemini_response(response_obj: Any, model_to_call: str) -> str:
-    """当 Gemini 返回无有效正文的响应时，生成清晰的中文诊断详情。"""
-    if response_obj is None:
-        return f"模型 {model_to_call} 返回了空对象（None）。"
-
-    pf = getattr(response_obj, "prompt_feedback", None)
-    if pf and getattr(pf, "block_reason", None):
-        br = getattr(pf.block_reason, "name", None) or str(pf.block_reason)
-        br_msg = getattr(pf, "block_reason_message", "") or ""
-        return f"请求被安全策略在提示词阶段拦截（block_reason={br} {br_msg}）。"
-
-    candidates = getattr(response_obj, "candidates", None) or []
-    if not candidates:
-        return f"模型 {model_to_call} 未返回任何候选结果（candidates 为空，可能触发了静默过滤）。"
-
-    cand = candidates[0]
-    fr = getattr(cand, "finish_reason", None)
-    fr_str = getattr(fr, "name", None) or str(fr or "未知")
-    finish_msg = getattr(cand, "finish_message", None) or ""
-
-    if any(r in fr_str.upper() for r in ("MALFORMED_RESPONSE", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")):
-        return f"模型 {model_to_call} 上游解码格式异常（finish_reason={fr_str} {finish_msg}）。"
-
-    parts = getattr(getattr(cand, "content", None), "parts", None) or []
-    thought_chars = 0
-    for p in parts:
-        if getattr(p, "thought", None) is True and getattr(p, "text", None):
-            thought_chars += len(str(p.text))
-
-    if thought_chars > 0:
-        return (
-            f"模型 {model_to_call} 只返回了思考过程（共 {thought_chars} 字）、未输出任何正文"
-            f"（finish_reason={fr_str} {finish_msg}）。"
-            "这通常是因为原生思考在 HIGH 档位耗尽了输出额度或被截断，"
-            "建议在控制台将「原生思考控制」设为「关闭原生思考」或调低思考档位。"
-        )
-
-    return (
-        f"模型 {model_to_call} 返回了空内容（候选数={len(candidates)}，Parts数={len(parts)}，"
-        f"finish_reason={fr_str} {finish_msg}）。"
-    )
-
-
-def is_retryable_exception(e: Exception) -> bool:
-    """判断异常是否应按用户设置的最大次数进行退避重试。
-    第 ① 类（本地 ValueError：提示词拦截 / 安全过滤 / 空候选 / 只思考无正文）绝不重试；
-    第 ②、③、④ 类（网络/代理闪断 + Google 500/502/503/504/429）全部允许重试。
-    """
-    if getattr(e, "is_retryable", None) is True:
-        return True
-    if getattr(e, "is_retryable", None) is False and getattr(e, "is_auth_or_billing", None) is not None:
-        return False
-
-    if isinstance(e, ValueError):
-        return False
-
-    error_str = f"{type(e).__name__} {getattr(e, 'status', '')} {e}".lower()
-    if any(k in error_str for k in (
-        "提示词阶段拦截", "block_reason", "静默过滤", "prohibited_content",
-        "finish_reason=safety", "image_safety", "blocklist",
-        "只返回了思考过程", "返回了空内容", "返回了空对象",
-    )):
-        return False
-
-    if isinstance(e, (httpx.TransportError, httpx.TimeoutException, TimeoutError, ConnectionError)):
-        return True
-
-    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (429, 500, 502, 503, 504):
-        return True
-    err_code = getattr(e, "code", None) or getattr(e, "status_code", None)
-    if err_code in (429, 500, 502, 503, 504):
-        return True
-
-    retry_keywords = (
-        "429", "500", "502", "503", "504",
-        "too many requests", "quota", "resource exhausted", "resource_exhausted", "rate limit",
-        "internal", "backend error", "unavailable", "overloaded", "temporarily unavailable",
-        "deadline_exceeded", "remoteprotocolerror", "connecterror", "readerror", "writeerror",
-        "proxyerror", "pooltimeout", "server disconnected", "connection reset", "timed out", "timeout",
-        "incomplete chunked read", "peer closed connection",
-    )
-    return any(k in error_str for k in retry_keywords)
-
-
-def is_express_auth_or_billing_error(e: Exception, err_code: int) -> bool:
-    """判断是否为单个 Express Key 的鉴权失效或所属项目欠费/无权限错误（用于在多凭证池中隔离该坏 Key 并切换到下一个）。"""
-    if getattr(e, "is_auth_or_billing", None) is True:
-        return True
-    if isinstance(e, ValueError):
-        return False
-    low = f"{getattr(e, 'status', '')} {e}".lower()
-    if err_code in (401, 403):
-        return True
-    return any(k in low for k in (
-        "api_key_invalid", "api key not valid", "unauthenticated",
-        "permission_denied", "requires billing", "billing to be enabled",
-        "account_suspended", "consumer_invalid",
-    ))
+# (错误诊断与重试退避工具已抽离至 error_utils.py 并于顶部兼容导出)
 
 
 def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
@@ -540,13 +287,6 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
         for key in ["response_mime_type", "response_schema", "response_json_schema", "response_logprobs", "logprobs"]:
             config.pop(key, None)
     else:
-        if config.get("temperature") is None and settings.get("default_temperature") is not None:
-            config["temperature"] = settings["default_temperature"]
-        if config.get("top_p") is None and settings.get("default_top_p") is not None:
-            config["top_p"] = settings["default_top_p"]
-        if config.get("max_output_tokens") is None and settings.get("default_max_tokens") is not None:
-            config["max_output_tokens"] = settings["default_max_tokens"]
-
         if not _tools_disabled and _forced_search and profile.get("supports_search"):
             tools_list.append({"google_search": {}})
         elif function_declarations:
@@ -833,114 +573,7 @@ def print_outbound_debug_report(
     print("\n".join(lines))
 
 
-def _um_get_int(um: Any, *keys: str) -> Optional[int]:
-    """跨 SDK 版本安全读取 usage_metadata 字段（同时兼容对象属性、dict 与 Pydantic model_extra 未知驼峰字段）。"""
-    if um is None:
-        return None
-    if isinstance(um, dict):
-        for k in keys:
-            v = um.get(k)
-            if v is not None:
-                try:
-                    return int(v)
-                except (TypeError, ValueError):
-                    pass
-        return None
-
-    extra = getattr(um, "model_extra", None)
-    for k in keys:
-        v = getattr(um, k, None)
-        if v is None and isinstance(extra, dict):
-            v = extra.get(k)
-        if v is not None:
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                pass
-    return None
-
-
-def _extract_raw_usage_fields(resp: Any) -> tuple[int, int, int, int, int]:
-    """提取未经守恒折算的原始 (prompt_tk, explicit_th_tk, explicit_out_tk, tool_prompt_tk, total_tk)。"""
-    um = resp.get("usageMetadata") if isinstance(resp, dict) else getattr(resp, "usage_metadata", None)
-    if not um:
-        return 0, 0, 0, 0, 0
-    p_tk = _um_get_int(um, "prompt_token_count", "promptTokenCount") or 0
-    th_tk = _um_get_int(
-        um, "thoughts_token_count", "thoughtsTokenCount", "thought_token_count", "thoughtTokenCount"
-    ) or 0
-    out_tk = _um_get_int(um, "candidates_token_count", "candidatesTokenCount") or 0
-    tool_p_tk = _um_get_int(um, "tool_use_prompt_token_count", "toolUsePromptTokenCount") or 0
-    tot_tk = _um_get_int(um, "total_token_count", "totalTokenCount") or 0
-    return p_tk, th_tk, out_tk, tool_p_tk, tot_tk
-
-
-def _reconcile_usage_counts(
-    p_tk: int,
-    explicit_th: int,
-    explicit_out: int,
-    tool_p_tk: int,
-    raw_tot: int,
-    visible_chars: int = 0,
-) -> tuple[int, int, int, int]:
-    """基于 total_token_count 总量守恒校核并补齐隐藏思考或流式分片漏计的正文 Token：
-    1. 当压制思考 (include_thoughts=False) 时，部分 Gemini 4 模型将 thoughts_token_count 填为 0 或 8（标记壳），
-       而将真实的数百/数千内部推理 Token 计入 total_token_count —— 自动通过差额还原真实 th_tk；
-    2. 当 stream_function_call_arguments 分片传输时，若 candidates_token_count 仅统计了收尾壳（<=32）而实际正文很长，
-       且 explicit_th 已记录思考量，则将剩余差额归还给 out_tk。
-    """
-    th_tk = max(0, int(explicit_th or 0))
-    out_tk = max(0, int(explicit_out or 0))
-    p_tk = max(0, int(p_tk or 0))
-    tool_p_tk = max(0, int(tool_p_tk or 0))
-    raw_tot = max(0, int(raw_tot or 0))
-
-    if raw_tot > 0 and p_tk > 0:
-        residual_gen = max(0, raw_tot - p_tk - tool_p_tk)
-        if residual_gen > (th_tk + out_tk):
-            if th_tk > 16 and out_tk <= 32 and visible_chars > 120:
-                out_tk = max(out_tk, residual_gen - th_tk)
-            else:
-                th_tk = max(th_tk, residual_gen - out_tk)
-
-    comp_tk = th_tk + out_tk
-    t_tk = max(raw_tot, p_tk + tool_p_tk + comp_tk) if (p_tk or comp_tk or raw_tot) else 0
-    return p_tk, th_tk, out_tk, t_tk
-
-
-def _extract_usage_detail(resp: Any, visible_chars: int = 0) -> tuple[int, int, int, int]:
-    """从 Gemini 响应对象提取经总量守恒校核后的精确 (输入Tokens, 原生思考Tokens, 正文输出Tokens, 总Tokens)。"""
-    p_tk, raw_th, raw_out, tool_p_tk, raw_tot = _extract_raw_usage_fields(resp)
-    return _reconcile_usage_counts(p_tk, raw_th, raw_out, tool_p_tk, raw_tot, visible_chars=visible_chars)
-
-
-def _extract_usage(resp: Any) -> tuple[int, int, int]:
-    p_tk, th_tk, out_tk, t_tk = _extract_usage_detail(resp)
-    return p_tk, (th_tk + out_tk), t_tk
-
-
-def _record_usage(resp: Any, visible_chars: int = 0) -> dict:
-    usage_metadata = getattr(resp, "usage_metadata", None)
-    traffic_type = getattr(usage_metadata, "traffic_type", None) if usage_metadata else None
-    if traffic_type:
-        value = getattr(traffic_type, "value", None) or str(traffic_type)
-        print(f"🚦 [流量等级] 上游实际 traffic_type={value}")
-
-    p_tk, th_tk, out_tk, t_tk = _extract_usage_detail(resp, visible_chars=visible_chars)
-    comp_tk = th_tk + out_tk
-    if p_tk or comp_tk:
-        stats.add_tokens(p_tk, comp_tk)
-        print(f"💰 [算力消耗统计] 输入: {p_tk} | 思考: {th_tk} | 正文: {out_tk} | 总计: {t_tk} Tokens")
-    else:
-        stats.add_success()
-    res: Dict[str, Any] = {
-        "prompt_tokens": p_tk,
-        "completion_tokens": comp_tk,
-        "total_tokens": t_tk,
-        "thoughts_tokens": th_tk,
-        "output_tokens": out_tk,
-    }
-    return res
+# (用量提取与守恒校核已抽离至 call_tracker.py 并于顶部兼容导出)
 
 
 def wants_usage(request_obj: Any) -> bool:
@@ -1617,457 +1250,10 @@ def _with_brief_reasoning_nudge(contents: List[Any]) -> List[Any]:
     return cloned
 
 
-def is_location_pin_failure(err: Any) -> bool:
-    """错误是否像"钉定的 projects/locations 路径不对"（而非模型或网络本身的问题）。"""
-    e = str(err).lower()
-    if "requires billing" in e or "billing to be enabled" in e:
-        return True
-    if ("not found" in e or "404" in e) and ("publisher model" in e or "projects/" in e):
-        return True
-    if ("permission_denied" in e or ("permission" in e and "denied" in e) or "403" in e) and "projects/" in e:
-        return True
-    return False
-
-
 # ============================================================
 # 统一多 Key 轮询 + 跨通道（Express ↔ Cookie）主备重试调度引擎
+# (CallTraceTracker 及凭证/思考格式化已抽离至 call_tracker.py)
 # ============================================================
-
-def _emit_credential_invalid_warning(target: dict, err_code: int, err_formatted: str) -> str:
-    """当某个 Key 或 Cookie 发生 401/403/欠费时，打印醒目红色告警并返回附加给用户的更换提醒。"""
-    if target.get("channel") == "express":
-        rec = target.get("key_record") or {}
-        idx_num = rec.get("index", 0) + 1
-        masked = _mask_key_short(rec.get("key", ""))
-        pid = rec.get("project_id") or "未绑定"
-        warn_line = (
-            f"🔴 [密钥失效提醒] 第 #{idx_num} 个 Express API Key（{masked} | 项目={pid}）"
-            f"鉴权或计费失败（HTTP {err_code}），本轮请求已自动隔离并跳过该 Key！"
-            f"👉 请及时前往控制台「通道与凭证」页检查、删除或更换该 Key！原因：{err_formatted[:400]}"
-        )
-        user_tip = f"\n\n👉 【凭证更换提醒】第 #{idx_num} 个 Express API Key（{masked}）已失效或所属项目未开计费，请及时到控制台「通道与凭证」页删除或更换！"
-    else:
-        warn_line = (
-            f"🔴 [Cookie 失效提醒] {target.get('label', 'Studio Cookie 直连')} "
-            f"鉴权或项目计费失败（HTTP {err_code}），本轮请求已自动隔离并跳过 Cookie 通道！"
-            f"👉 请及时前往控制台「通道与凭证」页重新获取并更新 Google Cookie（或检查 Project ID）！原因：{err_formatted[:400]}"
-        )
-        user_tip = "\n\n👉 【凭证更换提醒】Studio Cookie 登录态已失效或项目无权限，请及时到控制台「通道与凭证」页更新 Cookie 或切换通道！"
-    print(warn_line)
-    return user_tip
-
-
-def _short_cred_name(target: Optional[dict]) -> str:
-    if not target:
-        return "—"
-    if target.get("channel") == "express":
-        rec = target.get("key_record") or {}
-        return f"Key #{rec.get('index', 0) + 1}"
-    return "🍪 Cookie"
-
-
-def _format_thinking_for_record(tk_dict: Optional[dict]) -> tuple[str, str, bool]:
-    """返回 (展示文案, 徽章样式 muted|accent|apricot, 是否流式回传原生思考)。"""
-    if not tk_dict or tk_dict.get("mode") is None:
-        return "无", "muted", False
-    inc = bool(tk_dict.get("include_thoughts", True))
-    lv = str(tk_dict.get("level") or "").strip().upper()
-    if not inc:
-        return (f"压制 ({lv})" if lv else "压制"), "muted", False
-    if lv == "XHIGH":
-        return "🧠 XHIGH", "apricot", True
-    if lv:
-        return lv, "accent", True
-    return "自动", "accent", True
-
-
-def _chunk_has_model_token(chunk: Any, include_thoughts: bool = True) -> tuple[bool, bool]:
-    """检测上游流式 chunk 是否包含实际生成的模型 token（精确测量真实首字响应 TTFT，不受 96 字滑窗影响）。"""
-    cands = getattr(chunk, "candidates", None) or []
-    has_tok = False
-    has_thought = False
-    for cand in cands:
-        parts = getattr(getattr(cand, "content", None), "parts", None) or []
-        for p in parts:
-            is_th = getattr(p, "thought", None) is True
-            txt = getattr(p, "text", None)
-            if is_th:
-                if txt:
-                    has_thought = True
-                    if include_thoughts:
-                        has_tok = True
-            elif txt:
-                has_tok = True
-            else:
-                fc = getattr(p, "function_call", None)
-                if fc is not None and (
-                    getattr(fc, "name", None)
-                    or getattr(fc, "args", None)
-                    or getattr(fc, "partial_args", None)
-                ):
-                    has_tok = True
-                elif getattr(p, "inline_data", None) is not None or getattr(p, "file_data", None) is not None:
-                    has_tok = True
-    return has_tok, has_thought
-
-
-class CallTraceTracker:
-    """单次聊天请求的生命周期指标追踪器（幂等写入 CallRecorder，零重复记账）。"""
-
-    def __init__(self, request_obj: OpenAIRequest, primary_channel: str):
-        self.created_wall = time.time()
-        self.start_mono = time.monotonic()
-        self.primary_channel = primary_channel
-        self.finalized = False
-
-        raw_model = str(getattr(request_obj, "model", "") or "unknown").strip()
-        base_m = raw_model
-        while True:
-            low_m = base_m.lower()
-            if low_m.endswith("-search"):
-                base_m = base_m[: -len("-search")]
-                continue
-            m_th = re.search(r"-think-(?:minimal|low|medium|high|xhigh|off|none)$", low_m)
-            if m_th:
-                base_m = base_m[: m_th.start()]
-                continue
-            break
-        self.model_display = base_m or raw_model
-        prof = mc.get_profile(self.model_display)
-        self.is_image = bool(prof.get("is_image", False))
-        self.is_stream_req = bool(getattr(request_obj, "stream", False))
-        fake_on = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
-
-        eff_settings = app_state.get_effective_settings(self.model_display)
-        # 粗略预判末尾是否为 assistant 预填充（后续 Express ctx 或 Cookie telemetry 会用精确结果覆盖）
-        msgs = getattr(request_obj, "messages", None) or []
-        rough_prefill = bool(
-            msgs
-            and str(getattr(msgs[-1], "role", "") or "") == "assistant"
-            and eff_settings.get("prefill_mode", "smart") != "off"
-        )
-        tk_init = mc.resolve_thinking(raw_model, request_obj, eff_settings, prefill_active=rough_prefill)
-        self.thinking_label, self.think_style, self.include_thoughts = _format_thinking_for_record(tk_init)
-
-        self.sandbox = bool(eff_settings.get("synthetic_sandbox_enabled", False) and not self.is_image)
-        self.prefill = rough_prefill
-        self.search = bool(raw_model.lower().endswith("-search"))
-        self.tool_calls = False
-
-        if self.is_image:
-            self.mode_label = "🖼️ 生图假流" if self.is_stream_req else "🖼️ 生图非流"
-            self.mode_class = "pill-accent" if self.is_stream_req else "pill-sky"
-            self.is_unary = True
-        elif not self.is_stream_req:
-            self.mode_label = "📦 非流式"
-            self.mode_class = "pill-sky"
-            self.is_unary = True
-        elif fake_on:
-            self.mode_label = "💓 假流式"
-            self.mode_class = "pill-accent"
-            self.is_unary = True
-        else:
-            self.mode_label = "⚡ 真流式"
-            self.mode_class = "pill-mint"
-            self.is_unary = False
-
-        self.retries = 0
-        self.retry_wait_total = 0.0
-        self.unique_creds: List[str] = []
-        self.failed_steps: List[str] = []
-        self.last_cred_short: str = ""
-
-    def sync_from_express_ctx(self, ctx: Optional[dict]) -> None:
-        if not ctx:
-            return
-        self.model_display = ctx.get("base_model_name") or self.model_display
-        self.sandbox = bool(ctx.get("synthetic_tool_name"))
-        self.prefill = bool(ctx.get("prefill_active", False))
-        self.search = bool(ctx.get("has_search", False))
-        tk_res = ctx.get("thinking_resolved")
-        if tk_res is not None:
-            self.thinking_label, self.think_style, self.include_thoughts = _format_thinking_for_record(tk_res)
-
-    def sync_from_cookie_telemetry(self, tel: Optional[dict]) -> None:
-        if not tel:
-            return
-        if tel.get("base_model"):
-            self.model_display = tel["base_model"]
-        if "sandbox" in tel:
-            self.sandbox = bool(tel["sandbox"])
-        if "prefill" in tel:
-            self.prefill = bool(tel["prefill"])
-        if "search" in tel:
-            self.search = bool(tel["search"])
-        if tel.get("thinking_resolved") is not None:
-            self.thinking_label, self.think_style, self.include_thoughts = _format_thinking_for_record(
-                tel["thinking_resolved"]
-            )
-        if "is_unary" in tel:
-            self.is_unary = bool(tel["is_unary"])
-        if tel.get("mode_label"):
-            self.mode_label = tel["mode_label"]
-            if "真流式" in self.mode_label:
-                self.mode_class = "pill-mint"
-            elif "假流" in self.mode_label:
-                self.mode_class = "pill-accent"
-            else:
-                self.mode_class = "pill-sky"
-
-    def note_attempt_start(self, target: dict) -> None:
-        short = _short_cred_name(target)
-        self.last_cred_short = short
-        if short not in self.unique_creds:
-            self.unique_creds.append(short)
-
-    def note_attempt_failure(self, target: dict, err_code: int, wait_sec: Optional[float] = None) -> None:
-        short = _short_cred_name(target)
-        if wait_sec is not None:
-            self.retries += 1
-            self.retry_wait_total += wait_sec
-            self.failed_steps.append(f"{html.escape(short)} (HTTP {err_code}，等 {wait_sec:.2f}s)")
-        else:
-            self.failed_steps.append(f"{html.escape(short)} (HTTP {err_code})")
-
-    def _build_time_strs(self) -> tuple[str, str]:
-        lt = time.localtime(self.created_wall)
-        return time.strftime("%H:%M:%S", lt), time.strftime("%Y-%m-%d %H:%M:%S", lt)
-
-    def finalize_success(
-        self,
-        target: dict,
-        *,
-        is_cookie: bool = False,
-        ttft: Optional[float] = None,
-        gen_time: float = 0.0,
-        saw_thought_stream: bool = False,
-        finish_reason: str = "stop",
-        raw_finish_reason: str = "",
-        has_tool_calls: bool = False,
-        has_usage: bool = False,
-        p_tk: int = 0,
-        th_tk: int = 0,
-        out_tk: int = 0,
-        out_chars: int = 0,
-    ) -> None:
-        if self.finalized:
-            return
-        self.finalized = True
-        total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
-        short_cred = _short_cred_name(target)
-        if target.get("channel") != self.primary_channel:
-            cred_note = "跨通道兜底"
-        elif is_cookie:
-            cred_note = "Cookie 模式"
-        else:
-            note = str((target.get("key_record") or {}).get("note") or "").strip()
-            cred_note = note[:16] if note else "标准模式"
-
-        is_trunc = (str(finish_reason or "").lower() == "length")
-        if is_trunc:
-            badge_type = "trunc"
-        elif self.retries > 0:
-            badge_type = "retry_ok"
-        else:
-            badge_type = "ok"
-
-        clean_ttft = round(float(ttft), 2) if (not self.is_unary and ttft is not None and ttft >= 0) else None
-        clean_gen = round(max(0.0, float(gen_time)), 2)
-
-        tps: Optional[float] = None
-        tps_approx = False
-        if has_usage:
-            if not self.is_unary:
-                streamed_tk = (th_tk + out_tk) if (self.include_thoughts and saw_thought_stream) else out_tk
-                if clean_gen >= 0.12 and streamed_tk > 0:
-                    tps = round(streamed_tk / clean_gen, 1)
-                    tps_approx = False
-                elif (th_tk + out_tk) > 0 and ((clean_ttft or 0.0) + clean_gen) >= 0.1:
-                    tps = round((th_tk + out_tk) / ((clean_ttft or 0.0) + clean_gen), 1)
-                    tps_approx = True
-            else:
-                tot_gen_tk = th_tk + out_tk
-                if clean_gen >= 0.1 and tot_gen_tk > 0:
-                    tps = round(tot_gen_tk / clean_gen, 1)
-                    tps_approx = True
-
-        # 组装清晰安全的展开详情
-        parts_det: List[str] = []
-        if self.failed_steps:
-            chain_str = " → ".join(self.failed_steps + [f"<b>{html.escape(short_cred)} 成功</b>"])
-            parts_det.append(
-                f"🔄 <b>重试轨迹（重试 {self.retries} 次，退避共耗 {self.retry_wait_total:.1f}s）</b>：{chain_str}。"
-            )
-        else:
-            parts_det.append(f"✅ <b>一次直通成功</b>：使用凭证 <b>{html.escape(short_cred)}</b>（{html.escape(cred_note)}）。")
-
-        if not self.is_unary and clean_ttft is not None:
-            parts_det.append(f"⏱️ 首字响应 <b>{clean_ttft:.2f}s</b>，首字后纯流式输出耗时 <b>{clean_gen:.2f}s</b>（请求总历时 {total_wall:.2f}s）。")
-        else:
-            parts_det.append(f"⏱️ 上游原生整包生成耗时 <b>{clean_gen:.2f}s</b>（无独立首字时间，请求总历时 {total_wall:.2f}s）。")
-
-        if has_usage:
-            spd_txt = f"，速度 <b>{'≈' if tps_approx else ''}{tps:.1f} tok/s</b>" if tps else ""
-            parts_det.append(
-                f"💰 Token 明细：输入 <b>{p_tk:,}</b> · 思考 <b>{th_tk:,}</b> · 正文 <b>{out_tk:,}</b>（共 {p_tk + th_tk + out_tk:,} Tokens{spd_txt}）。"
-            )
-        elif is_cookie:
-            ch_txt = f"，正文共 <b>{out_chars:,}</b> 字符" if out_chars > 0 else ""
-            parts_det.append(f"🍪 Cookie 私有接口不回传 Token 统计{ch_txt}。")
-
-        if is_trunc:
-            raw_fr_up = str(raw_finish_reason or "").strip().upper()
-            if raw_fr_up in ("MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE", "UNEXPECTED_TOOL_CALL"):
-                parts_det.append(
-                    f"⚠️ <b>上游格式中断</b>：上游返回 <code>{html.escape(raw_fr_up)}</code>（OpenAI 协议映射为 length，并非超过 max_tokens，而是模型流式工具参数外层 JSON 编码中途出错被上游中止）。"
-                )
-            elif raw_fr_up == "MAX_TOKENS":
-                parts_det.append(
-                    "⚠️ <b>达上限截断提醒</b>：上游返回 <code>MAX_TOKENS</code>（正文与隐性思考 Token 合计撞上 max_tokens 上限提前停止），若正文未写完建议调大客户端最大回复长度。"
-                )
-            else:
-                raw_note = f"（上游={html.escape(raw_fr_up)}）" if raw_fr_up else ""
-                parts_det.append(
-                    f"⚠️ <b>提前截断提醒</b>：finish_reason=length{raw_note}（可能是输出含隐性思考 Token 触及 max_tokens 上限，或上游工具编码格式中断），若正文未写完建议调大客户端最大回复长度。"
-                )
-
-        t_short, t_full = self._build_time_strs()
-        call_recorder.record({
-            "time": t_short,
-            "full_time": t_full,
-            "group": "ok",
-            "badge_type": badge_type,
-            "retries": self.retries,
-            "code": 200,
-            "finish_reason": str(finish_reason or "stop"),
-            "model": self.model_display,
-            "sandbox": self.sandbox,
-            "prefill": self.prefill,
-            "search": self.search,
-            "tool_calls": bool(has_tool_calls or finish_reason == "tool_calls"),
-            "thinking": self.thinking_label,
-            "think_style": self.think_style,
-            "mode": self.mode_label,
-            "mode_class": self.mode_class,
-            "cred": short_cred,
-            "cred_note": cred_note,
-            "is_unary": self.is_unary,
-            "ttft": clean_ttft,
-            "gen_time": clean_gen,
-            "total_time": total_wall,
-            "is_cookie": is_cookie,
-            "has_usage": has_usage,
-            "p_tk": p_tk,
-            "th_tk": th_tk,
-            "out_tk": out_tk,
-            "out_chars": out_chars,
-            "tps": tps,
-            "tps_approx": tps_approx,
-            "detail": " ".join(parts_det),
-        })
-
-    def finalize_error(self, err_code: int, err_msg: str, preflight: bool = False) -> None:
-        if self.finalized:
-            return
-        self.finalized = True
-        total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
-        if preflight or not self.unique_creds:
-            cred = "未发往上游"
-            cred_note = "前置校验拦截"
-        elif len(self.unique_creds) == 1:
-            cred = self.unique_creds[0]
-            cred_note = f"单凭证重试×{self.retries}" if self.retries > 0 else "未触发重试"
-        else:
-            cred = f"试 {len(self.unique_creds)} 凭证均败"
-            cred_note = f"止于 {self.last_cred_short}"
-
-        parts_det: List[str] = []
-        if self.failed_steps:
-            parts_det.append(f"🔄 <b>尝试轨迹</b>：{' → '.join(self.failed_steps)}。")
-        clean_reason = html.escape(str(err_msg or "未知错误").strip()[:600])
-        parts_det.append(f"❌ <b>失败原因（HTTP {err_code} · 总耗时 {total_wall:.2f}s）</b>：{clean_reason}")
-
-        t_short, t_full = self._build_time_strs()
-        call_recorder.record({
-            "time": t_short,
-            "full_time": t_full,
-            "group": "err",
-            "badge_type": "err",
-            "retries": self.retries,
-            "code": int(err_code or 500),
-            "finish_reason": "error",
-            "model": self.model_display,
-            "sandbox": self.sandbox,
-            "prefill": self.prefill,
-            "search": self.search,
-            "tool_calls": False,
-            "thinking": self.thinking_label,
-            "think_style": self.think_style,
-            "mode": self.mode_label,
-            "mode_class": self.mode_class,
-            "cred": cred,
-            "cred_note": cred_note,
-            "is_unary": self.is_unary,
-            "ttft": None,
-            "gen_time": total_wall,
-            "total_time": total_wall,
-            "is_cookie": (cred == "🍪 Cookie"),
-            "has_usage": False,
-            "p_tk": 0,
-            "th_tk": 0,
-            "out_tk": 0,
-            "out_chars": 0,
-            "tps": None,
-            "tps_approx": False,
-            "detail": " ".join(parts_det),
-        })
-
-    def finalize_cancelled(self, partial_output: bool = False) -> None:
-        if self.finalized:
-            return
-        self.finalized = True
-        total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
-        cred = self.last_cred_short or "—"
-        cred_note = "输出中途断开" if partial_output else "前端主动停止"
-        msg = (
-            f"🛑 <b>客户端中途断开（HTTP 499 · 已耗时 {total_wall:.2f}s）</b>：流式输出期间连接关闭，后台已安全回收上游流。"
-            if partial_output
-            else f"🛑 <b>前端手动停止（HTTP 499 · 已耗时 {total_wall:.2f}s）</b>：首包产出前检测到客户端断开，后台已立即取消上游任务与重试。"
-        )
-        t_short, t_full = self._build_time_strs()
-        call_recorder.record({
-            "time": t_short,
-            "full_time": t_full,
-            "group": "cancel",
-            "badge_type": "cancel",
-            "retries": self.retries,
-            "code": 499,
-            "finish_reason": "cancelled",
-            "model": self.model_display,
-            "sandbox": self.sandbox,
-            "prefill": self.prefill,
-            "search": self.search,
-            "tool_calls": False,
-            "thinking": self.thinking_label,
-            "think_style": self.think_style,
-            "mode": self.mode_label,
-            "mode_class": self.mode_class,
-            "cred": cred,
-            "cred_note": cred_note,
-            "is_unary": self.is_unary,
-            "ttft": None,
-            "gen_time": total_wall,
-            "total_time": total_wall,
-            "is_cookie": (cred == "🍪 Cookie"),
-            "has_usage": False,
-            "p_tk": 0,
-            "th_tk": 0,
-            "out_tk": 0,
-            "out_chars": 0,
-            "tps": None,
-            "tps_approx": False,
-            "detail": msg,
-        })
 
 
 async def execute_unified_completion(
@@ -2076,17 +1262,30 @@ async def execute_unified_completion(
     primary_channel: str = "express",
     express_upstream: Any = None,
     cookie_upstream: Any = None,
+    forced_target: Optional[dict] = None,
+    disable_retries: bool = False,
+    result_meta: Optional[dict] = None,
 ):
     """统一调度器：
     - 方案 A 主备顺序：以 primary_channel 为主通道，当 cross_channel_fallback 开启时将另一通道纳入轮询周期尾部；
     - 多 Key 自动轮询：每次重试自动切换到下一个健康的 Express Key（动态绑定各自的 Project ID）或 Cookie；
+    - 定向单凭证实测：传入 forced_target 时仅使用指定 Key 或 Cookie，不切换全局主通道、不触发跨通道兜底；
     - 坏凭证自动隔离与红色告警：401/403/欠费凭证当次隔离跳过并提示删除/更换；
     - 严格遵守 retry_backoff_seconds 退避间隔。
     """
-    tracker = CallTraceTracker(request_obj, primary_channel)
+    eff_primary = (forced_target.get("channel") if isinstance(forced_target, dict) else None) or primary_channel
+    tracker = CallTraceTracker(request_obj, eff_primary)
+
+    def _touch_meta(**kw: Any) -> None:
+        if result_meta is not None:
+            for mk, mv in kw.items():
+                if mv is not None:
+                    result_meta[mk] = mv
+
     try:
         validate_request_schemas(request_obj)
     except SchemaValidationError as exc:
+        _touch_meta(channel=eff_primary, error_code=400, error_message=str(exc))
         tracker.finalize_error(400, str(exc), preflight=True)
         return JSONResponse(
             status_code=400,
@@ -2100,18 +1299,6 @@ async def execute_unified_completion(
         from upstreams.cookie_proxy import CookieProxyUpstream
         cookie_upstream = CookieProxyUpstream()
 
-    express_key_manager = getattr(fastapi_request.app.state, "express_key_manager", None)
-    express_records = express_key_manager.get_ordered_express_records() if express_key_manager else []
-    express_targets = [
-        {
-            "channel": "express",
-            "id": f"express:{rec['key']}",
-            "key_record": rec,
-            "label": f"Express Key #{rec.get('index', 0) + 1} ({_mask_key_short(rec['key'])} | 项目={rec.get('project_id') or '默认'})",
-        }
-        for rec in express_records
-    ]
-
     cookie_ready, _, cookie_pid, _, cookie_err_code, cookie_err_msg = cookie_upstream.check_cookie_ready()
     cookie_target = {
         "channel": "cookie",
@@ -2119,47 +1306,107 @@ async def execute_unified_completion(
         "label": f"Studio Cookie 直连 (项目={cookie_pid})",
     } if cookie_ready else None
 
-    cross_fallback = bool(app_state.get_setting("cross_channel_fallback", True))
-
     base_targets: List[dict] = []
-    if primary_channel == "express":
-        base_targets.extend(express_targets)
-        if cross_fallback and cookie_target is not None:
-            base_targets.append(cookie_target)
-        if not base_targets:
-            error_msg = (
-                "未配置任何可用的 Express API Key"
-                + ("（且未配置有效 Cookie 兜底）" if cross_fallback else "")
-                + "，请在控制台「通道与凭证」页添加 Express Key。"
-            )
-            print(f"❌ [密钥配置] {error_msg}")
-            tracker.finalize_error(401, error_msg, preflight=True)
+    if isinstance(forced_target, dict):
+        ft_ch = str(forced_target.get("channel") or "").strip().lower()
+        if ft_ch == "cookie":
+            if cookie_target is None:
+                _touch_meta(
+                    channel="cookie",
+                    cred_short="Studio Cookie",
+                    cred_label="Studio Cookie 直连",
+                    error_code=cookie_err_code,
+                    error_message=cookie_err_msg,
+                )
+                print(f"❌ [定向实测 - Cookie] 模型={request_obj.model} | {cookie_err_msg}")
+                tracker.finalize_error(cookie_err_code, cookie_err_msg, preflight=True)
+                return JSONResponse(
+                    status_code=cookie_err_code,
+                    content=create_openai_error_response(cookie_err_code, cookie_err_msg, "auth_error"),
+                )
+            base_targets = [cookie_target]
+        elif ft_ch == "express" and isinstance(forced_target.get("key_record"), dict):
+            frec = dict(forced_target["key_record"])
+            fkey = str(frec.get("key") or "").strip()
+            if not fkey:
+                err_m = "指定的 Express API Key 为空，请检查凭证配置。"
+                _touch_meta(channel="express", error_code=400, error_message=err_m)
+                tracker.finalize_error(400, err_m, preflight=True)
+                return JSONResponse(
+                    status_code=400,
+                    content=create_openai_error_response(400, err_m, "invalid_request_error"),
+                )
+            base_targets = [
+                {
+                    "channel": "express",
+                    "id": f"express:{fkey}",
+                    "key_record": frec,
+                    "label": f"Express Key #{frec.get('index', 0) + 1} ({_mask_key_short(fkey)} | 项目={frec.get('project_id') or '默认'})",
+                }
+            ]
+        else:
+            err_m = "无效的定向实测目标凭证。"
+            _touch_meta(channel=eff_primary, error_code=400, error_message=err_m)
+            tracker.finalize_error(400, err_m, preflight=True)
             return JSONResponse(
-                status_code=401,
-                content=create_openai_error_response(401, error_msg, "authentication_error"),
-            )
-        if not express_targets and cookie_target is not None:
-            print(
-                "🔴 [密钥缺失提醒] 当前处于 Express 模式但未配置任何启用的 Express API Key！"
-                "已自动跨通道切换至 Studio Cookie 直连兜底。👉 请及时在「通道与凭证」页添加 Key 或切换通道。"
+                status_code=400,
+                content=create_openai_error_response(400, err_m, "invalid_request_error"),
             )
     else:
-        if cookie_target is not None:
-            base_targets.append(cookie_target)
-        if cross_fallback and express_targets:
+        express_key_manager = getattr(fastapi_request.app.state, "express_key_manager", None)
+        express_records = express_key_manager.get_ordered_express_records() if express_key_manager else []
+        express_targets = [
+            {
+                "channel": "express",
+                "id": f"express:{rec['key']}",
+                "key_record": rec,
+                "label": f"Express Key #{rec.get('index', 0) + 1} ({_mask_key_short(rec['key'])} | 项目={rec.get('project_id') or '默认'})",
+            }
+            for rec in express_records
+        ]
+
+        cross_fallback = bool(app_state.get_setting("cross_channel_fallback", True))
+
+        if primary_channel == "express":
             base_targets.extend(express_targets)
-            if cookie_target is None:
-                print(
-                    f"🔴 [Cookie 失效提醒] 当前处于 Cookie 直连模式，但 Cookie 未配置或无效（{cookie_err_msg}）！"
-                    f"已自动跨通道切换至 Express API Key 池兜底。👉 请及时在「通道与凭证」页更新 Cookie！"
+            if cross_fallback and cookie_target is not None:
+                base_targets.append(cookie_target)
+            if not base_targets:
+                error_msg = (
+                    "未配置任何可用的 Express API Key"
+                    + ("（且未配置有效 Cookie 兜底）" if cross_fallback else "")
+                    + "，请在控制台「通道与凭证」页添加 Express Key。"
                 )
-        if not base_targets:
-            print(f"❌ [Studio 鉴权/配置失败] 模型={request_obj.model} | {cookie_err_msg}")
-            tracker.finalize_error(cookie_err_code, cookie_err_msg, preflight=True)
-            return JSONResponse(
-                status_code=cookie_err_code,
-                content=create_openai_error_response(cookie_err_code, cookie_err_msg, "auth_error"),
-            )
+                _touch_meta(channel="express", error_code=401, error_message=error_msg)
+                print(f"❌ [密钥配置] {error_msg}")
+                tracker.finalize_error(401, error_msg, preflight=True)
+                return JSONResponse(
+                    status_code=401,
+                    content=create_openai_error_response(401, error_msg, "authentication_error"),
+                )
+            if not express_targets and cookie_target is not None:
+                print(
+                    "🔴 [密钥缺失提醒] 当前处于 Express 模式但未配置任何启用的 Express API Key！"
+                    "已自动跨通道切换至 Studio Cookie 直连兜底。👉 请及时在「通道与凭证」页添加 Key 或切换通道。"
+                )
+        else:
+            if cookie_target is not None:
+                base_targets.append(cookie_target)
+            if cross_fallback and express_targets:
+                base_targets.extend(express_targets)
+                if cookie_target is None:
+                    print(
+                        f"🔴 [Cookie 失效提醒] 当前处于 Cookie 直连模式，但 Cookie 未配置或无效（{cookie_err_msg}）！"
+                        f"已自动跨通道切换至 Express API Key 池兜底。👉 请及时在「通道与凭证」页更新 Cookie！"
+                    )
+            if not base_targets:
+                _touch_meta(channel="cookie", error_code=cookie_err_code, error_message=cookie_err_msg)
+                print(f"❌ [Studio 鉴权/配置失败] 模型={request_obj.model} | {cookie_err_msg}")
+                tracker.finalize_error(cookie_err_code, cookie_err_msg, preflight=True)
+                return JSONResponse(
+                    status_code=cookie_err_code,
+                    content=create_openai_error_response(cookie_err_code, cookie_err_msg, "auth_error"),
+                )
 
     if len(base_targets) > 1:
         pool_desc = " → ".join(t["label"] for t in base_targets)
@@ -2226,6 +1473,8 @@ async def execute_unified_completion(
         return None
 
     async def _client_gone() -> bool:
+        if tracker.is_live_aborted():
+            return True
         if fastapi_request is None:
             return False
         try:
@@ -2234,7 +1483,28 @@ async def execute_unified_completion(
             return False
 
     max_retries, backoff_sec = get_retry_settings()
+    if disable_retries:
+        max_retries = 0
     is_image_request = mc.get_profile(request_obj.model)["is_image"]
+
+    def _note_target_meta(t: dict, **extra: Any) -> None:
+        if result_meta is None:
+            return
+        krec = t.get("key_record") or {}
+        loc_v = (
+            (str(app_state.get_setting("express_location", "global") or "global").strip() or "默认")
+            if t.get("channel") == "express"
+            else "Studio"
+        )
+        _touch_meta(
+            channel=t.get("channel", ""),
+            cred_short=_short_cred_name(t),
+            cred_label=t.get("label", ""),
+            project_id=(krec.get("project_id") or "") if t.get("channel") == "express" else (cookie_pid or ""),
+            location=loc_v,
+            attempts=int(result_meta.get("attempts") or 0) + 1,
+            **extra,
+        )
     tried_target_ids_in_cycle: set[str] = set()
 
     def _compute_smart_retry_wait(
@@ -2316,6 +1586,7 @@ async def execute_unified_completion(
                         break
 
                     tracker.note_attempt_start(target)
+                    _note_target_meta(target)
                     has_yielded_output = False
                     has_yielded_visible_body = False
                     attempt_failed = False
@@ -2375,7 +1646,7 @@ async def execute_unified_completion(
                                         if await _client_gone():
                                             print("ℹ️ [客户端断开] 假流式等待期间客户端已断开，正在取消上游任务。")
                                             await _cancel_task()
-                                            tracker.finalize_cancelled(partial_output=False)
+                                            tracker.finalize_cancelled(partial_output=False, by_console=tracker.is_live_aborted())
                                             return
                                         if not api_call_task.done() and elapsed_hb >= outer_keep_alive_interval:
                                             elapsed_hb = 0.0
@@ -2440,6 +1711,8 @@ async def execute_unified_completion(
                                         "completion_tokens": usage_info["completion_tokens"],
                                         "total_tokens": usage_info["total_tokens"],
                                     }
+                                    if usage_info.get("cached_tokens", 0) > 0:
+                                        _u_fake["prompt_tokens_details"] = {"cached_tokens": usage_info["cached_tokens"]}
                                     if usage_info["thoughts_tokens"] > 0:
                                         _u_fake["completion_tokens_details"] = {"reasoning_tokens": usage_info["thoughts_tokens"]}
                                     openai_response_dict["usage"] = _u_fake
@@ -2473,6 +1746,7 @@ async def execute_unified_completion(
                                     has_tool_calls=_has_tc0,
                                     has_usage=bool(usage_info["prompt_tokens"] or usage_info["completion_tokens"]),
                                     p_tk=usage_info["prompt_tokens"],
+                                    cached_tk=usage_info.get("cached_tokens", 0),
                                     th_tk=usage_info["thoughts_tokens"],
                                     out_tk=usage_info["output_tokens"],
                                     out_chars=_out_c0,
@@ -2529,9 +1803,13 @@ async def execute_unified_completion(
                                         silent_eof_warning = False
                                         last_finish_reason_str = "stop"
                                         last_stream_chunk_obj = None
-                                        raw_p_max, raw_th_max, raw_out_max, raw_tool_p_max, raw_tot_max = 0, 0, 0, 0, 0
+                                        raw_p_max, raw_th_max, raw_out_max, raw_tool_p_max, raw_tot_max, raw_cached_max = 0, 0, 0, 0, 0, 0
 
                                         async for chunk_item_call in stream_gen_obj:
+                                            if tracker.is_live_aborted():
+                                                print(f"🛑 [实况中止] 正在断开模型 {model_to_call} 的真流式连接。")
+                                                tracker.finalize_cancelled(partial_output=any_output_yielded, by_console=True)
+                                                return
                                             received_any_stream_chunk = True
                                             last_stream_chunk_obj = chunk_item_call
                                             for _cand_fr_chk in (getattr(chunk_item_call, "candidates", None) or []):
@@ -2562,6 +1840,9 @@ async def execute_unified_completion(
                                                     raw_tool_p_max = _utp
                                                 if _utot > raw_tot_max:
                                                     raw_tot_max = _utot
+                                                _ucached = _extract_cached_tokens(chunk_item_call)
+                                                if _ucached > raw_cached_max:
+                                                    raw_cached_max = _ucached
 
                                             pf = getattr(chunk_item_call, "prompt_feedback", None)
                                             if pf and getattr(pf, "block_reason", None) and not has_yielded_visible_body:
@@ -2621,8 +1902,10 @@ async def execute_unified_completion(
 
                                                 if has_th_in_chunk:
                                                     emitted_reasoning_any = True
+                                                    tracker.note_live_phase("thinking", add_thought_chars=max(1, len(sse_chunk) // 4))
                                                 if has_vis_in_chunk:
                                                     has_yielded_visible_body = True
+                                                    tracker.note_live_phase("streaming", add_chars=max(1, len(sse_chunk) // 4))
 
                                                 if not prefill_emitted and '"content":' in sse_chunk and '"content": ""' not in sse_chunk and '"content": null' not in sse_chunk:
                                                     prefill_emitted = True
@@ -2827,9 +2110,11 @@ async def execute_unified_completion(
                                             visible_chars=_gen_only_chars,
                                         )
                                         final_comp_tk = final_th_tk + final_out_tk
+                                        final_cached_tk = min(final_p_tk, raw_cached_max) if final_p_tk > 0 else raw_cached_max
                                         if final_p_tk > 0 or final_comp_tk > 0:
-                                            stats.add_tokens(final_p_tk, final_comp_tk)
-                                            print(f"💰 [算力消耗统计] 输入: {final_p_tk} | 思考: {final_th_tk} | 正文: {final_out_tk} | 总计: {final_t_tk} Tokens")
+                                            stats.add_tokens(final_p_tk, final_comp_tk, cached_tokens=final_cached_tk)
+                                            _c_note = f" (缓存命中: {final_cached_tk})" if final_cached_tk > 0 else ""
+                                            print(f"💰 [算力消耗统计] 输入: {final_p_tk}{_c_note} | 思考: {final_th_tk} | 正文: {final_out_tk} | 总计: {final_t_tk} Tokens")
                                         else:
                                             stats.add_success()
 
@@ -2839,6 +2124,8 @@ async def execute_unified_completion(
                                                 "completion_tokens": final_comp_tk,
                                                 "total_tokens": final_t_tk,
                                             }
+                                            if final_cached_tk > 0:
+                                                _u_dict["prompt_tokens_details"] = {"cached_tokens": final_cached_tk}
                                             if final_th_tk > 0:
                                                 _u_dict["completion_tokens_details"] = {"reasoning_tokens": final_th_tk}
                                             yield make_usage_chunk(response_id_for_stream, exp_req_obj.model, _u_dict)
@@ -2864,6 +2151,7 @@ async def execute_unified_completion(
                                             has_tool_calls=tool_indexer.has_tool_calls(0),
                                             has_usage=bool(final_p_tk > 0 or final_comp_tk > 0),
                                             p_tk=final_p_tk,
+                                            cached_tk=final_cached_tk,
                                             th_tk=final_th_tk,
                                             out_tk=final_out_tk,
                                             out_chars=_stream_chars,
@@ -2986,10 +2274,15 @@ async def execute_unified_completion(
                             tracker.sync_from_cookie_telemetry(cookie_tel)
                             cookie_iter = cookie_resp.body_iterator
                             async for chunk_item in cookie_iter:
+                                if tracker.is_live_aborted():
+                                    print(f"🛑 [实况中止] 正在断开 Cookie 通道模型 {request_obj.model} 的流式连接。")
+                                    tracker.finalize_cancelled(partial_output=any_output_yielded, by_console=True)
+                                    return
                                 chunk_str = chunk_item.decode("utf-8", errors="replace") if isinstance(chunk_item, bytes) else str(chunk_item)
                                 if chunk_str.strip().startswith("data:") and '"chatcmpl-keepalive"' not in chunk_str:
                                     has_yielded_output = True
                                     any_output_yielded = True
+                                    tracker.note_live_phase("streaming", add_chars=max(1, len(chunk_str) // 4))
                                 yield chunk_str
                             tracker.sync_from_cookie_telemetry(cookie_tel)
                             if cookie_tel.get("cancelled"):
@@ -3010,6 +2303,7 @@ async def execute_unified_completion(
                                     has_tool_calls=bool(cookie_tel.get("tool_calls")),
                                     has_usage=bool(cookie_tel.get("has_usage")),
                                     p_tk=int(cookie_tel.get("p_tk") or 0),
+                                    cached_tk=int(cookie_tel.get("cached_tk") or 0),
                                     th_tk=int(cookie_tel.get("th_tk") or 0),
                                     out_tk=int(cookie_tel.get("out_tk") or 0),
                                     out_chars=int(cookie_tel.get("out_chars") or 0),
@@ -3097,7 +2391,8 @@ async def execute_unified_completion(
                         return
             finally:
                 if not tracker.finalized:
-                    tracker.finalize_cancelled(partial_output=any_output_yielded)
+                    tracker.finalize_cancelled(partial_output=any_output_yielded, by_console=tracker.is_live_aborted())
+                tracker.finish_live()
 
         return StreamingResponse(_unified_stream_generator(), media_type="text/event-stream")
 
@@ -3108,268 +2403,280 @@ async def execute_unified_completion(
     last_err_formatted = f"模型 {request_obj.model} 上游未返回任何响应（重试已耗尽）。"
     ns_thinking_cutoff_rewritten = False
 
-    for attempt in range(max_retries + 1):
-        if await _client_gone():
-            print(f"ℹ️ [客户端断开] 非流式请求前检测到客户端已断开，停止调用模型 {request_obj.model}。")
-            tracker.finalize_cancelled(partial_output=False)
-            return JSONResponse(
-                status_code=499,
-                content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
-            )
-
-        target = _pick_next_target()
-        if target is None:
-            break
-
-        tracker.note_attempt_start(target)
-        err_code = 500
-        err_formatted = ""
-        err_retry_after: Optional[float] = None
-        is_retryable = False
-        is_auth_or_billing = False
-
-        # ---------- 2A. 当前轮次使用 Express Key ----------
-        if target["channel"] == "express":
-            ctx, actual_prompt, _ = await _get_express_ctx(no_sandbox=sandbox_downgraded)
-            spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
-            current_client = spec["client"]
-            model_to_call = spec["model_to_call"]
-            fallback_model = spec["fallback_model"]
-            fallback_client_factory = spec["fallback_client_factory"]
-            gen_config_dict = ctx["gen_config_dict"]
-            prefill_text = ctx["prefill_text"]
-            exp_req_obj = ctx["request_obj"]
-            synth_tool_name = ctx.get("synthetic_tool_name", "")
-
-            print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用 {model_to_call}（请求模型={request_obj.model}）。")
-
-            try:
-                response_obj_call = None
-                sampler = _RawSampler()
-                unary_cfg = strip_stream_fc_args_from_config(gen_config_dict)
-                ns_call_t0 = time.monotonic()
-                for _pin_try in range(2):
-                    ns_call_t0 = time.monotonic()
-                    call_task = asyncio.create_task(
-                        current_client.aio.models.generate_content(
-                            model=model_to_call,
-                            contents=(_with_brief_reasoning_nudge(actual_prompt) if ns_thinking_cutoff_rewritten else actual_prompt),
-                            config=unary_cfg,
-                        )
-                    )
-                    try:
-                        while not call_task.done():
-                            await asyncio.sleep(0.5)
-                            if await _client_gone():
-                                print(f"ℹ️ [客户端断开] 非流式等待期间客户端已断开，取消调用模型 {model_to_call}。")
-                                call_task.cancel()
-                                try:
-                                    await call_task
-                                except (asyncio.CancelledError, Exception):
-                                    pass
-                                tracker.finalize_cancelled(partial_output=False)
-                                return JSONResponse(
-                                    status_code=499,
-                                    content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
-                                )
-                        response_obj_call = await call_task
-                        sampler.add(extract_gemini_chunk_debug_dict(response_obj_call))
-                        break
-                    except asyncio.CancelledError:
-                        if not call_task.done():
-                            call_task.cancel()
-                        tracker.finalize_cancelled(partial_output=False)
-                        raise
-                    except Exception as e_pin_call:
-                        if (
-                            _pin_try == 0
-                            and fallback_model
-                            and model_to_call != fallback_model
-                            and is_location_pin_failure(e_pin_call)
-                        ):
-                            _, pin_msg = extract_upstream_error(e_pin_call)
-                            print(f"↩️ [上游端点回退] [{target['label']}] 钉定路径 {model_to_call} 失败（{pin_msg[:600]}），"
-                                  f"立即退回默认路由 {fallback_model} 重试一次。")
-                            model_to_call = fallback_model
-                            current_client = fallback_client_factory()
-                            continue
-                        raise
-                ns_unary_elapsed = max(0.0, time.monotonic() - ns_call_t0)
-
-                if hasattr(response_obj_call, "prompt_feedback") and \
-                   hasattr(response_obj_call.prompt_feedback, "block_reason") and \
-                   response_obj_call.prompt_feedback.block_reason:
-                    print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
-                    raise ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
-
-                if not is_gemini_response_valid(
-                    response_obj_call,
-                    synthetic_tool_name=synth_tool_name,
-                    prefill_text=prefill_text,
-                ):
-                    print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
-                    err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
-                    if _is_max_tokens_finish(response_obj_call) and not ns_thinking_cutoff_rewritten:
-                        ns_thinking_cutoff_rewritten = True
-                        err_v.is_retryable = True
-                        print(f"🩹 [思考超限自愈] 模型 {model_to_call} 非流式仅输出思考即耗尽 max_tokens（0 字正文），将自动追加精简思考提示重写一次。")
-                    elif synth_tool_name:
-                        err_v.is_retryable = True
-                        if not sandbox_downgraded and is_malformed_tool_finish(response_obj_call):
-                            sandbox_downgraded = True
-                            print(f"🩹 [抗截断自愈] 模型 {model_to_call} 非流式触发工具解码异常，后续重试已自动剥离 compose_reply 切换为原生模式。")
-                    raise err_v
-
-                openai_response_content = convert_to_openai_format(
-                    response_obj_call,
-                    exp_req_obj.model,
-                    synthetic_tool_name=synth_tool_name,
-                    prefill_text=prefill_text,
-                )
-                _ns_ch0 = (openai_response_content.get("choices") or [{}])[0]
-                _ns_msg0 = _ns_ch0.get("message") or {}
-                _ns_raw_gen_chars = len(_ns_msg0.get("content") or "")
-                usage_info_ns = _record_usage(response_obj_call, visible_chars=_ns_raw_gen_chars)
-                if "usage" in openai_response_content:
-                    openai_response_content["usage"]["prompt_tokens"] = usage_info_ns["prompt_tokens"]
-                    openai_response_content["usage"]["completion_tokens"] = usage_info_ns["completion_tokens"]
-                    openai_response_content["usage"]["total_tokens"] = usage_info_ns["total_tokens"]
-                    if usage_info_ns["thoughts_tokens"] > 0:
-                        openai_response_content["usage"]["completion_tokens_details"] = {
-                            "reasoning_tokens": usage_info_ns["thoughts_tokens"]
-                        }
-                _prepend_prefill(openai_response_content, prefill_text)
-                if app_state.get_setting("debug_outbound", False):
-                    print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
-                _ns_fin0 = _ns_ch0.get("finish_reason") or "stop"
-                _ns_raw_fr0 = ""
-                _ns_cands0 = getattr(response_obj_call, "candidates", None) or []
-                if _ns_cands0 and getattr(_ns_cands0[0], "finish_reason", None) is not None:
-                    _ns_fv0 = _ns_cands0[0].finish_reason
-                    _ns_raw_fr0 = str(getattr(_ns_fv0, "name", _ns_fv0) or "").strip().upper()
-                tracker.finalize_success(
-                    target,
-                    is_cookie=False,
-                    ttft=None,
-                    gen_time=ns_unary_elapsed,
-                    finish_reason=_ns_fin0,
-                    raw_finish_reason=_ns_raw_fr0,
-                    has_tool_calls=bool(_ns_msg0.get("tool_calls")),
-                    has_usage=bool(usage_info_ns["prompt_tokens"] or usage_info_ns["completion_tokens"]),
-                    p_tk=usage_info_ns["prompt_tokens"],
-                    th_tk=usage_info_ns["thoughts_tokens"],
-                    out_tk=usage_info_ns["output_tokens"],
-                    out_chars=len(_ns_msg0.get("content") or ""),
-                )
-                print(f"✅ [Express] {request_obj.model} | 非流式响应完成")
-                return JSONResponse(content=openai_response_content)
-
-            except asyncio.CancelledError:
-                tracker.finalize_cancelled(partial_output=False)
-                raise
-            except Exception as e_call:
-                err_code, err_formatted = extract_upstream_error(e_call)
-                err_retry_after = extract_retry_after_seconds(e_call, err_formatted)
-                is_auth_or_billing = is_express_auth_or_billing_error(e_call, err_code)
-                is_retryable = is_retryable_exception(e_call)
-
-        # ---------- 2B. 当前轮次使用 Studio Cookie 直连 ----------
-        else:
-            print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用模型 {request_obj.model}。")
-            cookie_ns_tel: Dict[str, Any] = {}
-            try:
-                cookie_ns_resp = await cookie_upstream.execute_once(
-                    request_obj, fastapi_request, telemetry=cookie_ns_tel
-                )
-                tracker.sync_from_cookie_telemetry(cookie_ns_tel)
-                if getattr(cookie_ns_resp, "status_code", 200) == 499 or cookie_ns_tel.get("cancelled"):
-                    tracker.finalize_cancelled(partial_output=False)
-                else:
-                    tracker.finalize_success(
-                        target,
-                        is_cookie=True,
-                        ttft=None,
-                        gen_time=float(cookie_ns_tel.get("gen_time") or 0.0),
-                        finish_reason=str(cookie_ns_tel.get("finish_reason") or "stop"),
-                        raw_finish_reason=str(cookie_ns_tel.get("raw_finish_reason") or ""),
-                        has_tool_calls=bool(cookie_ns_tel.get("tool_calls")),
-                        has_usage=bool(cookie_ns_tel.get("has_usage")),
-                        p_tk=int(cookie_ns_tel.get("p_tk") or 0),
-                        th_tk=int(cookie_ns_tel.get("th_tk") or 0),
-                        out_tk=int(cookie_ns_tel.get("out_tk") or 0),
-                        out_chars=int(cookie_ns_tel.get("out_chars") or 0),
-                    )
-                return cookie_ns_resp
-            except asyncio.CancelledError:
-                tracker.sync_from_cookie_telemetry(cookie_ns_tel)
-                tracker.finalize_cancelled(partial_output=False)
-                raise
-            except Exception as e_cookie:
-                tracker.sync_from_cookie_telemetry(cookie_ns_tel)
-                err_code = getattr(e_cookie, "status_code", None) or getattr(e_cookie, "code", None) or 500
-                err_formatted = getattr(e_cookie, "message", None) or str(e_cookie)
-                err_retry_after = extract_retry_after_seconds(e_cookie, err_formatted)
-                is_auth_or_billing = bool(getattr(e_cookie, "is_auth_or_billing", False))
-                is_retryable = bool(getattr(e_cookie, "is_retryable", False))
-
-        # ---------- 2C. 统一处理非流式失败与多凭证退避轮换 ----------
-        if is_auth_or_billing:
-            dead_targets.add(target["id"])
-            tip = _emit_credential_invalid_warning(target, err_code, err_formatted)
-            if "【凭证更换提醒】" not in err_formatted:
-                err_formatted = err_formatted + tip
-
-        last_err_code = err_code
-        last_err_formatted = err_formatted
-
-        next_target = _peek_next_target()
-        can_retry = (
-            attempt < max_retries
-            and next_target is not None
-            and (is_retryable or is_auth_or_billing)
-        )
-        if can_retry:
+    try:
+        for attempt in range(max_retries + 1):
             if await _client_gone():
-                tracker.finalize_cancelled(partial_output=False)
+                print(f"ℹ️ [客户端断开] 非流式请求前检测到客户端已断开，停止调用模型 {request_obj.model}。")
+                tracker.finalize_cancelled(partial_output=False, by_console=tracker.is_live_aborted())
                 return JSONResponse(
                     status_code=499,
                     content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
                 )
-            stats.add_retry()
-            wait_target = _compute_smart_retry_wait(
-                backoff_sec, target, next_target, err_retry_after
-            )
-            tracker.note_attempt_failure(target, err_code, wait_sec=wait_target)
-            print(
-                f"⚠️ [自动重试] 非流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
-                f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
-                f"原因: {err_formatted[:1500]}"
-            )
-            waited = 0.0
-            while waited < wait_target:
-                step = min(0.5, wait_target - waited)
-                await asyncio.sleep(step)
-                waited += step
-                if await _client_gone():
-                    print(f"ℹ️ [客户端断开] 非流式退避期间客户端已断开，停止重试模型 {request_obj.model}。")
+
+            target = _pick_next_target()
+            if target is None:
+                break
+
+            tracker.note_attempt_start(target)
+            _note_target_meta(target)
+            err_code = 500
+            err_formatted = ""
+            err_retry_after: Optional[float] = None
+            is_retryable = False
+            is_auth_or_billing = False
+
+            # ---------- 2A. 当前轮次使用 Express Key ----------
+            if target["channel"] == "express":
+                ctx, actual_prompt, _ = await _get_express_ctx(no_sandbox=sandbox_downgraded)
+                spec = express_upstream.build_key_call_spec(ctx, target["key_record"])
+                current_client = spec["client"]
+                model_to_call = spec["model_to_call"]
+                fallback_model = spec["fallback_model"]
+                fallback_client_factory = spec["fallback_client_factory"]
+                gen_config_dict = ctx["gen_config_dict"]
+                prefill_text = ctx["prefill_text"]
+                exp_req_obj = ctx["request_obj"]
+                synth_tool_name = ctx.get("synthetic_tool_name", "")
+
+                print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用 {model_to_call}（请求模型={request_obj.model}）。")
+
+                try:
+                    response_obj_call = None
+                    sampler = _RawSampler()
+                    unary_cfg = strip_stream_fc_args_from_config(gen_config_dict)
+                    ns_call_t0 = time.monotonic()
+                    for _pin_try in range(2):
+                        ns_call_t0 = time.monotonic()
+                        call_task = asyncio.create_task(
+                            current_client.aio.models.generate_content(
+                                model=model_to_call,
+                                contents=(_with_brief_reasoning_nudge(actual_prompt) if ns_thinking_cutoff_rewritten else actual_prompt),
+                                config=unary_cfg,
+                            )
+                        )
+                        try:
+                            while not call_task.done():
+                                await asyncio.sleep(0.5)
+                                if await _client_gone():
+                                    print(f"ℹ️ [客户端断开] 非流式等待期间客户端已断开，取消调用模型 {model_to_call}。")
+                                    call_task.cancel()
+                                    try:
+                                        await call_task
+                                    except (asyncio.CancelledError, Exception):
+                                        pass
+                                    tracker.finalize_cancelled(partial_output=False, by_console=tracker.is_live_aborted())
+                                    return JSONResponse(
+                                        status_code=499,
+                                        content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
+                                    )
+                            response_obj_call = await call_task
+                            sampler.add(extract_gemini_chunk_debug_dict(response_obj_call))
+                            break
+                        except asyncio.CancelledError:
+                            if not call_task.done():
+                                call_task.cancel()
+                            tracker.finalize_cancelled(partial_output=False)
+                            raise
+                        except Exception as e_pin_call:
+                            if (
+                                _pin_try == 0
+                                and fallback_model
+                                and model_to_call != fallback_model
+                                and is_location_pin_failure(e_pin_call)
+                            ):
+                                _, pin_msg = extract_upstream_error(e_pin_call)
+                                print(f"↩️ [上游端点回退] [{target['label']}] 钉定路径 {model_to_call} 失败（{pin_msg[:600]}），"
+                                      f"立即退回默认路由 {fallback_model} 重试一次。")
+                                model_to_call = fallback_model
+                                current_client = fallback_client_factory()
+                                continue
+                            raise
+                    ns_unary_elapsed = max(0.0, time.monotonic() - ns_call_t0)
+
+                    if hasattr(response_obj_call, "prompt_feedback") and \
+                       hasattr(response_obj_call.prompt_feedback, "block_reason") and \
+                       response_obj_call.prompt_feedback.block_reason:
+                        print(f"🔎 [Express 诊断] 模型={model_to_call} 触发拦截。原始响应样本：\n{sampler.dump()}")
+                        raise ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
+
+                    if not is_gemini_response_valid(
+                        response_obj_call,
+                        synthetic_tool_name=synth_tool_name,
+                        prefill_text=prefill_text,
+                    ):
+                        print(f"🔎 [Express 诊断] 模型={model_to_call} 空正文或无效响应。原始响应样本：\n{sampler.dump()}")
+                        err_v = ValueError(_describe_empty_gemini_response(response_obj_call, model_to_call))
+                        if _is_max_tokens_finish(response_obj_call) and not ns_thinking_cutoff_rewritten:
+                            ns_thinking_cutoff_rewritten = True
+                            err_v.is_retryable = True
+                            print(f"🩹 [思考超限自愈] 模型 {model_to_call} 非流式仅输出思考即耗尽 max_tokens（0 字正文），将自动追加精简思考提示重写一次。")
+                        elif synth_tool_name:
+                            err_v.is_retryable = True
+                            if not sandbox_downgraded and is_malformed_tool_finish(response_obj_call):
+                                sandbox_downgraded = True
+                                print(f"🩹 [抗截断自愈] 模型 {model_to_call} 非流式触发工具解码异常，后续重试已自动剥离 compose_reply 切换为原生模式。")
+                        raise err_v
+
+                    openai_response_content = convert_to_openai_format(
+                        response_obj_call,
+                        exp_req_obj.model,
+                        synthetic_tool_name=synth_tool_name,
+                        prefill_text=prefill_text,
+                    )
+                    _ns_ch0 = (openai_response_content.get("choices") or [{}])[0]
+                    _ns_msg0 = _ns_ch0.get("message") or {}
+                    _ns_raw_gen_chars = len(_ns_msg0.get("content") or "")
+                    usage_info_ns = _record_usage(response_obj_call, visible_chars=_ns_raw_gen_chars)
+                    if "usage" in openai_response_content:
+                        openai_response_content["usage"]["prompt_tokens"] = usage_info_ns["prompt_tokens"]
+                        openai_response_content["usage"]["completion_tokens"] = usage_info_ns["completion_tokens"]
+                        openai_response_content["usage"]["total_tokens"] = usage_info_ns["total_tokens"]
+                        if usage_info_ns.get("cached_tokens", 0) > 0:
+                            openai_response_content["usage"]["prompt_tokens_details"] = {
+                                "cached_tokens": usage_info_ns["cached_tokens"]
+                            }
+                        if usage_info_ns["thoughts_tokens"] > 0:
+                            openai_response_content["usage"]["completion_tokens_details"] = {
+                                "reasoning_tokens": usage_info_ns["thoughts_tokens"]
+                            }
+                    _prepend_prefill(openai_response_content, prefill_text)
+                    if app_state.get_setting("debug_outbound", False):
+                        print(f"🔎 [Express 响应原始结构] {sampler.dump()}")
+                    _ns_fin0 = _ns_ch0.get("finish_reason") or "stop"
+                    _ns_raw_fr0 = ""
+                    _ns_cands0 = getattr(response_obj_call, "candidates", None) or []
+                    if _ns_cands0 and getattr(_ns_cands0[0], "finish_reason", None) is not None:
+                        _ns_fv0 = _ns_cands0[0].finish_reason
+                        _ns_raw_fr0 = str(getattr(_ns_fv0, "name", _ns_fv0) or "").strip().upper()
+                    tracker.finalize_success(
+                        target,
+                        is_cookie=False,
+                        ttft=None,
+                        gen_time=ns_unary_elapsed,
+                        finish_reason=_ns_fin0,
+                        raw_finish_reason=_ns_raw_fr0,
+                        has_tool_calls=bool(_ns_msg0.get("tool_calls")),
+                        has_usage=bool(usage_info_ns["prompt_tokens"] or usage_info_ns["completion_tokens"]),
+                        p_tk=usage_info_ns["prompt_tokens"],
+                        cached_tk=usage_info_ns.get("cached_tokens", 0),
+                        th_tk=usage_info_ns["thoughts_tokens"],
+                        out_tk=usage_info_ns["output_tokens"],
+                        out_chars=len(_ns_msg0.get("content") or ""),
+                    )
+                    print(f"✅ [Express] {request_obj.model} | 非流式响应完成")
+                    return JSONResponse(content=openai_response_content)
+
+                except asyncio.CancelledError:
                     tracker.finalize_cancelled(partial_output=False)
+                    raise
+                except Exception as e_call:
+                    err_code, err_formatted = extract_upstream_error(e_call)
+                    err_retry_after = extract_retry_after_seconds(e_call, err_formatted)
+                    is_auth_or_billing = is_express_auth_or_billing_error(e_call, err_code)
+                    is_retryable = is_retryable_exception(e_call)
+
+            # ---------- 2B. 当前轮次使用 Studio Cookie 直连 ----------
+            else:
+                print(f"🚀 [上游请求] 正在使用 [{target['label']}] 调用模型 {request_obj.model}。")
+                cookie_ns_tel: Dict[str, Any] = {}
+                try:
+                    cookie_ns_resp = await cookie_upstream.execute_once(
+                        request_obj, fastapi_request, telemetry=cookie_ns_tel
+                    )
+                    tracker.sync_from_cookie_telemetry(cookie_ns_tel)
+                    if getattr(cookie_ns_resp, "status_code", 200) == 499 or cookie_ns_tel.get("cancelled"):
+                        tracker.finalize_cancelled(partial_output=False)
+                    else:
+                        tracker.finalize_success(
+                            target,
+                            is_cookie=True,
+                            ttft=None,
+                            gen_time=float(cookie_ns_tel.get("gen_time") or 0.0),
+                            finish_reason=str(cookie_ns_tel.get("finish_reason") or "stop"),
+                            raw_finish_reason=str(cookie_ns_tel.get("raw_finish_reason") or ""),
+                            has_tool_calls=bool(cookie_ns_tel.get("tool_calls")),
+                            has_usage=bool(cookie_ns_tel.get("has_usage")),
+                            p_tk=int(cookie_ns_tel.get("p_tk") or 0),
+                            cached_tk=int(cookie_ns_tel.get("cached_tk") or 0),
+                            th_tk=int(cookie_ns_tel.get("th_tk") or 0),
+                            out_tk=int(cookie_ns_tel.get("out_tk") or 0),
+                            out_chars=int(cookie_ns_tel.get("out_chars") or 0),
+                        )
+                    return cookie_ns_resp
+                except asyncio.CancelledError:
+                    tracker.sync_from_cookie_telemetry(cookie_ns_tel)
+                    tracker.finalize_cancelled(partial_output=False)
+                    raise
+                except Exception as e_cookie:
+                    tracker.sync_from_cookie_telemetry(cookie_ns_tel)
+                    err_code = getattr(e_cookie, "status_code", None) or getattr(e_cookie, "code", None) or 500
+                    err_formatted = getattr(e_cookie, "message", None) or str(e_cookie)
+                    err_retry_after = extract_retry_after_seconds(e_cookie, err_formatted)
+                    is_auth_or_billing = bool(getattr(e_cookie, "is_auth_or_billing", False))
+                    is_retryable = bool(getattr(e_cookie, "is_retryable", False))
+
+            # ---------- 2C. 统一处理非流式失败与多凭证退避轮换 ----------
+            if is_auth_or_billing:
+                dead_targets.add(target["id"])
+                tip = _emit_credential_invalid_warning(target, err_code, err_formatted)
+                if "【凭证更换提醒】" not in err_formatted:
+                    err_formatted = err_formatted + tip
+
+            last_err_code = err_code
+            last_err_formatted = err_formatted
+
+            next_target = _peek_next_target()
+            can_retry = (
+                attempt < max_retries
+                and next_target is not None
+                and (is_retryable or is_auth_or_billing)
+            )
+            if can_retry:
+                if await _client_gone():
+                    tracker.finalize_cancelled(partial_output=False, by_console=tracker.is_live_aborted())
                     return JSONResponse(
                         status_code=499,
                         content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
                     )
-            continue
+                stats.add_retry()
+                wait_target = _compute_smart_retry_wait(
+                    backoff_sec, target, next_target, err_retry_after
+                )
+                tracker.note_attempt_failure(target, err_code, wait_sec=wait_target)
+                print(
+                    f"⚠️ [自动重试] 非流式模型={request_obj.model} | 凭证 [{target['label']}] 失败 (HTTP {err_code}) | "
+                    f"第 {attempt + 1}/{max_retries} 次退避重试，等待 {wait_target}s 后将切换至 [{next_target['label']}] | "
+                    f"原因: {err_formatted[:1500]}"
+                )
+                waited = 0.0
+                while waited < wait_target:
+                    step = min(0.5, wait_target - waited)
+                    await asyncio.sleep(step)
+                    waited += step
+                    if await _client_gone():
+                        print(f"ℹ️ [客户端断开] 非流式退避期间客户端已断开，停止重试模型 {request_obj.model}。")
+                        tracker.finalize_cancelled(partial_output=False, by_console=tracker.is_live_aborted())
+                        return JSONResponse(
+                            status_code=499,
+                            content=create_openai_error_response(499, "客户端已断开连接，请求已取消。", "client_closed_request"),
+                        )
+                continue
 
-        tracker.note_attempt_failure(target, err_code)
-        tracker.finalize_error(err_code, err_formatted)
-        # 注意：非流式返回 status_code >= 400 时，main.py 的 stats_tracker_middleware 会统一计 1 次 error
-        print(f"❌ [非流式请求失败] 模型={request_obj.model} | 凭证=[{target['label']}] | HTTP {err_code} | {err_formatted[:2000]}")
+            tracker.note_attempt_failure(target, err_code)
+            tracker.finalize_error(err_code, err_formatted)
+            # 注意：非流式返回 status_code >= 400 时，main.py 的 stats_tracker_middleware 会统一计 1 次 error
+            print(f"❌ [非流式请求失败] 模型={request_obj.model} | 凭证=[{target['label']}] | HTTP {err_code} | {err_formatted[:2000]}")
+            return JSONResponse(
+                status_code=err_code,
+                content=create_openai_error_response(err_code, err_formatted[:2000], "upstream_error"),
+            )
+
+        tracker.finalize_error(last_err_code, last_err_formatted)
         return JSONResponse(
-            status_code=err_code,
-            content=create_openai_error_response(err_code, err_formatted[:2000], "upstream_error"),
+            status_code=last_err_code,
+            content=create_openai_error_response(last_err_code, last_err_formatted[:2000], "upstream_error"),
         )
-
-    tracker.finalize_error(last_err_code, last_err_formatted)
-    return JSONResponse(
-        status_code=last_err_code,
-        content=create_openai_error_response(last_err_code, last_err_formatted[:2000], "upstream_error"),
-    )
+    finally:
+        if not tracker.finalized:
+            tracker.finalize_cancelled(partial_output=False, by_console=tracker.is_live_aborted())
+        tracker.finish_live()

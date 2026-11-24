@@ -989,18 +989,12 @@ def _build_batch_graphql_body(
         if "nano-banana" in (model_name or "").lower():
             gen_config["mediaResolution"] = "MEDIA_RESOLUTION_HIGH"
     else:
-        if "temperature" in allowed:
-            tv = request.temperature if request.temperature is not None else settings.get("default_temperature")
-            if tv is not None:
-                gen_config["temperature"] = tv
-        if "top_p" in allowed:
-            pv = request.top_p if request.top_p is not None else settings.get("default_top_p")
-            if pv is not None:
-                gen_config["topP"] = pv
+        if "temperature" in allowed and request.temperature is not None:
+            gen_config["temperature"] = request.temperature
+        if "top_p" in allowed and request.top_p is not None:
+            gen_config["topP"] = request.top_p
         if "max_output_tokens" in allowed:
             mv = request.max_tokens if request.max_tokens is not None else getattr(request, "max_completion_tokens", None)
-            if mv is None:
-                mv = settings.get("default_max_tokens")
             if mv is not None:
                 _fake_on_c = bool(app_state.get_setting("fake_streaming", app_config.FAKE_STREAMING_ENABLED))
                 _is_real_stream_c = bool(getattr(request, "stream", False) and not _fake_on_c)
@@ -1360,10 +1354,28 @@ def _extract_studio_usage_detail(usage_meta: dict | None) -> tuple[int, int, int
     return p, th, out_c, t
 
 
+def _extract_studio_cached_tokens(usage_meta: dict | None, prompt_tokens: int = 0) -> int:
+    """提取 Studio(Cookie) 通道隐式前缀缓存命中 Token 数（cachedContentTokenCount）。"""
+    usage_meta = usage_meta or {}
+    raw = usage_meta.get("cachedContentTokenCount")
+    if raw is None:
+        raw = usage_meta.get("cached_content_token_count")
+    try:
+        c = max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        c = 0
+    if prompt_tokens > 0 and c > prompt_tokens:
+        c = prompt_tokens
+    return c
+
+
 def _map_usage(usage_meta: dict | None) -> dict:
     p, th, out_c, t = _extract_studio_usage_detail(usage_meta)
+    cached = _extract_studio_cached_tokens(usage_meta, p)
     comp = out_c + th
     res: dict = {"prompt_tokens": p, "completion_tokens": comp, "total_tokens": t}
+    if cached > 0:
+        res["prompt_tokens_details"] = {"cached_tokens": cached}
     if th > 0:
         res["completion_tokens_details"] = {"reasoning_tokens": th}
     return res
@@ -1372,10 +1384,12 @@ def _map_usage(usage_meta: dict | None) -> dict:
 def _record_studio_usage(usage_meta: dict | None) -> dict:
     """将 Studio(Cookie) 通道返回的 usageMetadata 计入全局算力统计（无 token 时仅计成功次数）。"""
     p_tk, th_tk, out_tk, t_tk = _extract_studio_usage_detail(usage_meta)
+    cached_tk = _extract_studio_cached_tokens(usage_meta, p_tk)
     comp_tk = th_tk + out_tk
     if p_tk > 0 or comp_tk > 0:
-        stats.add_tokens(p_tk, comp_tk)
-        print(f"💰 [Studio 算力统计] 输入: {p_tk} | 思考: {th_tk} | 正文: {out_tk} | 总计: {t_tk} Tokens")
+        stats.add_tokens(p_tk, comp_tk, cached_tokens=cached_tk)
+        _c_note = f" (缓存命中: {cached_tk})" if cached_tk > 0 else ""
+        print(f"💰 [Studio 算力统计] 输入: {p_tk}{_c_note} | 思考: {th_tk} | 正文: {out_tk} | 总计: {t_tk} Tokens")
     else:
         stats.add_success()
     return _map_usage(usage_meta)
@@ -2089,6 +2103,7 @@ class CookieProxyUpstream(BaseUpstream):
                     yield _make_openai_chunk(response_id, model_display, reasoning_content=res["reasoning_text"])
                 yield _make_openai_chunk(response_id, model_display, content=full_text or " ")
                 p_u, th_u, out_u, _ = _extract_studio_usage_detail(res.get("usage_meta"))
+                c_u = _extract_studio_cached_tokens(res.get("usage_meta"), p_u)
                 usage = _record_studio_usage(res.get("usage_meta"))
                 fin_r = res.get("finish_reason", "stop")
                 if telemetry is not None:
@@ -2098,6 +2113,7 @@ class CookieProxyUpstream(BaseUpstream):
                     telemetry["out_chars"] = len(full_text)
                     telemetry["has_usage"] = bool(p_u > 0 or th_u > 0 or out_u > 0)
                     telemetry["p_tk"] = p_u
+                    telemetry["cached_tk"] = c_u
                     telemetry["th_tk"] = th_u
                     telemetry["out_tk"] = out_u
                 if want_usage:
@@ -2546,6 +2562,7 @@ class CookieProxyUpstream(BaseUpstream):
                         telemetry["out_chars"] = stream_out_chars
                         telemetry["has_usage"] = bool(p_u_s > 0 or th_u_s > 0 or out_u_s > 0)
                         telemetry["p_tk"] = p_u_s
+                        telemetry["cached_tk"] = _extract_studio_cached_tokens(usage_meta, p_u_s)
                         telemetry["th_tk"] = th_u_s
                         telemetry["out_tk"] = out_u_s
                     if want_usage:
@@ -2838,6 +2855,7 @@ class CookieProxyUpstream(BaseUpstream):
                 telemetry["out_chars"] = len(full_text)
                 telemetry["has_usage"] = bool(p_u_ns > 0 or th_u_ns > 0 or out_u_ns > 0)
                 telemetry["p_tk"] = p_u_ns
+                telemetry["cached_tk"] = _extract_studio_cached_tokens(usage_meta, p_u_ns)
                 telemetry["th_tk"] = th_u_ns
                 telemetry["out_tk"] = out_u_ns
             content_value = full_text + safety_html

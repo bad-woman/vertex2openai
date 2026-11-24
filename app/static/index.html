@@ -1,0 +1,1306 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="sky-day">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>agentplatform2api · 控制台</title>
+  <link rel="icon" type="image/webp" href="/avatar.webp" />
+  <script>
+    (function () {
+      var valid = { "sky-day": 1, "sky-night": 1, "sakura-day": 1, "sakura-night": 1 };
+      var saved = "";
+      try { saved = localStorage.getItem("ap2a_theme") || ""; } catch (e) {}
+      if (!valid[saved]) {
+        try {
+          var legacy = localStorage.getItem("ap_theme");
+          if (legacy === "dark") saved = "sakura-night";
+          else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) saved = "sky-night";
+          else saved = "sky-day";
+        } catch (e) { saved = "sky-day"; }
+      }
+      document.documentElement.setAttribute("data-theme", saved);
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <!-- MOBILE TOPBAR (<768px) -->
+  <header class="mobile-topbar">
+    <div class="mobile-brand">
+      <img class="mobile-avatar" src="/avatar.webp" alt="429 娘" />
+      <div class="truncate">
+        <div class="brand-title">agentplatform2api <span class="sparkle">✦</span></div>
+      </div>
+      <span class="live-dot" title="服务在线"></span>
+    </div>
+    <div class="mobile-top-actions">
+      <button class="btn-icon" id="mobThemeBtn" aria-label="切换主题" title="切换主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41"/></svg>
+      </button>
+      <button class="btn-icon" id="mobCopyBtn" aria-label="复制 /v1 地址" title="复制 /v1 地址">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Mobile Theme Popover -->
+  <div class="mobile-popover" id="mobileThemePopover">
+    <div class="sidebar-label" style="margin-bottom:10px;">
+      <span>主题配色 <span class="sparkle">✦</span></span>
+      <span id="mobThemeName" style="color:var(--primary-text);">晴空汽水</span>
+    </div>
+    <div class="theme-grid" id="mobThemeGrid"></div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <span style="font-size:11.5px;color:var(--text-muted);" id="mobUptimeText">运行中</span>
+      <button class="btn btn-danger-soft btn-sm" onclick="logout()">退出登录</button>
+    </div>
+  </div>
+
+  <!-- MAIN APP SHELL -->
+  <div class="app-shell">
+    <!-- Desktop Left Sidebar -->
+    <aside class="sidebar">
+      <div class="brand-box">
+        <img class="brand-avatar" src="/avatar.webp" alt="429 娘" />
+        <div class="brand-meta">
+          <div class="brand-title">agentplatform2api <span class="sparkle">✦</span></div>
+          <div class="brand-status">
+            <span class="live-dot"></span>
+            <span class="truncate" id="sidebarChannelStatus">在线 · 加载中</span>
+          </div>
+        </div>
+      </div>
+
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-tab="overview">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>
+          数据概览
+        </button>
+        <button class="nav-item" data-tab="channel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+          通道与凭证
+          <span class="nav-badge num" id="navKeyBadge">0</span>
+        </button>
+        <button class="nav-item" data-tab="params">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+          模型参数
+        </button>
+        <button class="nav-item" data-tab="logs">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          运行日志
+          <span class="nav-badge num" id="navRecBadge">0</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-section">
+        <div class="sidebar-label">
+          <span>主题配色</span>
+          <span class="sparkle">✦</span>
+        </div>
+        <div class="theme-grid" id="sideThemeGrid"></div>
+      </div>
+
+      <div class="sidebar-actions">
+        <div style="font-size:11.5px;color:var(--text-muted);padding:0 10px 2px;" id="sideUptimeText">已运行 0.0 h</div>
+        <button class="side-btn" id="sideCopyBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          复制 /v1 接口地址
+        </button>
+        <button class="side-btn" onclick="logout()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          退出登录
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Content Stage -->
+    <main class="main-stage">
+      <div class="stage-inner">
+
+        <!-- =============================================================
+             TAB 1: 数据概览 (OVERVIEW)
+             ============================================================= -->
+        <section class="tab-panel active" id="panel-overview">
+          <div class="page-header">
+            <div class="page-title-wrap">
+              <h1 class="page-title">
+                数据概览
+                <span class="pill primary"><span class="sparkle">✦</span> SQLite 长久留存</span>
+              </h1>
+              <p class="page-desc">实时观测通道健康度、隐式前缀缓存命中率与分模型性能表现。</p>
+            </div>
+            <div class="header-controls">
+              <div class="segmented" role="tablist" aria-label="时间范围">
+                <button class="seg-btn active" data-range="today" onclick="setRange('today')">今日</button>
+                <button class="seg-btn" data-range="7d" onclick="setRange('7d')">近 7 天</button>
+                <button class="seg-btn" data-range="all" onclick="setRange('all')">全部累计</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Dynamic Live Stream X-Ray Pulse Capsule (Only visible when active requests exist) -->
+          <div class="pulse-wrapper" id="pulseWrapper">
+            <div class="pulse-stack" id="pulseStack"></div>
+          </div>
+
+          <!-- 4 Core KPI Cards -->
+          <div class="kpi-grid">
+            <div class="glass-card kpi-card" style="--kpi-color: var(--primary);">
+              <div class="kpi-head">
+                <span class="kpi-label">总请求</span>
+                <span class="card-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                </span>
+              </div>
+              <div class="kpi-val num" id="kpiTotal">0</div>
+              <div class="kpi-foot" id="kpiTotalSub">等待发起请求</div>
+            </div>
+
+            <div class="glass-card kpi-card" style="--kpi-color: var(--success);">
+              <div class="kpi-head">
+                <span class="kpi-label">成功响应</span>
+                <span class="card-icon mint">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                </span>
+              </div>
+              <div class="kpi-val num" id="kpiOk">0</div>
+              <div class="kpi-foot" id="kpiOkSub">待命</div>
+            </div>
+
+            <div class="glass-card kpi-card" style="--kpi-color: var(--warning);">
+              <div class="kpi-head">
+                <span class="kpi-label">拥堵重试</span>
+                <span class="card-icon warn">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                </span>
+              </div>
+              <div class="kpi-val num" id="kpiRetry">0</div>
+              <div class="kpi-foot" id="kpiRetrySub">429 / 503 自动换钥挽回</div>
+            </div>
+
+            <div class="glass-card kpi-card" style="--kpi-color: var(--danger);">
+              <div class="kpi-head">
+                <span class="kpi-label">错误 / 拦截</span>
+                <span class="card-icon danger">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                </span>
+              </div>
+              <div class="kpi-val num" id="kpiErr">0</div>
+              <div class="kpi-foot" id="kpiErrSub">含上游报错 / 安全拦截</div>
+            </div>
+          </div>
+
+          <!-- Dual-Column Pure SVG Charts -->
+          <div class="viz-grid">
+            <!-- Left: Health Donut + 7-Day Bezier Sparkline -->
+            <div class="glass-card health-card">
+              <div class="card-header" style="margin-bottom:12px;">
+                <div class="card-title-group">
+                  <span class="card-icon mint">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                  </span>
+                  <div>
+                    <h2 class="card-title">服务健康度</h2>
+                    <div class="card-sub">可用率与近 7 天活跃趋势</div>
+                  </div>
+                </div>
+                <span class="pill primary num" id="healthStatusPill">待命</span>
+              </div>
+
+              <div class="donut-stage">
+                <div class="donut-box">
+                  <svg viewBox="0 0 128 128" id="healthDonutSvg"></svg>
+                  <div class="donut-center">
+                    <div class="donut-pct num" id="donutPct">—</div>
+                    <div class="donut-sub" id="donutSub">待命</div>
+                  </div>
+                </div>
+                <div class="donut-stats" id="donutLegend"></div>
+              </div>
+
+              <div class="spark-box">
+                <div class="spark-head">
+                  <span>近 7 天请求趋势</span>
+                  <span class="num" id="sparkSummary" style="color:var(--primary-text);font-weight:650;">峰值 0 / 日</span>
+                </div>
+                <svg class="spark-svg" viewBox="0 0 320 64" id="sparkSvg"></svg>
+                <div class="spark-axis num">
+                  <span>6天前</span>
+                  <span>4天前</span>
+                  <span>前天</span>
+                  <span>昨天</span>
+                  <span style="color:var(--primary-text);font-weight:650;">今日</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right: Token & Implicit Prefix Cache Radar -->
+            <div class="glass-card token-card">
+              <div class="card-header">
+                <div class="card-title-group">
+                  <span class="card-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                  </span>
+                  <div>
+                    <h2 class="card-title">Token 算力与隐式缓存雷达</h2>
+                    <div class="card-sub">实时追踪 Vertex 隐式前缀缓存命中率</div>
+                  </div>
+                </div>
+                <span class="pill success num" id="cacheHitBadge">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                  隐式缓存 0.0%
+                </span>
+              </div>
+
+              <div class="token-radar-list" id="tokenRadarList"></div>
+
+              <div class="token-footer">
+                <div>
+                  <div style="font-size:12px;color:var(--text-muted);font-weight:600;">累计总消耗 Tokens</div>
+                  <div style="font-size:11.5px;color:var(--text-secondary);margin-top:2px;" id="tokenCacheSaveHint">暂无算力消耗记录</div>
+                </div>
+                <div class="num" style="font-size:22px;font-weight:780;color:var(--primary-text);letter-spacing:-0.02em;" id="tokenGrandTotal">0</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Per-Model Stats & Performance -->
+          <div class="glass-card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="card-icon think">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+                </span>
+                <div>
+                  <h2 class="card-title">分模型统计与性能</h2>
+                  <div class="card-sub">仅展示当前时间范围内存在调用记录的模型 · 含缓存高亮占比条与速度统计</div>
+                </div>
+              </div>
+              <div class="segmented">
+                <button class="seg-btn active" data-sort="calls" onclick="setModelSort('calls')">按调用次数</button>
+                <button class="seg-btn" data-sort="tokens" onclick="setModelSort('tokens')">按 Token 消耗</button>
+              </div>
+            </div>
+
+            <div class="model-list" id="modelStatsList"></div>
+            <div class="model-expand-wrap" id="modelExpandWrap"></div>
+          </div>
+        </section>
+
+        <!-- =============================================================
+             TAB 2: 通道与凭证 (CHANNEL — 凭证配置 | 连通实测)
+             ============================================================= -->
+        <section class="tab-panel" id="panel-channel">
+          <div class="page-header">
+            <div class="page-title-wrap">
+              <h1 class="page-title">通道与凭证</h1>
+              <p class="page-desc">管理优先上游通道与凭证池，并支持定向单凭证无感实测、生图验收与出站参数解剖。</p>
+            </div>
+            <div class="segmented" role="tablist" aria-label="通道与实测切换">
+              <button class="seg-btn active" id="subChanConfigBtn" onclick="setChannelSub('config')">凭证配置</button>
+              <button class="seg-btn" id="subChanTestBtn" onclick="setChannelSub('test')">连通实测</button>
+            </div>
+          </div>
+
+          <!-- Sub-tab A: Credential Config -->
+          <div id="channelSubConfig">
+          <!-- Priority Channel Selector -->
+          <div class="channel-cards">
+            <button class="channel-choice active" id="chExpress" onclick="selectChannel('api_key')">
+              <div class="choice-top">
+                <div class="choice-name">
+                  <span class="card-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                  </span>
+                  Express API Key（标准模式）
+                </div>
+                <span class="choice-radio"></span>
+              </div>
+              <div class="choice-desc">使用官方 google-genai SDK + 多账号 Key 池轮询调用，低延迟并精确统计隐式前缀缓存。</div>
+              <div style="margin-top:4px;display:flex;gap:8px;flex-wrap:wrap;">
+                <span class="pill primary" id="badgeExpressActive">当前主用</span>
+                <span class="pill num" id="expressTotalHitsPill">池内累计命中 0 次</span>
+              </div>
+            </button>
+
+            <button class="channel-choice" id="chCookie" onclick="selectChannel('web_proxy')">
+              <div class="choice-top">
+                <div class="choice-name">
+                  <span class="card-icon mint">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                  </span>
+                  Cookie 直连反代（Studio 模式）
+                </div>
+                <span class="choice-radio"></span>
+              </div>
+              <div class="choice-desc">使用 Google Cloud 控制台 Cookie 直连私有接口，开启跨通道兜底时自动互为热备。</div>
+              <div style="margin-top:4px;display:flex;gap:8px;flex-wrap:wrap;">
+                <span class="pill" id="badgeCookieActive">热备通道</span>
+                <span class="pill success num" id="cookieCardHitsPill">Cookie 累计命中 0 次</span>
+              </div>
+            </button>
+          </div>
+
+          <!-- Express Key Pool -->
+          <div class="glass-card" style="margin-bottom:16px;">
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="card-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+                </span>
+                <div>
+                  <h2 class="card-title" style="display:flex;align-items:center;gap:6px;">
+                    Express API Key 凭证池
+                    <button class="help-btn" onclick="toggleHelpById(this,'h_keys')" aria-label="凭证池说明">?</button>
+                  </h2>
+                  <div class="card-sub" id="keyPoolSub">支持多账号轮询，移开输入框即自动保存并探测归属 Project ID</div>
+                </div>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <button class="btn btn-ghost btn-sm" onclick="probeAllKeys()">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                  探测全部项目
+                </button>
+                <button class="btn btn-primary btn-sm" onclick="addKeyRow()">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                  添加 Key
+                </button>
+              </div>
+            </div>
+            <div id="h_keys" class="help-drawer" style="margin-top:0;margin-bottom:12px;">
+              <strong>自动保存 &amp; 即添即探</strong>：点「添加 Key」粘贴后，移开输入框（或按回车）即自动保存并后台探测归属 Project ID；勾选启用/禁用、修改 Project ID 或删除也会立即落盘生效。每把 Key 的累计命中次数通过非敏感 SHA-256 指纹长久绑定，删改调序不串号。
+            </div>
+
+            <div class="key-pool" id="keyPoolList"></div>
+          </div>
+
+          <!-- Studio Cookie Card -->
+          <div class="glass-card">
+            <div class="card-header">
+              <div class="card-title-group">
+                <span class="card-icon mint">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                </span>
+                <div>
+                  <h2 class="card-title" style="display:flex;align-items:center;gap:6px;">
+                    Studio Cookie 直连凭证
+                    <button class="help-btn" onclick="toggleHelpById(this,'h_ck')" aria-label="Cookie 说明">?</button>
+                  </h2>
+                  <div class="card-sub">用于 Studio 直连模式，或作为 Express Key 池的跨通道备用凭证</div>
+                </div>
+              </div>
+              <span class="hit-pill num" id="cookieHitsPill">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                命中 0 次
+              </span>
+            </div>
+            <div id="h_ck" class="help-drawer" style="margin-top:0;margin-bottom:12px;">
+              <strong>Cookie 维护说明</strong>：Cookie 通常可维持数周。当日志出现 <code>aiplatform.endpoints.predict denied</code> 权限错误时，重新从已登录的 <code>console.cloud.google.com</code> 复制完整 Request Cookie（或用 Cookie-Editor 导出 JSON）粘贴保存即可。
+            </div>
+
+            <div class="form-grid-2">
+              <div class="field-group" style="grid-column: 1 / -1;">
+                <label class="field-label" for="cookieInput">
+                  <span>Google Cookie（支持 Header 字符串或 Cookie-Editor JSON 自动解析）</span>
+                  <span class="pill" id="cookieStatePill">未配置</span>
+                </label>
+                <textarea id="cookieInput" class="field-textarea mono" style="min-height:76px;font-size:12px;" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Header 字符串或 Cookie-Editor JSON）"></textarea>
+              </div>
+              <div class="field-group">
+                <label class="field-label" for="cookieProj">Google Cloud Project ID（支持粘贴控制台 URL 自动提取）</label>
+                <input id="cookieProj" class="field-input mono" placeholder="例如：my-gcp-project-123456（或含 ?project=xxx 的链接）" />
+              </div>
+              <div class="field-group" style="justify-content:flex-end;">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <button class="btn btn-primary" onclick="saveCookie()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                    保存并校验 Cookie
+                  </button>
+                  <button class="btn btn-ghost" onclick="testCookieDirect()" title="不切换全局主通道，直接单发实测当前 Cookie">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    实测 Cookie
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          </div>
+
+          <!-- Sub-tab B: Live Connectivity Test & Request Anatomy -->
+          <div id="channelSubTest" style="display:none;">
+            <div class="lab-split">
+              <!-- Left: Minimalist Composer (Zero Preset Templates) -->
+              <div class="glass-card">
+                <div class="card-header" style="margin-bottom:12px;">
+                  <div class="card-title-group">
+                    <span class="card-icon">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                    </span>
+                    <div>
+                      <h2 class="card-title">发包实测控制台</h2>
+                      <div class="card-sub">支持指定单把 Key 或 Cookie 无感直测，留空直接发送极简探针</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="lab-target-row">
+                  <div class="field-group">
+                    <label class="field-label" for="labTarget">
+                      <span>测试目标凭证</span>
+                      <span class="pill" id="labTargetModePill">跟随默认路由</span>
+                    </label>
+                    <select class="field-select" id="labTarget" onchange="onLabTargetChange()">
+                      <option value="auto">跟随当前全局路由（含轮询与容灾）</option>
+                      <option value="cookie">仅测 Studio Cookie 直连（单发直测）</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="lab-controls">
+                  <select class="field-select" id="labModel" onchange="onLabModelChange()">
+                    <option value="gemini-4-carbon">gemini-4-carbon</option>
+                  </select>
+                  <div class="segmented">
+                    <button class="seg-btn active" id="labStreamYes" onclick="setLabStream(true)">流式</button>
+                    <button class="seg-btn" id="labStreamNo" onclick="setLabStream(false)">非流式</button>
+                  </div>
+                </div>
+
+                <textarea id="labPrompt" class="field-textarea" style="min-height:132px;" placeholder="输入任意测试提示词…（留空直接点发送，将自动发送一句极简连通性探针）"></textarea>
+
+                <button class="lab-accordion-btn" id="labOptToggle" onclick="toggleLabOptional()">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                  附加 System / 模拟预填充（可选）
+                </button>
+
+                <div class="lab-optional" id="labOptionalArea">
+                  <div class="field-group">
+                    <label class="field-label" for="labSystem">System Prompt（可选）</label>
+                    <textarea id="labSystem" class="field-textarea" style="min-height:66px;" placeholder="可选系统指令…" oninput="refreshLabInspector()"></textarea>
+                  </div>
+                  <div class="field-group">
+                    <label class="field-label" for="labPrefill">Assistant 模拟预填充（可选）</label>
+                    <textarea id="labPrefill" class="field-textarea" style="min-height:58px;" placeholder="可选尾部 assistant 预填充片段…" oninput="refreshLabInspector()"></textarea>
+                  </div>
+                </div>
+
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:14px;flex-wrap:wrap;">
+                  <span style="font-size:12px;color:var(--text-muted);" id="labReadyHint">将按当前生效规则发往真实上游</span>
+                  <button class="btn btn-primary" id="labSendBtn" onclick="runLabTest()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    发送实测
+                  </button>
+                </div>
+              </div>
+
+              <!-- Right: 3-View Anatomy Panel -->
+              <div class="glass-card">
+                <div class="card-header" style="margin-bottom:14px;">
+                  <div class="card-title-group">
+                    <span class="card-icon mint">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                    </span>
+                    <h2 class="card-title">实测解剖面板</h2>
+                  </div>
+                  <div class="segmented">
+                    <button class="seg-btn active" data-labview="stream" onclick="setLabView('stream')">实况流</button>
+                    <button class="seg-btn" data-labview="inspect" onclick="setLabView('inspect')">出站透视</button>
+                    <button class="seg-btn" data-labview="tokens" onclick="setLabView('tokens')">Token 体检</button>
+                  </div>
+                </div>
+
+                <!-- View 1: Live Stream + Hit Cred Bar + Error Diagnosis + Image Preview + Timing -->
+                <div class="lab-subpanel active" id="labView-stream">
+                  <div class="lab-meta-bar" id="labMetaBar" style="display:none;">
+                    <span class="pill primary" id="labCredPill">等待命中凭证</span>
+                    <div class="record-tags" id="labMetaTags"></div>
+                  </div>
+
+                  <div class="lab-error-card" id="labErrorCard" style="display:none;">
+                    <div class="lab-error-head">
+                      <span class="pill danger num" id="labErrorCode">HTTP 500</span>
+                      <strong id="labErrorTitle">上游返回异常</strong>
+                    </div>
+                    <div class="lab-error-hint" id="labErrorHint"></div>
+                    <pre class="lab-error-detail" id="labErrorDetail"></pre>
+                  </div>
+
+                  <div class="thought-box" id="labThoughtBox" style="display:none;">
+                    <button class="thought-toggle" onclick="document.getElementById('labThoughtBox').classList.toggle('collapsed')">
+                      <span style="display:inline-flex;align-items:center;gap:6px;">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                        <span id="labThoughtMeta">思考过程（点击折叠 / 展开）</span>
+                      </span>
+                      <span style="font-size:11px;">折叠</span>
+                    </button>
+                    <div class="thought-body" id="labThoughtText"></div>
+                  </div>
+
+                  <div class="stream-output" id="labStreamText" style="color:var(--text-muted);">选择测试目标与模型后点击「发送实测」，此处实时展示思考过程、正文吐字或生图预览，并在下方绘制连接 / 思考 / 吐字比例耗时条。</div>
+
+                  <div class="lab-image-gallery" id="labImageGallery" style="display:none;"></div>
+
+                  <div class="timing-box">
+                    <div class="timing-head">
+                      <strong>彩色耗时时间轴</strong>
+                      <span class="pill num" id="labSpeedPill">等待发包</span>
+                    </div>
+                    <div class="timing-bar" id="labTimingBar"></div>
+                    <div class="timing-legend num" id="labTimingLegend">
+                      <span><i class="dot" style="background:var(--warning)"></i> 连接 —</span>
+                      <span><i class="dot" style="background:var(--think)"></i> 思考 —</span>
+                      <span><i class="dot" style="background:var(--accent)"></i> 吐字 —</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- View 2: Outbound Inspector -->
+                <div class="lab-subpanel" id="labView-inspect">
+                  <div class="inspect-grid" id="labInspectGrid"></div>
+                  <pre class="json-pre" id="labInspectJson"></pre>
+                </div>
+
+                <!-- View 3: Token & Cache Checkup -->
+                <div class="lab-subpanel" id="labView-tokens">
+                  <div style="margin-bottom:14px;">
+                    <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:6px;">
+                      <span style="font-weight:650;">单次 Token 结构占比</span>
+                      <span class="num" style="color:var(--text-secondary);" id="labTokTotal">等待实测数据</span>
+                    </div>
+                    <div class="stacked-bar" style="height:12px;" id="labTokBar"></div>
+                  </div>
+                  <div class="inspect-grid" id="labTokenGrid"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- =============================================================
+             TAB 3: 模型参数 (PARAMS — 13 项有效模型参数 + 16 项全局基础设施设置)
+             ============================================================= -->
+        <section class="tab-panel" id="panel-params">
+          <div class="page-header">
+            <div class="page-title-wrap">
+              <h1 class="page-title">模型参数</h1>
+              <p class="page-desc">按模型精细控制思考强度、预填充与抗截断、生图参数及全局容灾；废弃采样参数已由后端静默自动剥离。</p>
+            </div>
+            <div class="segmented" role="tablist">
+              <button class="seg-btn active" id="subParamModelBtn" onclick="setParamsSub('model')">按模型参数配置</button>
+              <button class="seg-btn" id="subParamGlobalBtn" onclick="setParamsSub('global')">全局基础设施设置</button>
+            </div>
+          </div>
+
+          <!-- Sub-tab A: Per-Model Config -->
+          <div id="paramsSubModel">
+            <!-- Scope Picker + Capability Whitelist -->
+            <div class="glass-card" style="margin-bottom:14px;padding:16px 18px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+                <div style="display:flex;align-items:center;gap:10px;flex:1;min-width:220px;">
+                  <span class="card-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                  </span>
+                  <div style="flex:1;min-width:0;max-width:360px;">
+                    <div style="font-size:12px;color:var(--text-muted);font-weight:600;margin-bottom:4px;">配置作用域</div>
+                    <select class="field-select" id="scopeSelect" onchange="handleScopeChange(this.value)">
+                      <option value="__global__">＊ 全局默认（对所有模型）</option>
+                    </select>
+                  </div>
+                  <span class="pill primary" id="ovBadge" style="display:none;"><span class="sparkle">✦</span> 已设专属参数</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <button class="btn btn-ghost btn-sm" id="btnScopeTest" onclick="jumpToModelTest()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    去实测此模型
+                  </button>
+                  <button class="btn btn-ghost btn-sm" id="btnScopeClear" style="display:none;" onclick="clearModelOverride()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                    恢复全局默认
+                  </button>
+                  <button class="btn btn-primary btn-sm" id="btnScopeSave" onclick="saveParams('model')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                    <span id="btnScopeSaveText">保存为全局默认</span>
+                  </button>
+                </div>
+              </div>
+              <div class="scope-meta-bar">
+                <span style="font-size:12px;color:var(--text-muted);" id="scopeHintText">当前编辑：所有未单独定制模型的全局默认参数</span>
+                <div class="caps-strip" id="capsSummary"></div>
+              </div>
+            </div>
+
+            <!-- Live Effective Pipeline Bar -->
+            <div class="glass-card pipeline-card">
+              <div class="pipeline-header">
+                <div style="display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;">
+                  <span class="sparkle">✦</span>
+                  当前生效管线（Live Pipeline）
+                </div>
+                <span style="font-size:11.5px;color:var(--text-muted);">切换下方任意开关实时联动</span>
+              </div>
+              <div class="pipeline-track" id="livePipelineTrack"></div>
+            </div>
+
+            <!-- Balanced 2-Column Core Pair: Thinking (Left) + Prefill & Anti-Truncation (Right) -->
+            <div class="params-cols" style="margin-bottom:16px;">
+              <!-- Left Card: 思考强度与控制 -->
+              <div class="glass-card">
+                <div class="card-header">
+                  <div class="card-title-group">
+                    <span class="card-icon think">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-1.54z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-1.54z"/></svg>
+                    </span>
+                    <div>
+                      <h2 class="card-title">思考强度与控制</h2>
+                      <div class="card-sub">调节上游推理档位与原生思考块控制策略</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="setting-item" id="wrapG3Level">
+                  <div class="field-group">
+                    <label class="field-label" for="thinking_g3_level">
+                      <span class="setting-title">
+                        思考档位
+                        <button class="help-btn" onclick="toggleHelpById(this,'h_tl')" aria-label="思考档位说明">?</button>
+                      </span>
+                    </label>
+                    <select id="thinking_g3_level" class="field-select" onchange="onParamChange()">
+                      <option value="">自动（按模型默认档位）</option>
+                      <option value="minimal">minimal（最低思考 · 3.6及更早）</option>
+                      <option value="low">low（轻量思考）</option>
+                      <option value="medium">medium（均衡思考）</option>
+                      <option value="high">high（深度思考）</option>
+                      <option value="xhigh">xhigh（超高思考 · 仅四档 4.x 机型，其余降级 high）</option>
+                    </select>
+                    <div id="h_tl" class="help-drawer">
+                      按模型能力白名单自动校验档位边界：3.7+ 及 4.x 全系最低合法档为 <code>low</code>；仅支持四档思考的 4.x 机型（如 4-neon / 4-hydrogen）生效 <code>xhigh</code>。
+                      <div><span class="help-code">thinking_g3_level (thinking_level)</span></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="setting-item">
+                  <div class="field-group">
+                    <label class="field-label" for="native_thinking_mode">
+                      <span class="setting-title">
+                        原生思考控制
+                        <button class="help-btn" onclick="toggleHelpById(this,'h_ntm')" aria-label="原生思考控制说明">?</button>
+                      </span>
+                    </label>
+                    <select id="native_thinking_mode" class="field-select" onchange="onParamChange()">
+                      <option value="request">跟随客户端请求（默认）</option>
+                      <option value="off">关闭原生思考（酒馆角色扮演推荐）</option>
+                      <option value="console">强制使用上方档位（忽略客户端）</option>
+                    </select>
+                    <div id="h_ntm" class="help-drawer">
+                      <strong>酒馆（SillyTavern）角色扮演推荐选「关闭原生思考」</strong>：自动忽略前端传来的 <code>reasoning_effort=xhigh</code>，将思考压到该模型最低合法档并剥离原生思考块，避免挤占正文额度，让预设自带的思维链接管。
+                      <div><span class="help-code">native_thinking_mode: request | off | console</span></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div id="thinkNote" class="note-box"></div>
+              </div>
+
+              <!-- Right Card: 预填充兼容与抗截断 -->
+              <div class="glass-card">
+                <div class="card-header">
+                  <div class="card-title-group">
+                    <span class="card-icon">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                    </span>
+                    <div>
+                      <h2 class="card-title">预填充兼容与抗截断</h2>
+                      <div class="card-sub">单字段结构化守护、预填充续写与外挂注入</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="setting-item">
+                  <div class="setting-row">
+                    <div class="setting-info">
+                      <div class="setting-title">
+                        Function Call 抗截断传输
+                        <button class="help-btn" onclick="toggleHelpById(this,'h_sbox')" aria-label="抗截断说明">?</button>
+                      </div>
+                      <div class="setting-desc">单字段 compose_reply 受限解码 + 滑动尾窗防截断</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="synthetic_sandbox_enabled" onchange="onParamChange()" />
+                      <span class="switch-track"></span>
+                    </label>
+                  </div>
+                  <div id="h_sbox" class="help-drawer">
+                    使用固定单字段工具 <code>compose_reply</code> 与 <code>mode: ANY</code> 受限解码包裹回复正文，保持 Vertex 隐式前缀缓存命中；自动适配普通回复与预填充续写，并在真流式/假流式/非流式下透明拆包（生图与联网搜索自动旁路）。
+                    <div><span class="help-code">synthetic_sandbox_enabled</span></div>
+                  </div>
+                </div>
+
+                <div class="setting-item">
+                  <div class="setting-row">
+                    <div class="setting-info">
+                      <div class="setting-title">
+                        预填充兼容模式
+                        <button class="help-btn" onclick="toggleHelpById(this,'h_pfm')" aria-label="预填充说明">?</button>
+                      </div>
+                      <div class="setting-desc">解决 3.x / 4.x 拒绝以 assistant 轮次结尾的限制</div>
+                    </div>
+                    <select id="prefill_mode" class="field-select select-inline" onchange="onParamChange()">
+                      <option value="smart">智能并入（默认）</option>
+                      <option value="keep_turn">保留模型轮次</option>
+                      <option value="minimal">最小占位</option>
+                      <option value="off">关闭兼容</option>
+                    </select>
+                  </div>
+                  <div id="h_pfm" class="help-drawer">
+                    内置未闭合标签思维链守卫与流式去重：<br/>
+                    • <strong>智能并入（默认）</strong>：将末尾预填充并入最后一条 user 末尾，输出侧自动拼回与去重。<br/>
+                    • <strong>保留模型轮次</strong>：保留 assistant 预填充轮次，在其后补简短 user 推动语。<br/>
+                    • <strong>最小占位</strong>：仅补占位 user 保证不报错，不拼回预填充。<br/>
+                    • <strong>关闭兼容</strong>：原样下发。
+                    <div><span class="help-code">prefill_mode: smart | keep_turn | minimal | off</span></div>
+                  </div>
+                </div>
+
+                <div class="setting-item">
+                  <div class="setting-row">
+                    <div class="setting-info">
+                      <div class="setting-title">
+                        预填充时自动压制原生思考
+                        <button class="help-btn" onclick="toggleHelpById(this,'h_pst')" aria-label="压制思考说明">?</button>
+                      </div>
+                      <div class="setting-desc">检测到末尾预填充时自动将原生思考压到最低并不回传</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="prefill_suppress_thinking" onchange="onParamChange()" />
+                      <span class="switch-track"></span>
+                    </label>
+                  </div>
+                  <div id="h_pst" class="help-drawer">
+                    检测到请求末尾带预填充时，自动将模型的原生思考压到最低并不回传，让预设自带的思维链接管。
+                    <div><span class="help-code">prefill_suppress_thinking</span></div>
+                  </div>
+                </div>
+                <input type="checkbox" id="prefill_cot_guard" class="sr-only" checked />
+
+                <!-- Collapsible Advanced Injection Drawer -->
+                <details class="adv-details">
+                  <summary>
+                    <span>高级外挂注入与自定义续写模板（轻量客户端可选）</span>
+                    <span class="adv-chevron">
+                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                    </span>
+                  </summary>
+                  <div class="adv-body">
+                    <div class="field-group">
+                      <label class="field-label" for="inject_system_instruction">
+                        <span class="setting-title" style="font-size:12.5px;">
+                          附加 system 指令
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_injs')" aria-label="说明">?</button>
+                        </span>
+                      </label>
+                      <textarea id="inject_system_instruction" class="field-textarea mono" style="min-height:58px;font-size:12px;" placeholder="留空 = 不注入（酒馆用户已有预设请留空）" oninput="onParamChange()"></textarea>
+                      <div id="h_injs" class="help-drawer">
+                        追加到客户端 system 提示词之后，适合 NextChat / RikkaHub 等无预设管理器的轻量客户端。
+                        <div><span class="help-code">inject_system_instruction</span></div>
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <label class="field-label" for="inject_prefill">
+                        <span class="setting-title" style="font-size:12.5px;">
+                          自动注入预填充
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_injp')" aria-label="说明">?</button>
+                        </span>
+                      </label>
+                      <textarea id="inject_prefill" class="field-textarea mono" style="min-height:58px;font-size:12px;" placeholder="留空 = 不注入" oninput="onParamChange()"></textarea>
+                      <div id="h_injp" class="help-drawer">
+                        仅当客户端请求未带预填充时自动补一条 assistant 预填充；若客户端已自带预填充则自动跳过。
+                        <div><span class="help-code">inject_prefill</span></div>
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <label class="field-label" for="prefill_instruction">
+                        <span class="setting-title" style="font-size:12.5px;">
+                          自定义续写引导模板
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_pfi')" aria-label="说明">?</button>
+                        </span>
+                      </label>
+                      <textarea id="prefill_instruction" class="field-textarea mono" style="min-height:58px;font-size:12px;" placeholder="留空 = 使用内置默认续写引导语" oninput="onParamChange()"></textarea>
+                      <div id="h_pfi" class="help-drawer">
+                        留空即使用内置默认续写引导语（生图模型留空时会自动换用要求输出图片的专用指令）。
+                        <div><span class="help-code">prefill_instruction</span></div>
+                      </div>
+                    </div>
+                  </div>
+                </details>
+              </div>
+            </div>
+
+            <!-- Full-Width Clean Card: 生图模型参数 -->
+            <div class="glass-card">
+              <div class="card-header">
+                <div class="card-title-group">
+                  <span class="card-icon warn">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                  </span>
+                  <div>
+                    <h2 class="card-title">生图模型参数</h2>
+                    <div class="card-sub">选择生图模型（如 gemini-3-pro-image）自动解锁分辨率与宽高比</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="params-cols">
+                <div class="form-grid-2">
+                  <div class="field-group">
+                    <label class="field-label" for="image_size">默认分辨率</label>
+                    <select id="image_size" class="field-select" onchange="onParamChange()">
+                      <option value="512">512</option>
+                      <option value="1K">1K</option>
+                      <option value="2K">2K</option>
+                      <option value="4K">4K</option>
+                    </select>
+                  </div>
+                  <div class="field-group">
+                    <label class="field-label" for="image_aspect_ratio">默认宽高比</label>
+                    <select id="image_aspect_ratio" class="field-select" onchange="onParamChange()"></select>
+                  </div>
+                </div>
+
+                <div>
+                  <div class="setting-item" style="padding-top:0;">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          生图请求下发 system 指令
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_isi')" aria-label="生图 system 说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="image_system_instruction" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_isi" class="help-drawer">
+                      开启后，system 提示词中的画风、构图要求会随生图请求一并下发给生图模型。
+                      <div><span class="help-code">image_system_instruction</span></div>
+                    </div>
+                  </div>
+
+                  <div class="setting-item">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          生图请求允许注入预填充
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_ipf')" aria-label="生图预填充说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="inject_prefill_for_image" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_ipf" class="help-drawer">
+                      默认关闭，避免角色扮演的思考标签误注入给生图模型。若需用预填充引导画风可针对生图模型单独开启。
+                      <div><span class="help-code">inject_prefill_for_image</span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div id="imageNote" class="note-box"></div>
+            </div>
+          </div>
+
+          <!-- Sub-tab B: Global Infrastructure (ALL 16 REAL SETTINGS) -->
+          <div id="paramsSubGlobal" style="display:none;">
+            <div class="glass-card" style="margin-bottom:14px;padding:15px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+              <div>
+                <div style="font-size:14.5px;font-weight:700;">全局基础设施与容灾策略</div>
+                <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">对所有模型与通道统一生效（区域钉定、退避重试、输入图片压缩、流式保活与弱网续传）</div>
+              </div>
+              <button class="btn btn-primary btn-sm" onclick="saveParams('global')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                保存全局设置
+              </button>
+            </div>
+
+            <div class="params-cols">
+              <!-- Left Column: Region Routing + Retry & Fallback + Image Compression -->
+              <div class="params-col">
+                <div class="glass-card">
+                  <div class="card-header">
+                    <div class="card-title-group">
+                      <span class="card-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                      </span>
+                      <div>
+                        <h2 class="card-title" style="display:flex;align-items:center;gap:6px;">
+                          标准模式区域路由
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_loc')" aria-label="区域路由说明">?</button>
+                        </h2>
+                        <div class="card-sub">Express 标准模式目标部署区域</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="setting-row">
+                    <span style="font-size:13px;font-weight:600;color:var(--text-secondary);">目标部署区域</span>
+                    <select id="express_location" class="field-select" style="max-width:230px;" onchange="onParamChange()">
+                      <option value="global">global（默认·推荐）</option>
+                      <option value="">默认（后端自选）</option>
+                      <optgroup label="美国">
+                        <option value="us-central1">us-central1（爱荷华）</option>
+                        <option value="us-east1">us-east1（南卡）</option>
+                        <option value="us-east4">us-east4（北弗吉尼亚）</option>
+                        <option value="us-east5">us-east5（哥伦布）</option>
+                        <option value="us-south1">us-south1（达拉斯）</option>
+                        <option value="us-west1">us-west1（俄勒冈）</option>
+                        <option value="us-west4">us-west4（拉斯维加斯）</option>
+                      </optgroup>
+                      <optgroup label="欧洲">
+                        <option value="europe-west1">europe-west1（比利时）</option>
+                        <option value="europe-west2">europe-west2（伦敦）</option>
+                        <option value="europe-west3">europe-west3（法兰克福）</option>
+                        <option value="europe-west4">europe-west4（荷兰）</option>
+                        <option value="europe-west8">europe-west8（米兰）</option>
+                        <option value="europe-west9">europe-west9（巴黎）</option>
+                        <option value="europe-southwest1">europe-southwest1（马德里）</option>
+                        <option value="europe-central2">europe-central2（华沙）</option>
+                        <option value="europe-north1">europe-north1（芬兰）</option>
+                      </optgroup>
+                      <optgroup label="亚太">
+                        <option value="asia-east1">asia-east1（台湾）</option>
+                        <option value="asia-east2">asia-east2（香港）</option>
+                        <option value="asia-northeast1">asia-northeast1（东京）</option>
+                        <option value="asia-northeast2">asia-northeast2（大阪）</option>
+                        <option value="asia-northeast3">asia-northeast3（首尔）</option>
+                        <option value="asia-south1">asia-south1（孟买）</option>
+                        <option value="asia-southeast1">asia-southeast1（新加坡）</option>
+                        <option value="asia-southeast2">asia-southeast2（雅加达）</option>
+                        <option value="australia-southeast1">australia-southeast1（悉尼）</option>
+                      </optgroup>
+                      <optgroup label="其它">
+                        <option value="northamerica-northeast1">northamerica-northeast1（蒙特利尔）</option>
+                        <option value="southamerica-east1">southamerica-east1（圣保罗）</option>
+                        <option value="me-central1">me-central1（多哈）</option>
+                        <option value="me-west1">me-west1（特拉维夫）</option>
+                      </optgroup>
+                    </select>
+                  </div>
+                  <div id="h_loc" class="help-drawer">
+                    决定 Express 标准模式请求钉定到哪个区域，优先使用当前选中 Key 自有的 Project ID 拼装完整资源路径；若钉定路径失败会自动回退裸模型名重试一次。
+                    <div><span class="help-code">express_location</span></div>
+                  </div>
+                </div>
+
+                <div class="glass-card">
+                  <div class="card-header">
+                    <div class="card-title-group">
+                      <span class="card-icon warn">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                      </span>
+                      <div>
+                        <h2 class="card-title">重试与跨通道容灾</h2>
+                        <div class="card-sub">429 / 503 自动退避与 Express ↔ Cookie 无缝兜底</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="form-grid-2" style="margin-bottom:12px;">
+                    <div class="field-group">
+                      <label class="field-label" for="retry_max">最大重试次数</label>
+                      <input id="retry_max" type="number" class="field-input num" oninput="onParamChange()" />
+                    </div>
+                    <div class="field-group">
+                      <label class="field-label" for="retry_backoff_seconds">退避间隔（秒）</label>
+                      <input id="retry_backoff_seconds" type="number" step="0.5" class="field-input num" oninput="onParamChange()" />
+                    </div>
+                  </div>
+                  <div class="setting-item">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          允许跨通道兜底重试（Key ↔ Cookie）
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_ccf')" aria-label="跨通道说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="cross_channel_fallback" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_ccf" class="help-drawer">
+                      开启后，当主通道的所有凭证（如全部 Express Key 或 Cookie）报错/限流/失效时，自动无缝切换至另一通道的可用凭证接力完成回复。
+                      <div><span class="help-code">retry_max / retry_backoff_seconds / cross_channel_fallback</span></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="glass-card">
+                  <div class="card-header">
+                    <div class="card-title-group">
+                      <span class="card-icon mint">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+                      </span>
+                      <div>
+                        <h2 class="card-title">输入图片自动压缩</h2>
+                        <div class="card-sub">降低多图对话体积与上传耗时</div>
+                      </div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="img_compress_enabled" onchange="onParamChange()" />
+                      <span class="switch-track"></span>
+                    </label>
+                  </div>
+                  <div class="form-grid-3">
+                    <div class="field-group">
+                      <label class="field-label" for="img_compress_max_dim">最长边 (px)</label>
+                      <input id="img_compress_max_dim" type="number" class="field-input num" oninput="onParamChange()" />
+                    </div>
+                    <div class="field-group">
+                      <label class="field-label" for="img_compress_max_mb">触发阈值 (MB)</label>
+                      <input id="img_compress_max_mb" type="number" step="0.1" class="field-input num" oninput="onParamChange()" />
+                    </div>
+                    <div class="field-group">
+                      <label class="field-label" for="img_compress_quality">JPEG 质量</label>
+                      <input id="img_compress_quality" type="number" class="field-input num" oninput="onParamChange()" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Right Column: Streaming, Resumable & Debug -->
+              <div class="params-col">
+                <div class="glass-card">
+                  <div class="card-header">
+                    <div class="card-title-group">
+                      <span class="card-icon think">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                      </span>
+                      <div>
+                        <h2 class="card-title">流式保活、弱网续传 &amp; 调试</h2>
+                        <div class="card-sub">长回复抗断连、多 Key 轮询与诊断日志</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="setting-item">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          假流式保活模式
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_fks')" aria-label="假流式说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="fake_streaming" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_fks" class="help-drawer">
+                      开启后在等待长思考模型（如 gemini-4-argon）生成期间，按下方间隔持续向客户端发送保活帧，防止前端 60s 超时断连。双通道均生效。
+                      <div><span class="help-code">fake_streaming / fake_streaming_interval</span></div>
+                    </div>
+                    <div class="setting-row sub-indent">
+                      <span>└ 假流式心跳间隔（秒）</span>
+                      <input id="fake_streaming_interval" type="number" step="0.5" class="field-input inp-sm num" oninput="onParamChange()" />
+                    </div>
+                  </div>
+
+                  <div class="setting-item">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          弱网可靠续传缓冲
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_rsm')" aria-label="续传缓冲说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="resumable_enabled" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_rsm" class="help-drawer">
+                      将上游回复写入带序号内存缓冲区，客户端断网重连可凭 <code>Last-Event-ID</code> 或 <code>?resume_from=</code> 无损续传；首包产出前若前端主动停止，后台 1.5s 内立即止损取消。
+                      <div><span class="help-code">resumable_enabled / resumable_ttl_seconds / resumable_max_streams</span></div>
+                    </div>
+                    <div class="setting-row sub-indent">
+                      <span>└ 续传缓冲保留时长（秒）</span>
+                      <input id="resumable_ttl_seconds" type="number" step="60" class="field-input inp-sm num" oninput="onParamChange()" />
+                    </div>
+                    <div class="setting-row sub-indent">
+                      <span>└ 续传缓冲最大条数</span>
+                      <input id="resumable_max_streams" type="number" step="10" class="field-input inp-sm num" oninput="onParamChange()" />
+                    </div>
+                  </div>
+
+                  <div class="setting-item">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          多 Key 顺序轮询
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_rr')" aria-label="轮询说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="roundrobin" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_rr" class="help-drawer">
+                      开启后新请求按顺序轮流从下一个 Express Key 开始调用；关闭则随机挑选起始 Key。无论是否开启，单次请求触发重试时都会自动遍历其余健康 Key。
+                      <div><span class="help-code">roundrobin</span></div>
+                    </div>
+                  </div>
+
+                  <div class="setting-item">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          回复末尾附加安全评分
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_ss')" aria-label="安全评分说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="safety_score" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_ss" class="help-drawer">
+                      在模型回复末尾附加可折叠的 Google 安全分类评分详情块。
+                      <div><span class="help-code">safety_score</span></div>
+                    </div>
+                  </div>
+
+                  <div class="setting-item">
+                    <div class="setting-row">
+                      <div class="setting-info">
+                        <div class="setting-title">
+                          出站与原始响应诊断日志
+                          <button class="help-btn" onclick="toggleHelpById(this,'h_dbg')" aria-label="诊断日志说明">?</button>
+                        </div>
+                      </div>
+                      <label class="switch">
+                        <input type="checkbox" id="debug_outbound" onchange="onParamChange()" />
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div id="h_dbg" class="help-drawer">
+                      在运行日志打印发给 Google 的完整出站参数、工具 Schema 与末尾消息断点，并在流结束或异常时输出首尾候选包原始结构。
+                      <div><span class="help-code">debug_outbound</span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- =============================================================
+             TAB 4: 运行日志 (LOGS)
+             ============================================================= -->
+        <section class="tab-panel" id="panel-logs">
+          <div class="page-header">
+            <div class="page-title-wrap">
+              <h1 class="page-title">运行日志</h1>
+              <p class="page-desc">持久化调用记录（最近 500 条重启不丢）与实时 SSE 控制台终端输出。</p>
+            </div>
+            <div class="segmented">
+              <button class="seg-btn active" id="logsSubRecBtn" onclick="setLogsSub('records')">调用记录</button>
+              <button class="seg-btn" id="logsSubTermBtn" onclick="setLogsSub('terminal')">实时终端</button>
+            </div>
+          </div>
+
+          <!-- Sub-tab A: Persistent Call Records -->
+          <div class="glass-card" id="logsSubRecords">
+            <div class="log-toolbar">
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <button class="seg-btn active" id="fltRecAll" data-recfilter="all" onclick="setRecFilter('all')" style="border:1px solid var(--border);">全部 (0)</button>
+                <button class="seg-btn" id="fltRecOk" data-recfilter="ok" onclick="setRecFilter('ok')" style="border:1px solid var(--border);">成功 (0)</button>
+                <button class="seg-btn" id="fltRecErr" data-recfilter="err" onclick="setRecFilter('err')" style="border:1px solid var(--border);">失败 (0)</button>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <span class="pill num" id="recAvgTtft">平均首字 —</span>
+                <span class="pill num" id="recAvgTps">平均速度 —</span>
+                <span class="pill success num" id="recAvgCache">平均缓存 —</span>
+                <button class="btn btn-danger-soft btn-sm" onclick="clearCallRecords()">清空记录</button>
+              </div>
+            </div>
+
+            <div class="record-list" id="recordList"></div>
+          </div>
+
+          <!-- Sub-tab B: Live Terminal -->
+          <div class="glass-card" id="logsSubTerminal" style="display:none;">
+            <div class="log-toolbar">
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1;">
+                <input class="field-input" id="termSearch" placeholder="按关键字过滤日志（点击任意单行可复制）…" style="max-width:320px;padding:7px 11px;font-size:12.5px;" oninput="renderTerminal()" />
+                <button class="btn btn-ghost btn-sm" id="termPauseBtn" onclick="toggleTermPause()">自动置底：开</button>
+              </div>
+              <div style="display:flex;gap:8px;">
+                <button class="btn btn-ghost btn-sm" onclick="copyAllLogs()">复制全部</button>
+                <button class="btn btn-danger-soft btn-sm" onclick="clearTerminal()">清空面板</button>
+              </div>
+            </div>
+            <div class="terminal-box" id="terminalBox"></div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <!-- MOBILE 4-TAB GLASS BOTTOM NAV (<768px) -->
+  <nav class="mobile-bottom-nav" aria-label="移动端主导航">
+    <button class="mob-tab active" data-tab="overview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>
+      <span>概览</span>
+    </button>
+    <button class="mob-tab" data-tab="channel">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+      <span>通道</span>
+    </button>
+    <button class="mob-tab" data-tab="params">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+      <span>参数</span>
+    </button>
+    <button class="mob-tab" data-tab="logs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      <span>日志</span>
+    </button>
+  </nav>
+
+  <!-- FLOATING FROSTED UNSAVED-CHANGES BAR -->
+  <div class="dirty-bar-wrap" id="dirtyBarWrap">
+    <div class="dirty-bar">
+      <div class="dirty-msg">
+        <span class="dirty-dot"></span>
+        <span id="dirtyBarText">检测到 1 项未保存的配置改动</span>
+      </div>
+      <div class="dirty-actions">
+        <button class="btn btn-ghost btn-sm" onclick="discardParams()">撤销修改</button>
+        <button class="btn btn-primary btn-sm" onclick="saveParams()">保存配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- UNSAVED GUARD MODAL -->
+  <div class="overlay" id="dirtyModal">
+    <div class="glass-card modal-card">
+      <h3 style="margin:0 0 6px;font-size:16px;">有未保存的参数修改</h3>
+      <p style="margin:0;font-size:13px;color:var(--text-secondary);">当前模型参数页还有尚未保存的改动，是否先保存再离开？</p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost btn-sm" onclick="closeDirtyModal()">留在此页</button>
+        <button class="btn btn-danger-soft btn-sm" onclick="confirmDirtyAction(false)">放弃并切换</button>
+        <button class="btn btn-primary btn-sm" onclick="confirmDirtyAction(true)">保存并切换</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Host -->
+  <div class="toast-host" id="toastHost"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
