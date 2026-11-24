@@ -162,7 +162,7 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
             stream_id, model=request_obj.model, kind="json")
 
     async def _wait_buffer_with_disconnect(target_buf) -> bool:
-        deadline = asyncio.get_running_loop().time() + 600.0
+        deadline = asyncio.get_running_loop().time() + 1800.0
         target_buf.readers += 1
         try:
             while not target_buf.done:

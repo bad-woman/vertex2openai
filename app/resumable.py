@@ -370,7 +370,7 @@ class ResumableStore:
                     self._cancel_pump_locked(sid)
                     self._buffers.pop(sid, None)
                     removed += 1
-                elif not buf.done and (now - buf.created_at) > max(ttl * 4, 1800):
+                elif not buf.done and (now - buf.created_at) > max(ttl * 4, 2400):
                     self._cancel_pump_locked(sid)
                     self._buffers.pop(sid, None)
                     removed += 1
