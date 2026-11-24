@@ -1934,7 +1934,7 @@ class CookieProxyUpstream(BaseUpstream):
         sandbox_spec.has_prefill = bool(prefill_active)
 
         client_kwargs = {
-            "timeout": httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0),
+            "timeout": httpx.Timeout(connect=30.0, read=1800.0, write=30.0, pool=10.0),
             "follow_redirects": True,
         }
         if app_config.PROXY_URL:

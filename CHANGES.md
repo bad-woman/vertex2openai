@@ -37,6 +37,8 @@
     3. 新增英文自检句尾粘连孤立闭合括号（`_META_TAIL`，支持 `.!}?)` / `.!»}]` / `.!»?>}]` / `.!》?>}]` 并校验 `}` 孤立未配对防误伤代码）与同义词轮换型恐慌循环检测，首句即可 0 泄漏秒断；
     4. 新增句末孤立 `}` + `400` 字多语种收尾念叨观察窗（`_stray_close` + `_is_chatter`），念叨即从 `}` 切除，正常正文则原样放行；
   - **第二次重复调用智能去重 & 截断 JSON 恢复**：`FunctionCallStreamAssembler` 新增流式二次调用前 `40` 字探测（`SAME_DRAFT_PROBE`），自动抑制重复前缀并仅放行新增尾巴；非流式截断字符串 `args` 支持有界内容恢复；中间 `$.content` 分片漏带 `willContinue` 不再提前按 EOF 裁剪或封口；Cookie `_extract_from_results` 严格按 `data == "functionCall"` 区分空收尾帧。
+- **全链路单请求超时提升至 30 分钟（`app/http_options.py`、`app/routes/chat_api.py`、`app/upstreams/cookie_proxy.py`、`app/resumable.py`）**：
+  - 将 Express `HttpOptions.timeout`（同时透传 `X-Server-Timeout`）与 `httpx` 读取超时、Cookie 通道读取超时及非流式续传缓冲等待上限统一由 10 分钟（`600s`）提升至 **30 分钟（`1800s`）**，未完成缓冲兜底清理下限同步放宽至 40 分钟（`2400s`），避免长文写作在 10 分钟整点触发 `504 DEADLINE_EXCEEDED`。
 - **消除假 `max_tokens` 误报 & 0 字思考超限自动重写**：
   - 主动切除跑飞尾巴后（含流式、假流式、非流式及 Cookie 通道），统一恢复 `finish_reason="stop"`，避免前端误报达上限截断；撤销上游静默断流伪造 `length`；
   - 控制台调用记录与终端日志透传并明确区分上游真实原因（`MAX_TOKENS` vs `MALFORMED_FUNCTION_CALL`）；

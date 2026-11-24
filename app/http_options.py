@@ -10,10 +10,10 @@ try:
 except ImportError:
     _HAS_AIOHTTP = False
 
-# Google GenAI SDK 的 HttpOptions.timeout 单位为毫秒（600_000 ms = 10 分钟），
-# 防止 gemini-4-argon 等长思考模型在假流式或深思考期间被默认 60s 超时掐断。
-DEFAULT_TIMEOUT_MS = 600_000
-DEFAULT_HTTPX_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0)
+# Google GenAI SDK 的 HttpOptions.timeout 单位为毫秒（1_800_000 ms = 30 分钟），
+# 同时通过 X-Server-Timeout 透传给 Google 上游，防止长文写作与深思考在 10 分钟处被掐断。
+DEFAULT_TIMEOUT_MS = 1_800_000
+DEFAULT_HTTPX_TIMEOUT = httpx.Timeout(connect=30.0, read=1800.0, write=30.0, pool=10.0)
 
 
 def get_http_options(
