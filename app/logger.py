@@ -6,6 +6,8 @@ import threading
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
 
+from metrics_store import metrics_store
+
 original_print = builtins.print
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -18,6 +20,7 @@ class ProxyStats:
         self.error_requests = 0
         self.retry_counts = 0
         self.prompt_tokens = 0
+        self.cached_tokens = 0
         self.completion_tokens = 0
         self.lock = threading.Lock()
 
@@ -38,47 +41,86 @@ class ProxyStats:
         with self.lock:
             self.success_requests += 1
 
-    def add_tokens(self, p_tokens, c_tokens):
+    def add_tokens(self, p_tokens, c_tokens, cached_tokens: int = 0):
         with self.lock:
             self.prompt_tokens += p_tokens
+            self.cached_tokens += max(0, int(cached_tokens or 0))
             self.completion_tokens += c_tokens
             self.success_requests += 1
 
-    def get_json_stats(self):
-        with self.lock:
-            return {
-                "uptime": round(time.time() - self.start_time, 2),
-                "total": self.total_requests,
-                "success": self.success_requests,
-                "error": self.error_requests,
-                "retries": self.retry_counts,
-                "prompt_tokens": self.prompt_tokens,
-                "completion_tokens": self.completion_tokens,
-                "records_version": call_recorder.version,
-                "records_count": call_recorder.count(),
-            }
+    def get_json_stats(self, range_key: str = "all") -> Dict[str, Any]:
+        uptime = round(time.time() - self.start_time, 2)
+        db_stats = metrics_store.get_overview_stats(
+            range_key=range_key,
+            uptime=uptime,
+            records_version=call_recorder.version,
+            records_count=call_recorder.count(),
+        )
+        # 兼容仅直接调用内存 stats.add_tokens() 而不经过 CallTraceTracker 的轻量单元测试场景
+        if range_key == "all" and db_stats["total"] == 0:
+            with self.lock:
+                if self.total_requests > 0 or self.success_requests > 0 or self.error_requests > 0:
+                    db_stats["total"] = self.total_requests
+                    db_stats["success"] = self.success_requests
+                    db_stats["error"] = self.error_requests
+                    db_stats["retries"] = self.retry_counts
+                    db_stats["prompt_tokens"] = self.prompt_tokens
+                    db_stats["cached_tokens"] = self.cached_tokens
+                    db_stats["completion_tokens"] = self.completion_tokens
+        return db_stats
 
 
 class CallRecorder:
-    """轻量线程安全的最近调用记录环形缓冲区（默认最多保留 200 条，自动淘汰最旧记录，零磁盘开销）。"""
+    """线程安全的调用记录缓存（与 SQLite metrics_store 双向同步，最多保留最新 500 条，重启不丢）。"""
 
-    def __init__(self, maxlen: int = 200):
+    def __init__(self, maxlen: int = 500):
         self.maxlen = maxlen
         self._records: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
         self._seq: int = 0
         self.version: int = 0
         self._lock = threading.Lock()
+        self.reload_from_store()
 
-    def record(self, item: Dict[str, Any]) -> Dict[str, Any]:
+    def reload_from_store(self) -> None:
+        persisted = metrics_store.load_recent_records(self.maxlen)
         with self._lock:
-            self._seq += 1
+            self._records.clear()
+            max_id = 0
+            for item in persisted:
+                self._records.append(item)
+                try:
+                    max_id = max(max_id, int(item.get("id") or 0))
+                except (TypeError, ValueError):
+                    pass
+            self._seq = max(self._seq, max_id)
             self.version += 1
-            entry = dict(item)
-            entry["id"] = self._seq
+
+    def record(
+        self,
+        item: Dict[str, Any],
+        *,
+        channel: Optional[str] = None,
+        created_at: Optional[float] = None,
+        persist: bool = True,
+    ) -> Dict[str, Any]:
+        entry = dict(item)
+        ch = channel or entry.get("channel") or ("cookie" if entry.get("is_cookie") else "express")
+        row_id = None
+        if persist:
+            row_id = metrics_store.record_call(entry, channel=ch, created_at=created_at)
+        with self._lock:
+            if row_id is not None and row_id > 0:
+                self._seq = max(self._seq, row_id)
+                entry["id"] = row_id
+            else:
+                self._seq += 1
+                entry["id"] = self._seq
+            self.version += 1
             self._records.appendleft(entry)
             return entry
 
     def clear(self) -> None:
+        metrics_store.clear_call_records()
         with self._lock:
             self._records.clear()
             self.version += 1
@@ -104,8 +146,11 @@ class CallRecorder:
             for r in items
             if r.get("group") == "ok" and isinstance(r.get("tps"), (int, float)) and r["tps"] > 0
         ]
+        p_sum = sum(int(r.get("p_tk") or 0) for r in items if r.get("group") == "ok" and r.get("has_usage"))
+        c_sum = sum(int(r.get("cached_tk") or 0) for r in items if r.get("group") == "ok" and r.get("has_usage"))
         avg_ttft = round(sum(ttft_vals) / len(ttft_vals), 2) if ttft_vals else None
         avg_tps = round(sum(tps_vals) / len(tps_vals), 1) if tps_vals else None
+        avg_cache_pct = round((c_sum / p_sum) * 100, 1) if p_sum > 0 else None
 
         return {
             "version": ver,
@@ -114,32 +159,24 @@ class CallRecorder:
             "err_count": err_cnt,
             "avg_ttft": avg_ttft,
             "avg_tps": avg_tps,
+            "avg_cache_pct": avg_cache_pct,
             "records": items,
         }
 
 
-call_recorder = CallRecorder(maxlen=200)
+call_recorder = CallRecorder(maxlen=500)
 stats = ProxyStats()
 
 
 class SSELogger:
-    """把运行日志推给控制台的 SSE 订阅者。
+    """把运行日志推给控制台的 SSE 订阅者（线程安全 + 有界队列防内存膨胀）。"""
 
-    P1-5 修复的三个隐患：
-      - `asyncio.Queue.put_nowait` 不是线程安全的，而 push() 可能从任意线程被调用
-        （图片压缩线程、to_thread 里的消息转换等）。改为 loop.call_soon_threadsafe。
-      - 订阅者列表会被事件循环并发增删，遍历时可能 RuntimeError。改为持锁取快照。
-      - 队列原本无界，慢客户端会把内存撑爆。改为有界 + 满则丢最旧。
-    """
-
-    def __init__(self, max_history: int = 100, queue_size: int = 500):
+    def __init__(self, max_history: int = 120, queue_size: int = 500):
         self.max_history = max_history
         self.queue_size = queue_size
         self.history: List[str] = []
         self._subscribers: List[tuple] = []       # [(queue, loop)]
         self._lock = threading.Lock()
-
-    # ---- 订阅管理 ----
 
     def subscribe(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=self.queue_size)
@@ -156,11 +193,8 @@ class SSELogger:
         with self._lock:
             return list(self.history)
 
-    # ---- 推送 ----
-
     @staticmethod
     def _offer(q: asyncio.Queue, msg: str) -> None:
-        """在事件循环线程里执行：队列满时丢最旧的一条，保证新日志能进来。"""
         try:
             q.put_nowait(msg)
         except asyncio.QueueFull:
@@ -186,24 +220,16 @@ class SSELogger:
                     continue
                 loop.call_soon_threadsafe(self._offer, q, formatted_msg)
             except RuntimeError:
-                # 事件循环已停止，忽略即可
                 pass
 
 
 rt_logger = SSELogger()
 
-# 防止 print 钩子内部再触发 print 导致递归
 _in_hook = threading.local()
 
 
 def custom_print(*args, **kwargs):
-    """把业务 print 同时推到控制台日志流。
-
-    说明（P1-5 第一步）：仍保留对 builtins.print 的接管以兼容现有 6000 行代码里的
-    print 调用，但已经**移除了用正则从日志文本反解 token 数**的逻辑——
-    那与中文文案强耦合，改一个字就静默失效。现在由 api_helpers._record_usage()
-    直接调用 stats.add_tokens()。后续可分批把 print 迁移到 logging。
-    """
+    """把业务 print 同时推到控制台日志流。"""
     if getattr(_in_hook, "active", False):
         original_print(*args, **kwargs)
         return

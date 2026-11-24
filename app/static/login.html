@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="sky-day">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>登录 · agentplatform2api</title>
+  <link rel="icon" type="image/webp" href="/avatar.webp" />
+  <script>
+    (function () {
+      var valid = { "sky-day": 1, "sky-night": 1, "sakura-day": 1, "sakura-night": 1 };
+      var saved = "";
+      try { saved = localStorage.getItem("ap2a_theme") || ""; } catch (e) {}
+      if (!valid[saved]) {
+        try {
+          var legacy = localStorage.getItem("ap_theme");
+          if (legacy === "dark") saved = "sakura-night";
+          else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) saved = "sky-night";
+          else saved = "sky-day";
+        } catch (e) { saved = "sky-day"; }
+      }
+      document.documentElement.setAttribute("data-theme", saved);
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <main class="login-page">
+    <div class="glass-card login-card">
+      <img class="login-avatar" src="/avatar.webp" alt="429 娘" />
+      <h1 style="margin:0;font-size:20px;font-weight:760;letter-spacing:-0.02em;">
+        agentplatform2api <span class="sparkle">✦</span>
+      </h1>
+      <p style="margin:5px 0 0;font-size:12.5px;color:var(--text-secondary);">
+        Vertex AI 双通道透明代理控制台
+      </p>
+
+      <div class="login-themes" id="loginThemeGrid" aria-label="主题切换"></div>
+
+      <form id="loginForm" onsubmit="return handleLogin(event)" autocomplete="off">
+        <div class="field-group" style="text-align:left;margin-bottom:14px;">
+          <label class="field-label" for="loginPwd">控制台访问密码（API_KEY）</label>
+          <div class="key-input-wrap">
+            <input id="loginPwd" type="password" class="field-input" placeholder="输入部署时配置的 API_KEY" required autofocus />
+            <button type="button" class="key-eye" id="pwdEyeBtn" onclick="togglePwd()" aria-label="显示或隐藏密码">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary" id="loginBtn" style="width:100%;padding:11px;">
+          进入控制台
+        </button>
+
+        <div class="login-error" id="loginErr"></div>
+      </form>
+
+      <div style="margin-top:14px;font-size:11.5px;color:var(--text-muted);">
+        登录页与控制台共享 4 套主题记忆 · 100% 离线零外链
+      </div>
+    </div>
+  </main>
+
+  <script>
+    var THEMES = [
+      { id: "sky-day", name: "晴空汽水", swatch: "swatch-sky-day" },
+      { id: "sky-night", name: "星海夏夜", swatch: "swatch-sky-night" },
+      { id: "sakura-day", name: "初樱薄荷", swatch: "swatch-sakura-day" },
+      { id: "sakura-night", name: "月影星樱", swatch: "swatch-sakura-night" }
+    ];
+    var curTheme = document.documentElement.getAttribute("data-theme") || "sky-day";
+
+    function renderThemes() {
+      var grid = document.getElementById("loginThemeGrid");
+      grid.innerHTML = THEMES.map(function (t) {
+        return '<button type="button" class="theme-chip ' + (t.id === curTheme ? "active" : "") + '" onclick="setTheme(\'' + t.id + '\')">'
+          + '<span class="swatch ' + t.swatch + '"></span>'
+          + '<span class="truncate">' + t.name + '</span>'
+          + '</button>';
+      }).join("");
+    }
+
+    function setTheme(id) {
+      curTheme = id;
+      document.documentElement.setAttribute("data-theme", id);
+      try { localStorage.setItem("ap2a_theme", id); } catch (e) {}
+      renderThemes();
+    }
+
+    function togglePwd() {
+      var inp = document.getElementById("loginPwd");
+      inp.type = inp.type === "password" ? "text" : "password";
+    }
+
+    async function handleLogin(ev) {
+      ev.preventDefault();
+      var pwd = document.getElementById("loginPwd").value;
+      var btn = document.getElementById("loginBtn");
+      var err = document.getElementById("loginErr");
+      err.classList.remove("show");
+      btn.disabled = true;
+      btn.textContent = "验证中…";
+      try {
+        var r = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: pwd })
+        });
+        var d = {};
+        try { d = await r.json(); } catch (e) {}
+        if (r.ok && d.ok) {
+          location.href = "/";
+          return false;
+        }
+        err.textContent = d.error || ("登录失败（HTTP " + r.status + "）");
+        err.classList.add("show");
+      } catch (e) {
+        err.textContent = "网络请求失败，请检查服务是否正常运行。";
+        err.classList.add("show");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "进入控制台";
+      }
+      return false;
+    }
+
+    renderThemes();
+  </script>
+</body>
+</html>
