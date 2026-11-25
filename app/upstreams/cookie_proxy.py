@@ -1192,13 +1192,66 @@ def _is_thought_part(part: dict) -> bool:
     return bool(t)
 
 
-def _summ_obj(obj: dict, width: int = 2000) -> str:
+_DEBUG_OPAQUE_KEYS = frozenset({
+    "data",
+    "thoughtSignature",
+    "thought_signature",
+    "continuation_token",
+    "continuationToken",
+})
+
+
+def _compact_debug_obj(val: Any, _depth: int = 0) -> Any:
+    """递归精简调试对象：折叠 Base64/签名并首尾节选长正文，完整保留尾部 finishReason / usageMetadata / safetyRatings。"""
+    if _depth > 8:
+        return "<嵌套过深已省略>"
+    if isinstance(val, dict):
+        out = {}
+        for k, v in val.items():
+            if k == "sdk_http_response" and isinstance(v, dict):
+                headers = v.get("headers")
+                req_id = ""
+                if isinstance(headers, dict):
+                    for hk, hv in headers.items():
+                        if str(hk).lower() == "x-goog-request-id":
+                            req_id = str(hv)
+                            break
+                if req_id:
+                    out["request_id"] = req_id
+                continue
+            if k in _DEBUG_OPAQUE_KEYS and isinstance(v, str) and len(v) > 40:
+                out[k] = f"<已省略 {len(v)} 字符>"
+                continue
+            out[k] = _compact_debug_obj(v, _depth + 1)
+        return out
+    if isinstance(val, list):
+        if len(val) > 12:
+            head_items = [_compact_debug_obj(x, _depth + 1) for x in val[:6]]
+            tail_items = [_compact_debug_obj(x, _depth + 1) for x in val[-3:]]
+            return head_items + [f"<已省略 {len(val) - 9} 项>"] + tail_items
+        return [_compact_debug_obj(x, _depth + 1) for x in val]
+    if isinstance(val, str) and len(val) > 220:
+        omitted = len(val) - 180
+        return f"{val[:90]} …[已省略 {omitted} 字]… {val[-90:]}"
+    return val
+
+
+def _summ_obj(obj: dict, width: int = 4000) -> str:
+    compacted = _compact_debug_obj(obj)
     try:
-        s = json.dumps(obj, ensure_ascii=False)
+        s = json.dumps(compacted, ensure_ascii=False)
     except Exception:
-        s = str(obj)
-    s = re.sub(r'"(data|thoughtSignature)":\s*"[A-Za-z0-9+/=_-]{64,}"', r'"\1": "<长Base64已省略>"', s)
-    return s[:width] + ("…" if len(s) > width else "")
+        s = str(compacted)
+    s = re.sub(
+        r'"(data|thoughtSignature|thought_signature|continuation_token|continuationToken)":\s*"[A-Za-z0-9+/=_-]{40,}"',
+        r'"\1": "<长Base64已省略>"',
+        s,
+    )
+    if len(s) <= width:
+        return s
+    head = max(400, int(width * 0.55))
+    tail = max(400, width - head - 24)
+    return f"{s[:head]} …[总长超限，已省略中间 {len(s) - head - tail} 字]… {s[-tail:]}"
 
 
 class _RawSampler:

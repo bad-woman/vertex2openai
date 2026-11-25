@@ -340,13 +340,72 @@ def create_generation_config(request: OpenAIRequest) -> Dict[str, Any]:
     return config
 
 
-def _summ_obj(obj: Any, width: int = 2000) -> str:
+_DEBUG_OPAQUE_KEYS = frozenset({
+    "data",
+    "thoughtSignature",
+    "thought_signature",
+    "continuation_token",
+    "continuationToken",
+})
+
+
+def _compact_debug_str(text: str, head: int = 90, tail: int = 90, threshold: int = 220) -> str:
+    if len(text) <= threshold:
+        return text
+    omitted = len(text) - head - tail
+    return f"{text[:head]} …[已省略 {omitted} 字]… {text[-tail:]}"
+
+
+def _compact_debug_obj(val: Any, _depth: int = 0) -> Any:
+    """递归精简原始调试对象：去掉冗长 HTTP 头、折叠 Base64/签名、首尾节选长正文，完整保留尾部 finish_reason / usage_metadata / safety_ratings。"""
+    if _depth > 8:
+        return "<嵌套过深已省略>"
+    if isinstance(val, dict):
+        out: Dict[str, Any] = {}
+        for k, v in val.items():
+            if k == "sdk_http_response" and isinstance(v, dict):
+                headers = v.get("headers")
+                req_id = ""
+                if isinstance(headers, dict):
+                    for hk, hv in headers.items():
+                        if str(hk).lower() == "x-goog-request-id":
+                            req_id = str(hv)
+                            break
+                if req_id:
+                    out["request_id"] = req_id
+                continue
+            if k in _DEBUG_OPAQUE_KEYS and isinstance(v, str) and len(v) > 40:
+                out[k] = f"<已省略 {len(v)} 字符>"
+                continue
+            out[k] = _compact_debug_obj(v, _depth + 1)
+        return out
+    if isinstance(val, list):
+        if len(val) > 12:
+            head_items = [_compact_debug_obj(x, _depth + 1) for x in val[:6]]
+            tail_items = [_compact_debug_obj(x, _depth + 1) for x in val[-3:]]
+            return head_items + [f"<已省略 {len(val) - 9} 项>"] + tail_items
+        return [_compact_debug_obj(x, _depth + 1) for x in val]
+    if isinstance(val, str):
+        return _compact_debug_str(val)
+    return val
+
+
+def _summ_obj(obj: Any, width: int = 4000) -> str:
+    compacted = _compact_debug_obj(obj)
     try:
-        s = json.dumps(obj, ensure_ascii=False)
+        s = json.dumps(compacted, ensure_ascii=False)
     except Exception:
-        s = str(obj)
-    s = re.sub(r'"(data|thoughtSignature|thought_signature)":\s*"[A-Za-z0-9+/=_-]{40,}"', r'"\1": "<长Base64已省略>"', s)
-    return s[:width] + ("…" if len(s) > width else "")
+        s = str(compacted)
+    s = re.sub(
+        r'"(data|thoughtSignature|thought_signature|continuation_token|continuationToken)":\s*"[A-Za-z0-9+/=_-]{40,}"',
+        r'"\1": "<长Base64已省略>"',
+        s,
+    )
+    if len(s) <= width:
+        return s
+    head = max(400, int(width * 0.55))
+    tail = max(400, width - head - 24)
+    return f"{s[:head]} …[总长超限，已省略中间 {len(s) - head - tail} 字]… {s[-tail:]}"
 
 
 class _RawSampler:
@@ -452,6 +511,7 @@ def extract_gemini_chunk_debug_dict(chunk: Any) -> dict:
     if um:
         out["usageMetadata"] = {
             "promptTokenCount": getattr(um, "prompt_token_count", 0),
+            "cachedContentTokenCount": getattr(um, "cached_content_token_count", 0),
             "thoughtsTokenCount": getattr(um, "thoughts_token_count", 0),
             "candidatesTokenCount": getattr(um, "candidates_token_count", 0),
             "totalTokenCount": getattr(um, "total_token_count", 0),

@@ -264,6 +264,9 @@
       -moz-osx-font-smoothing: grayscale;
       overflow-x: clip;
     }
+    @media (min-width: 768px) {
+      html { scrollbar-gutter: stable; }
+    }
     body {
       background-color: var(--bg-base);
       transition: background-color 0.24s var(--ease-out), color 0.2s var(--ease-out);
@@ -851,6 +854,25 @@
       background-size: 220% 100%;
       animation: shimmer 2.2s linear infinite;
     }
+    .pulse-card.finished {
+      border-color: var(--border);
+      box-shadow: var(--shadow-card);
+    }
+    .pulse-card.finished::before {
+      animation: none;
+      background: linear-gradient(90deg, transparent, var(--success), var(--accent), transparent);
+    }
+    .pulse-card.finished-warn::before {
+      animation: none;
+      background: linear-gradient(90deg, transparent, var(--warning), transparent);
+    }
+    .pulse-card.finished-err::before {
+      animation: none;
+      background: linear-gradient(90deg, transparent, var(--danger), transparent);
+    }
+    .pulse-card.finished .live-dot { animation: none; }
+    .pulse-card.finished-warn .live-dot { background: var(--warning); }
+    .pulse-card.finished-err .live-dot { background: var(--danger); }
     @keyframes shimmer {
       0% { background-position: 100% 0; }
       100% { background-position: -100% 0; }
@@ -890,6 +912,14 @@
     .pulse-step.done {
       border-color: var(--success-soft);
       background: var(--success-soft);
+    }
+    .pulse-step.warn {
+      border-color: var(--warning-soft);
+      background: var(--warning-soft);
+    }
+    .pulse-step.err {
+      border-color: var(--danger-soft);
+      background: var(--danger-soft);
     }
     .pulse-step.active {
       border-color: var(--primary);
@@ -1848,13 +1878,18 @@
       font-family: var(--font-mono);
       font-size: 12px;
       line-height: 1.65;
-      padding: 14px 16px;
-      height: 410px;
+      padding: 14px 16px 24px;
+      height: clamp(420px, calc(100vh - 280px), 680px);
       overflow-y: auto;
       overscroll-behavior-y: contain;
       -webkit-overflow-scrolling: touch;
     }
-    .log-line { padding: 2px 0; word-break: break-word; }
+    .log-line {
+      padding: 3px 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
     .log-ts { color: var(--terminal-muted); margin-right: 8px; }
     .log-lv-info { color: #60a5fa; font-weight: 700; margin-right: 8px; }
     .log-lv-ok { color: #34d399; font-weight: 700; margin-right: 8px; }
@@ -2029,23 +2064,40 @@
       .page-header { margin-bottom: 14px; gap: 10px; }
       .page-title { font-size: 19px; }
 
-      /* Mobile Live Terminal: 锁定为整屏 flex 视口，杜绝底部空白与双层滚动锁死 */
-      html:has(body.mobile-term-open),
+      /* 日志页头部在「调用记录」与「实时终端」两个子页保持完全一致，杜绝切换按钮左右/上下跳动 */
+      #panel-logs .page-header {
+        flex-wrap: nowrap;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      #panel-logs .page-desc { display: none; }
+      #panel-logs .segmented { flex-shrink: 0; }
+
+      /* Mobile Live Terminal: 用 position:fixed 精确夹紧顶栏与底栏之间的真实可视区（不依赖 100dvh/:has()），底部日志永不裁切且无滚动锁死 */
       body.mobile-term-open {
-        height: 100dvh;
         overflow: hidden;
       }
-      body.mobile-term-open .app-shell,
+      body.mobile-term-open .mobile-topbar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+      }
       body.mobile-term-open .main-stage {
-        height: calc(100dvh - var(--mobile-top-h));
-        min-height: 0;
+        position: fixed;
+        top: var(--mobile-top-h);
+        left: 0;
+        right: 0;
+        bottom: calc(var(--mobile-nav-h) + env(safe-area-inset-bottom));
+        width: auto;
+        height: auto;
         overflow: hidden;
       }
       body.mobile-term-open .stage-inner {
         height: 100%;
         display: flex;
         flex-direction: column;
-        padding: 12px 12px calc(var(--mobile-nav-h) + 10px + env(safe-area-inset-bottom));
+        padding: 10px 12px 10px;
         overflow: hidden;
       }
       body.mobile-term-open #panel-logs.active {
@@ -2053,23 +2105,22 @@
         flex-direction: column;
         flex: 1;
         min-height: 0;
+        overflow: hidden;
       }
       body.mobile-term-open #panel-logs .page-header {
         margin-bottom: 10px;
         flex-shrink: 0;
-      }
-      body.mobile-term-open #panel-logs .page-desc {
-        display: none;
       }
       body.mobile-term-open #logsSubTerminal {
         display: flex;
         flex-direction: column;
         flex: 1;
         min-height: 0;
-        padding: 12px;
+        overflow: hidden;
+        padding: 10px 12px;
       }
       body.mobile-term-open #logsSubTerminal .log-toolbar {
-        margin-bottom: 10px;
+        margin-bottom: 8px;
         gap: 7px;
         flex-shrink: 0;
       }
@@ -2077,7 +2128,8 @@
         flex: 1;
         height: auto;
         min-height: 0;
-        padding: 10px 12px;
+        padding: 10px 12px 26px;
+        overflow-y: auto;
         overscroll-behavior: contain;
         -webkit-overflow-scrolling: touch;
       }
@@ -2125,6 +2177,7 @@
         left: 0;
         right: 0;
         bottom: 0;
+        height: calc(var(--mobile-nav-h) + env(safe-area-inset-bottom));
         padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
         background: var(--sidebar-bg);
         backdrop-filter: blur(8px);

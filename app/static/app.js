@@ -458,7 +458,7 @@
     }
   }
 
-  /* ── Real Live Stream X-Ray Polling & Abort ── */
+  /* ── Real Live Stream X-Ray Polling & Abort (with 30s post-finish linger) ── */
   async function fetchLive() {
     try {
       const r = await apiFetch("/api/live");
@@ -466,14 +466,15 @@
       const d = await r.json();
       const active = Array.isArray(d.active) ? d.active : [];
       renderLivePulse(active);
-      if (lastLiveCount > 0 && active.length === 0) {
-        // 请求刚结束，立即刷新统计、记录与 Key 命中数
+      const runningNow = active.filter((it) => !it.finished).length;
+      if (lastLiveCount > 0 && runningNow === 0) {
+        // 请求刚结束（此时脉冲进入 30s 停留展示态），立刻刷新统计、记录与 Key 命中数
         fetchStats();
         fetchRecords();
         loadExpressKeysQuiet();
         loadRuntime();
       }
-      lastLiveCount = active.length;
+      lastLiveCount = runningNow;
     } catch (e) {}
   }
 
@@ -486,41 +487,96 @@
       return;
     }
     stack.innerHTML = active.map((it) => {
+      const isFin = Boolean(it.finished);
+      const st = it.status || (isFin ? "ok" : "running");
       const ph = it.phase || "connecting";
-      const s0Cls = ph === "connecting" || ph === "retrying" ? "active" : "done";
-      const s1Cls = ph === "thinking" ? "active" : (ph === "streaming" || ph === "finishing" ? "done" : "");
-      const s2Cls = ph === "streaming" ? "active" : (ph === "finishing" ? "done" : "");
-      const s3Cls = ph === "finishing" ? "active" : "";
 
-      const s0Txt = ph === "retrying"
+      let s0Cls, s1Cls, s2Cls, s3Cls;
+      if (isFin) {
+        s0Cls = "done";
+        s1Cls = it.think_sec != null ? "done" : "";
+        s2Cls = (st === "ok" || st === "trunc" || it.chars > 0) ? "done" : "";
+        s3Cls = st === "error" ? "err" : (st === "trunc" || st === "cancelled" ? "warn" : "done");
+      } else {
+        s0Cls = ph === "connecting" || ph === "retrying" ? "active" : "done";
+        s1Cls = ph === "thinking" ? "active" : (ph === "streaming" || ph === "finishing" ? "done" : "");
+        s2Cls = ph === "streaming" ? "active" : (ph === "finishing" ? "done" : "");
+        s3Cls = ph === "finishing" ? "active" : "";
+      }
+
+      const s0Txt = (!isFin && ph === "retrying")
         ? escHtml(it.note || `重试第 ${it.retries} 次`)
-        : (it.conn_sec != null ? `${Number(it.conn_sec).toFixed(2)}s 完成` : `连接中 · ${escHtml(it.cred_label)}`);
+        : (it.conn_sec != null ? `${Number(it.conn_sec).toFixed(2)}s 完成` : (isFin ? "已完成握手" : `连接中 · ${escHtml(it.cred_label)}`));
       const s1Txt = it.think_sec != null
-        ? `${ph === "thinking" ? "推理中" : "完成"} ${Number(it.think_sec).toFixed(1)}s`
-        : (ph === "streaming" ? "无显式思考" : "等待中");
+        ? `${(!isFin && ph === "thinking") ? "推理中" : "完成"} ${Number(it.think_sec).toFixed(1)}s`
+        : (isFin || ph === "streaming" ? "无显式思考" : "等待中");
       const s2Txt = it.chars > 0
         ? `${fmtNum(it.chars)} 字${it.tps_est ? ` · ≈${it.tps_est} tok/s` : ""}`
-        : (it.is_stream ? "等待正文首字" : "整包生成中");
-      const s3Txt = it.sandbox_active ? "compose_reply 尾窗守护" : "原生直出";
+        : (isFin ? (st === "error" ? "未产出正文" : "已结束") : (it.is_stream ? "等待正文首字" : "整包生成中"));
+
+      let s3Title = "4. 通道守护";
+      let s3Txt = it.sandbox_active ? "compose_reply 尾窗守护" : "原生直出";
+      if (isFin) {
+        s3Title = "4. 完成状态";
+        const frTxt = escHtml(it.finish_reason || (st === "ok" ? "STOP" : st.toUpperCase()));
+        if (st === "error") {
+          s3Txt = it.note ? `${frTxt} · ${escHtml(it.note)}` : frTxt;
+        } else if (st === "cancelled") {
+          s3Txt = escHtml(it.note || "请求已中止");
+        } else {
+          const extras = [];
+          if (it.cache_pct != null && Number(it.cache_pct) > 0) extras.push(`缓存 ${Number(it.cache_pct).toFixed(0)}%`);
+          else if (it.sandbox_active) extras.push("尾窗守护");
+          s3Txt = extras.length ? `${frTxt} · ${extras.join(" · ")}` : frTxt;
+        }
+      }
+
       const credText = it.project_id ? `${it.cred_label} · ${it.project_id}` : it.cred_label;
+      let cardCls = "pulse-card";
+      let headTitle = it.is_stream ? "正在处理流式请求" : "正在处理非流式请求";
+      let statusBadge = it.sandbox_active ? `<span class="pill success">抗截断守护中</span>` : "";
+      if (isFin) {
+        cardCls += " finished";
+        if (st === "error") {
+          cardCls += " finished-err";
+          headTitle = "请求失败";
+          statusBadge = `<span class="pill danger">${escHtml(it.finish_reason || "失败")}</span>`;
+        } else if (st === "cancelled") {
+          cardCls += " finished-warn";
+          headTitle = "请求已中止";
+          statusBadge = `<span class="pill warning">已中止</span>`;
+        } else if (st === "trunc") {
+          cardCls += " finished-warn";
+          headTitle = "请求已结束";
+          statusBadge = `<span class="pill warning">${escHtml(it.finish_reason || "达上限/截断")}</span>`;
+        } else {
+          headTitle = "请求已完成";
+          statusBadge = `<span class="pill success">${escHtml(it.finish_reason || "STOP")}</span>`;
+        }
+      }
+
+      const rightCtrl = isFin
+        ? `<span class="num" style="font-size:12.5px;color:var(--text-secondary);">总耗时 ${Number(it.elapsed_sec || 0).toFixed(1)}s</span>
+           <span class="pill num" title="30 秒内若有新请求会立即切换，无新请求将自动收起">将在 ${Number(it.linger_remain || 30)}s 后收起</span>`
+        : `<span class="num" style="font-size:12.5px;color:var(--text-secondary);">已耗时 ${Number(it.elapsed_sec || 0).toFixed(1)}s</span>
+           <button class="btn btn-danger-soft btn-sm" ${it.aborted ? "disabled" : ""} onclick="abortLiveReq('${escHtml(it.req_id)}')">
+             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+             ${it.aborted ? "中止中…" : "中止请求"}
+           </button>`;
 
       return `
-        <div class="pulse-card">
+        <div class="${cardCls}">
           <div class="pulse-top">
             <div class="pulse-id">
               <span class="live-dot"></span>
-              <span>${it.is_stream ? "正在处理流式请求" : "正在处理非流式请求"}</span>
+              <span>${headTitle}</span>
               <span class="pill primary mono">${escHtml(it.model)}</span>
               <span class="pill">${escHtml(credText)}</span>
-              ${it.sandbox_active ? `<span class="pill success">抗截断守护中</span>` : ""}
+              ${statusBadge}
               ${it.retries > 0 ? `<span class="pill warning">重试 ×${it.retries}</span>` : ""}
             </div>
-            <div style="display:flex;align-items:center;gap:10px;">
-              <span class="num" style="font-size:12.5px;color:var(--text-secondary);">已耗时 ${Number(it.elapsed_sec || 0).toFixed(1)}s</span>
-              <button class="btn btn-danger-soft btn-sm" ${it.aborted ? "disabled" : ""} onclick="abortLiveReq('${escHtml(it.req_id)}')">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-                ${it.aborted ? "中止中…" : "中止请求"}
-              </button>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              ${rightCtrl}
             </div>
           </div>
           <div class="pulse-steps">
@@ -537,7 +593,7 @@
               <div class="pulse-step-meta num">${s2Txt}</div>
             </div>
             <div class="pulse-step ${s3Cls}">
-              <div class="pulse-step-title">4. 通道守护</div>
+              <div class="pulse-step-title">${s3Title}</div>
               <div class="pulse-step-meta num">${s3Txt}</div>
             </div>
           </div>
@@ -2198,7 +2254,7 @@
     }
     box.innerHTML = filtered.map(({ raw, idx }) => {
       const lv = classifyLogLevel(raw);
-      const m = raw.match(/^(\[\d{2}:\d{2}:\d{2}\])\s*(.*)$/);
+      const m = raw.match(/^(\[\d{2}:\d{2}:\d{2}\])\s*([\s\S]*)$/);
       const ts = m ? m[1] : "";
       const body = m ? m[2] : raw;
       return `<div class="log-line" onclick="copySingleLog(${idx})" title="点击复制本条日志">`
