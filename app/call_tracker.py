@@ -271,8 +271,29 @@ class CallTraceTracker:
     def is_live_aborted(self) -> bool:
         return live_tracker.is_aborted(self.req_id)
 
-    def finish_live(self) -> None:
-        live_tracker.finish(self.req_id)
+    def finish_live(
+        self,
+        *,
+        status: str = "ok",
+        finish_reason: str = "",
+        total_sec: Optional[float] = None,
+        ttft: Optional[float] = None,
+        tps: Optional[float] = None,
+        cache_pct: Optional[float] = None,
+        out_chars: Optional[int] = None,
+        note: str = "",
+    ) -> None:
+        live_tracker.finish(
+            self.req_id,
+            status=status,
+            finish_reason=finish_reason,
+            total_sec=total_sec,
+            ttft=ttft,
+            tps=tps,
+            cache_pct=cache_pct,
+            out_chars=out_chars,
+            note=note,
+        )
 
     def note_live_phase(
         self,
@@ -408,7 +429,6 @@ class CallTraceTracker:
         if self.finalized:
             return
         self.finalized = True
-        self.finish_live()
         total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
         short_cred = _short_cred_name(target)
         ch = "cookie" if (is_cookie or target.get("channel") == "cookie") else "express"
@@ -498,6 +518,16 @@ class CallTraceTracker:
                 parts_det.append(f"<b>提前截断</b>：finish_reason=length{raw_note}。")
 
         t_short, t_full = self._build_time_strs()
+        final_fr_display = raw_fr_up or ("STOP" if str(finish_reason or "stop") == "stop" else str(finish_reason or "").upper())
+        self.finish_live(
+            status="trunc" if is_trunc else "ok",
+            finish_reason=final_fr_display,
+            total_sec=total_wall,
+            ttft=clean_ttft,
+            tps=tps,
+            cache_pct=cache_pct if clean_cached > 0 else None,
+            out_chars=out_chars,
+        )
         call_recorder.record(
             {
                 "time": t_short,
@@ -547,7 +577,6 @@ class CallTraceTracker:
         if self.finalized:
             return
         self.finalized = True
-        self.finish_live()
         total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
         if preflight or not self.unique_creds:
             cred = "未发往上游"
@@ -567,6 +596,12 @@ class CallTraceTracker:
 
         t_short, t_full = self._build_time_strs()
         ch = "cookie" if (self.last_channel == "cookie" or cred == "Studio Cookie") else "express"
+        self.finish_live(
+            status="error",
+            finish_reason=f"HTTP {int(err_code or 500)}",
+            total_sec=total_wall,
+            note=str(err_msg or "上游异常").strip()[:72],
+        )
         call_recorder.record(
             {
                 "time": t_short,
@@ -616,7 +651,6 @@ class CallTraceTracker:
         if self.finalized:
             return
         self.finalized = True
-        self.finish_live()
         total_wall = round(max(0.01, time.monotonic() - self.start_mono), 2)
         cred = self.last_cred_short or "—"
         if by_console:
@@ -631,6 +665,12 @@ class CallTraceTracker:
 
         t_short, t_full = self._build_time_strs()
         ch = "cookie" if (self.last_channel == "cookie" or cred == "Studio Cookie") else "express"
+        self.finish_live(
+            status="cancelled",
+            finish_reason="CANCELLED",
+            total_sec=total_wall,
+            note=cred_note,
+        )
         call_recorder.record(
             {
                 "time": t_short,

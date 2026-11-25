@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import secrets
 import threading
 import time
@@ -105,15 +106,24 @@ class _LiveRequest:
             "note": self.note,
             "aborted": self.aborted.is_set(),
             "started_at": self.started_wall,
+            "finished": False,
+            "status": "running",
+            "finish_reason": "",
+            "cache_pct": None,
+            "linger_remain": 0,
         }
 
 
 class LiveRequestTracker:
-    """线程安全的在途请求实况注册表。"""
+    """线程安全的在途请求实况注册表（支持结束后停留 30s，遇新请求立刻切换）。"""
+
+    LINGER_SECONDS: float = 30.0
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._active: Dict[str, _LiveRequest] = {}
+        self._last_finished: Optional[Dict[str, Any]] = None
+        self._last_finished_mono: float = 0.0
 
     def start(
         self,
@@ -133,6 +143,9 @@ class LiveRequestTracker:
         )
         with self._lock:
             self._active[req_id] = item
+            # 30s 停留期内若有新进程进入，立刻切换为新进程
+            self._last_finished = None
+            self._last_finished_mono = 0.0
         return req_id
 
     def update(
@@ -251,16 +264,65 @@ class LiveRequestTracker:
         print(f"🛑 [实况中止] 控制台已下发中止信号，正在取消在途请求 #{req_id}（模型={item.model}）。")
         return True
 
-    def finish(self, req_id: str) -> None:
+    def finish(
+        self,
+        req_id: str,
+        *,
+        status: str = "ok",
+        finish_reason: str = "",
+        total_sec: Optional[float] = None,
+        ttft: Optional[float] = None,
+        tps: Optional[float] = None,
+        cache_pct: Optional[float] = None,
+        out_chars: Optional[int] = None,
+        note: str = "",
+    ) -> None:
         if not req_id:
             return
         with self._lock:
-            self._active.pop(req_id, None)
+            item = self._active.pop(req_id, None)
+            if item is None:
+                return
+            snap = item.to_public_dict()
+            snap["finished"] = True
+            snap["status"] = status or "ok"
+            snap["phase"] = "done" if snap["status"] in ("ok", "trunc") else snap["status"]
+            if finish_reason:
+                snap["finish_reason"] = str(finish_reason)
+            if total_sec is not None:
+                snap["elapsed_sec"] = round(max(0.01, float(total_sec)), 2)
+            if ttft is not None and snap.get("conn_sec") is None:
+                snap["conn_sec"] = round(max(0.0, float(ttft)), 2)
+            if tps is not None:
+                snap["tps_est"] = round(float(tps), 1)
+            if cache_pct is not None and float(cache_pct) > 0:
+                snap["cache_pct"] = round(float(cache_pct), 1)
+            if out_chars is not None and int(out_chars) > int(snap.get("chars") or 0):
+                snap["chars"] = int(out_chars)
+            if note:
+                snap["note"] = str(note)
+            self._last_finished = snap
+            self._last_finished_mono = time.monotonic()
+
+    def clear_linger(self) -> None:
+        with self._lock:
+            self._last_finished = None
+            self._last_finished_mono = 0.0
 
     def snapshot(self) -> List[Dict[str, Any]]:
         with self._lock:
-            items = sorted(self._active.values(), key=lambda x: x.started_wall, reverse=True)
-            return [it.to_public_dict() for it in items]
+            if self._active:
+                items = sorted(self._active.values(), key=lambda x: x.started_wall, reverse=True)
+                return [it.to_public_dict() for it in items]
+            if self._last_finished is not None:
+                rem = self.LINGER_SECONDS - (time.monotonic() - self._last_finished_mono)
+                if rem > 0.0:
+                    entry = dict(self._last_finished)
+                    entry["linger_remain"] = max(1, min(int(self.LINGER_SECONDS), math.ceil(rem)))
+                    return [entry]
+                self._last_finished = None
+                self._last_finished_mono = 0.0
+            return []
 
     def count(self) -> int:
         with self._lock:
