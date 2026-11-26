@@ -622,6 +622,39 @@
   let cookieConfigured = false;
   let cookieProjectId = "";
 
+  const SUPPORTS_TEXT_SECURITY = Boolean(
+    typeof CSS !== "undefined" &&
+    CSS.supports &&
+    (CSS.supports("-webkit-text-security", "disc") || CSS.supports("text-security", "disc"))
+  );
+
+  function maskKeyVisual(key) {
+    const s = String(key || "");
+    if (!s) return "";
+    if (s.length <= 8) return "•".repeat(s.length);
+    return s.slice(0, 4) + "••••••••••••" + s.slice(-4);
+  }
+
+  let keyRowUidSeq = 0;
+  let keysMutationSeq = 0;
+  let keysSaveInFlight = 0;
+  let keysSaveChain = Promise.resolve();
+  let keysProbeRefreshTimer = null;
+
+  function ensureKeyUid(rec) {
+    if (!rec._uid) rec._uid = ++keyRowUidSeq;
+    return rec._uid;
+  }
+
+  function findKeyIndexByUid(uid) {
+    return KEYS.findIndex((k) => k._uid === uid);
+  }
+
+  function findKeyByUid(uid) {
+    const idx = findKeyIndexByUid(uid);
+    return idx >= 0 ? KEYS[idx] : null;
+  }
+
   window.setChannelSub = function (sub) {
     const isTest = sub === "test";
     $("subChanConfigBtn").classList.toggle("active", !isTest);
@@ -771,6 +804,7 @@
     }
 
     box.innerHTML = KEYS.map((rec, i) => {
+      const uid = ensureKeyUid(rec);
       const enabled = rec.enabled !== false;
       const detStr = rec.detected_at ? `探测于 ${new Date(rec.detected_at * 1000).toLocaleString()}` : "";
       const hits = Number(rec.hits || 0);
@@ -779,32 +813,38 @@
         ? `<div class="key-probe-msg" style="color:${rec._msg_ok === false ? "var(--danger-text)" : "var(--success-text)"};">${escHtml(rec._msg)}</div>`
         : "";
 
+      const isHidden = !rec._show && Boolean(rec.key);
+      const useCssMask = isHidden && SUPPORTS_TEXT_SECURITY;
+      const useFallbackMask = isHidden && !SUPPORTS_TEXT_SECURITY;
+      const keyDisplayVal = useFallbackMask ? maskKeyVisual(rec.key) : (rec.key || "");
+      const antiFillAttrs = `autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other"`;
+
       return `
-        <div class="key-row ${enabled ? "" : "disabled"}" data-key-idx="${i}">
+        <div class="key-row ${enabled ? "" : "disabled"}" data-key-uid="${uid}">
           <div class="key-row-top">
             <div class="key-main-group">
               <span class="pill primary num" style="min-width:34px;justify-content:center;">#${i + 1}</span>
               <div class="key-input-wrap">
-                <input class="field-input k-key" type="${rec._show ? "text" : "password"}" value="${escHtml(rec.key || "")}" placeholder="粘贴 Express API Key（移开焦点或回车自动保存）" onchange="onKeyFieldChange(${i})" onkeydown="if(event.key==='Enter'){this.blur();}" />
-                <button class="key-eye" type="button" onclick="toggleKeyVis(${i})" aria-label="显示或隐藏 Key">
+                <input class="field-input k-key${useCssMask ? " k-key-masked" : ""}" type="text" name="ap2a_ek_${uid}" ${antiFillAttrs} value="${escHtml(keyDisplayVal)}"${useFallbackMask ? ` readonly data-masked="1" onclick="revealAndEditKey(${uid})" title="点击明文显示并编辑此 Key"` : ""} placeholder="粘贴 Express API Key（移开焦点或回车自动保存）" onchange="onKeyFieldChange(${uid})" onkeydown="if(event.key==='Enter'){this.blur();}" />
+                <button class="key-eye" type="button" onclick="toggleKeyVis(${uid})" aria-label="显示或隐藏 Key">
                   <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                 </button>
               </div>
             </div>
             <div class="key-actions-group">
               <label class="switch" title="启用或停用此 Key">
-                <input type="checkbox" class="k-enabled" ${enabled ? "checked" : ""} onchange="onKeyFieldChange(${i})" />
+                <input type="checkbox" class="k-enabled" ${enabled ? "checked" : ""} onchange="onKeyFieldChange(${uid})" />
                 <span class="switch-track"></span>
               </label>
-              <button class="btn btn-ghost btn-sm" type="button" onclick="probeOneKey(${i})">
+              <button class="btn btn-ghost btn-sm" type="button" onclick="probeOneKey(${uid})">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                 探测
               </button>
-              <button class="btn btn-ghost btn-sm" type="button" onclick="testKeyDirect(${i})" title="跳转到连通实测并锁定此 Key 单发验活">
+              <button class="btn btn-ghost btn-sm" type="button" onclick="testKeyDirect(${uid})" title="跳转到连通实测并锁定此 Key 单发验活">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                 实测
               </button>
-              <button class="btn-icon" type="button" onclick="removeKeyRow(${i})" title="删除此凭证" style="color:var(--danger-text);">
+              <button class="btn-icon" type="button" onclick="removeKeyRow(${uid})" title="删除此凭证" style="color:var(--danger-text);">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6m4-6v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
               </button>
             </div>
@@ -812,7 +852,7 @@
           <div class="key-row-bottom">
             <div class="key-main-group">
               <span style="font-size:12px;color:var(--text-muted);font-weight:600;white-space:nowrap;">Project ID</span>
-              <input class="field-input mono k-project" style="padding:6px 10px;font-size:12.5px;" value="${escHtml(rec.project_id || "")}" placeholder="留空 = 自动探测获取" onchange="onKeyFieldChange(${i})" onkeydown="if(event.key==='Enter'){this.blur();}" />
+              <input class="field-input mono k-project" type="text" name="ap2a_ep_${uid}" ${antiFillAttrs} style="padding:6px 10px;font-size:12.5px;" value="${escHtml(rec.project_id || "")}" placeholder="留空 = 自动探测获取" onchange="onKeyFieldChange(${uid})" onkeydown="if(event.key==='Enter'){this.blur();}" />
             </div>
             <div class="key-actions-group">
               ${keySrcPill(rec)}
@@ -831,16 +871,26 @@
   }
 
   function syncKeysFromDom() {
-    document.querySelectorAll("#keyPoolList [data-key-idx]").forEach((row) => {
-      const i = Number(row.dataset.keyIdx);
-      if (!KEYS[i]) return;
-      KEYS[i].key = row.querySelector(".k-key").value.trim();
-      const pid = row.querySelector(".k-project").value.trim();
-      if (pid !== (KEYS[i].project_id || "")) {
-        KEYS[i].project_id = pid;
-        KEYS[i].project_source = pid ? "manual" : "";
+    document.querySelectorAll("#keyPoolList [data-key-uid]").forEach((row) => {
+      const uid = Number(row.dataset.keyUid);
+      const rec = findKeyByUid(uid);
+      if (!rec) return;
+      const keyInp = row.querySelector(".k-key");
+      if (keyInp && keyInp.dataset.masked !== "1") {
+        rec.key = keyInp.value.trim();
       }
-      KEYS[i].enabled = row.querySelector(".k-enabled").checked;
+      const projInp = row.querySelector(".k-project");
+      if (projInp) {
+        const pid = projInp.value.trim();
+        if (pid !== (rec.project_id || "")) {
+          rec.project_id = pid;
+          rec.project_source = pid ? "manual" : "";
+        }
+      }
+      const enInp = row.querySelector(".k-enabled");
+      if (enInp) {
+        rec.enabled = enInp.checked;
+      }
     });
   }
 
@@ -856,154 +906,241 @@
   }
 
   function mergeServerKeys(serverKeys, emptyRows) {
-    const showMap = {};
-    const msgMap = {};
+    const uiMap = {};
     KEYS.forEach((k) => {
       if (k.key) {
-        showMap[k.key] = Boolean(k._show);
-        if (k._msg) msgMap[k.key] = { msg: k._msg, ok: k._msg_ok };
+        uiMap[k.key] = {
+          _uid: k._uid,
+          _show: Boolean(k._show),
+          _msg: k._msg,
+          _msg_ok: k._msg_ok
+        };
       }
     });
-    KEYS = (serverKeys || []).map((x) => {
+    const merged = (serverKeys || []).map((x) => {
       const item = Object.assign({}, x);
-      item._show = Boolean(showMap[item.key]);
-      if (msgMap[item.key]) {
-        item._msg = msgMap[item.key].msg;
-        item._msg_ok = msgMap[item.key].ok;
+      const prev = uiMap[item.key];
+      if (prev) {
+        if (prev._uid) item._uid = prev._uid;
+        item._show = prev._show;
+        if (prev._msg) {
+          item._msg = prev._msg;
+          item._msg_ok = prev._msg_ok;
+        }
+      } else {
+        item._show = false;
       }
+      ensureKeyUid(item);
       return item;
-    }).concat(emptyRows || []);
+    });
+    (emptyRows || []).forEach((r) => ensureKeyUid(r));
+    KEYS = merged.concat(emptyRows || []);
     renderKeys();
   }
 
-  async function autoSaveExpressKeys(customMsg) {
-    syncKeysFromDom();
-    const emptyRows = KEYS.filter((r) => !r.key);
+  async function autoSaveExpressKeys(customMsg, opts) {
+    if (!(opts && opts.skipSync)) syncKeysFromDom();
     const payload = cleanKeyPayload(KEYS);
-    try {
-      const r = await apiFetch("/api/express-keys", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keys: payload })
-      });
-      const d = await r.json().catch(() => ({}));
-      if (r.ok) {
-        mergeServerKeys(d.keys || [], emptyRows);
-        showToast(customMsg || `已自动保存（共 ${payload.length} 把有效 Key）`);
-        scheduleLabInspect();
-        if (payload.some((k) => !k.project_id)) {
-          setTimeout(loadExpressKeysQuiet, 2400);
-        }
-      } else {
-        showToast(d.error || "自动保存失败");
-      }
-    } catch (e) {
-      showToast("网络请求失败");
+    const mySeq = ++keysMutationSeq;
+    if (keysProbeRefreshTimer) {
+      clearTimeout(keysProbeRefreshTimer);
+      keysProbeRefreshTimer = null;
     }
+    const run = async () => {
+      keysSaveInFlight++;
+      try {
+        const r = await apiFetch("/api/express-keys", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ keys: payload })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+          if (mySeq === keysMutationSeq) {
+            const emptyRows = KEYS.filter((item) => !item.key);
+            mergeServerKeys(d.keys || [], emptyRows);
+            showToast(customMsg || `已自动保存（共 ${payload.length} 把有效 Key）`);
+            scheduleLabInspect();
+            if (payload.some((k) => !k.project_id)) {
+              keysProbeRefreshTimer = setTimeout(() => {
+                keysProbeRefreshTimer = null;
+                loadExpressKeysQuiet();
+              }, 2400);
+            }
+          }
+        } else if (mySeq === keysMutationSeq) {
+          showToast(d.error || "自动保存失败");
+        }
+      } catch (e) {
+        if (mySeq === keysMutationSeq) showToast("网络请求失败");
+      } finally {
+        keysSaveInFlight--;
+      }
+    };
+    const chained = keysSaveChain.then(run, run);
+    keysSaveChain = chained.catch(() => {});
+    return chained;
   }
 
   async function loadExpressKeys() {
     try {
+      const seqBefore = keysMutationSeq;
       const r = await apiFetch("/api/express-keys");
       if (!r.ok) return;
       const d = await r.json();
+      if (seqBefore !== keysMutationSeq || keysSaveInFlight > 0) return;
       mergeServerKeys(d.keys || [], []);
     } catch (e) {}
   }
 
   async function loadExpressKeysQuiet() {
     try {
-      // 若用户正在编辑输入框则暂不覆盖 DOM
+      // 若正在保存或用户正在编辑输入框，则暂不覆盖 DOM
+      if (keysSaveInFlight > 0) return;
       const ae = document.activeElement;
       if (ae && $("keyPoolList") && $("keyPoolList").contains(ae)) return;
+      const seqBefore = keysMutationSeq;
       syncKeysFromDom();
       const emptyRows = KEYS.filter((r) => !r.key);
       const r = await apiFetch("/api/express-keys");
       if (!r.ok) return;
       const d = await r.json();
+      if (seqBefore !== keysMutationSeq || keysSaveInFlight > 0) return;
+      const aeAfter = document.activeElement;
+      if (aeAfter && $("keyPoolList") && $("keyPoolList").contains(aeAfter)) return;
       mergeServerKeys(d.keys || [], emptyRows);
     } catch (e) {}
   }
 
-  window.toggleKeyVis = function (i) {
+  window.revealAndEditKey = function (uid) {
     syncKeysFromDom();
-    if (KEYS[i]) { KEYS[i]._show = !KEYS[i]._show; renderKeys(); }
+    const rec = findKeyByUid(uid);
+    if (!rec) return;
+    rec._show = true;
+    renderKeys();
+    const inp = document.querySelector(`#keyPoolList [data-key-uid="${uid}"] .k-key`);
+    if (inp) {
+      inp.focus();
+      const len = inp.value.length;
+      try { inp.setSelectionRange(len, len); } catch (e) {}
+    }
   };
 
-  window.onKeyFieldChange = async function (i) {
+  window.toggleKeyVis = function (uid) {
     syncKeysFromDom();
-    if (!KEYS[i] || !KEYS[i].key) return;
-    await autoSaveExpressKeys();
+    const rec = findKeyByUid(uid);
+    if (rec) { rec._show = !rec._show; renderKeys(); }
+  };
+
+  window.onKeyFieldChange = async function (uid) {
+    syncKeysFromDom();
+    const rec = findKeyByUid(uid);
+    if (!rec || !rec.key) return;
+    await autoSaveExpressKeys(undefined, { skipSync: true });
   };
 
   window.addKeyRow = function () {
     syncKeysFromDom();
-    KEYS.push({ key: "", project_id: "", project_source: "", enabled: true, hits: 0, _show: true });
+    const newUid = ++keyRowUidSeq;
+    KEYS.push({ _uid: newUid, key: "", project_id: "", project_source: "", enabled: true, hits: 0, _show: true });
     renderKeys();
-    const inputs = document.querySelectorAll("#keyPoolList .k-key");
-    if (inputs.length > 0) inputs[inputs.length - 1].focus();
+    const inp = document.querySelector(`#keyPoolList [data-key-uid="${newUid}"] .k-key`);
+    if (inp) inp.focus();
   };
 
-  window.removeKeyRow = async function (i) {
+  window.removeKeyRow = async function (uid) {
     syncKeysFromDom();
-    const hadKey = Boolean(KEYS[i] && KEYS[i].key);
-    KEYS.splice(i, 1);
-    if (!hadKey) { renderKeys(); return; }
-    await autoSaveExpressKeys("已删除 Key 并自动保存（历史命中保留于指纹库）");
+    const idx = findKeyIndexByUid(uid);
+    if (idx < 0) return;
+    const [removed] = KEYS.splice(idx, 1);
+    renderKeys();
+    if (!removed || (!removed.key && !removed.key_fp)) {
+      showToast("已移除空白 Key 槽位");
+      return;
+    }
+    await autoSaveExpressKeys("已删除 Key 并自动保存（历史命中保留于指纹库）", { skipSync: true });
   };
 
-  window.probeOneKey = async function (i) {
+  window.probeOneKey = async function (uid) {
     syncKeysFromDom();
-    const rec = KEYS[i];
+    const rec = findKeyByUid(uid);
     if (!rec || !rec.key) { showToast("请先在该行填入 Express API Key"); return; }
     const targetKey = rec.key;
-    const emptyRows = KEYS.filter((r) => !r.key);
     const payload = cleanKeyPayload(KEYS);
-    showToast("正在自动保存并探测归属项目…");
-    try {
-      const r = await apiFetch("/api/express-keys/probe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: targetKey, force: true, keys: payload })
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) { showToast(d.error || "探测失败"); return; }
-      const res = (d.results || [])[0] || {};
-      mergeServerKeys(d.keys || [], emptyRows);
-      const hit = KEYS.find((x) => x.key === targetKey);
-      if (hit) { hit._msg = res.message || ""; hit._msg_ok = Boolean(res.ok); }
-      renderKeys();
-      showToast(res.ok ? `探测成功：${res.project_id || "已识别"}` : `Key 已保存，探测未果：${res.message || "请手动填写项目"}`);
-    } catch (e) {
-      showToast("网络请求失败");
+    const mySeq = ++keysMutationSeq;
+    if (keysProbeRefreshTimer) {
+      clearTimeout(keysProbeRefreshTimer);
+      keysProbeRefreshTimer = null;
     }
+    showToast("正在自动保存并探测归属项目…");
+    const run = async () => {
+      keysSaveInFlight++;
+      try {
+        const r = await apiFetch("/api/express-keys/probe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: targetKey, force: true, keys: payload })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (mySeq !== keysMutationSeq) return;
+        if (!r.ok) { showToast(d.error || "探测失败"); return; }
+        const res = (d.results || [])[0] || {};
+        const emptyRows = KEYS.filter((item) => !item.key);
+        mergeServerKeys(d.keys || [], emptyRows);
+        const hit = KEYS.find((x) => x.key === targetKey);
+        if (hit) { hit._msg = res.message || ""; hit._msg_ok = Boolean(res.ok); }
+        renderKeys();
+        showToast(res.ok ? `探测成功：${res.project_id || "已识别"}` : `Key 已保存，探测未果：${res.message || "请手动填写项目"}`);
+      } catch (e) {
+        if (mySeq === keysMutationSeq) showToast("网络请求失败");
+      } finally {
+        keysSaveInFlight--;
+      }
+    };
+    const chained = keysSaveChain.then(run, run);
+    keysSaveChain = chained.catch(() => {});
+    return chained;
   };
 
   window.probeAllKeys = async function () {
     syncKeysFromDom();
-    const emptyRows = KEYS.filter((r) => !r.key);
     const payload = cleanKeyPayload(KEYS);
     if (!payload.length) { showToast("请先至少添加一个 Express API Key"); return; }
-    showToast("正在自动保存并探测全部 Key…");
-    try {
-      const r = await apiFetch("/api/express-keys/probe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ all: true, force: true, keys: payload })
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) { showToast(d.error || "探测失败"); return; }
-      const results = d.results || [];
-      mergeServerKeys(d.keys || [], emptyRows);
-      results.forEach((res) => {
-        const hit = KEYS.find((x) => x.key === res.key);
-        if (hit) { hit._msg = res.message || ""; hit._msg_ok = Boolean(res.ok); }
-      });
-      renderKeys();
-      showToast(`已完成探测：成功 ${results.filter((x) => x.ok).length} / ${results.length}`);
-    } catch (e) {
-      showToast("网络请求失败");
+    const mySeq = ++keysMutationSeq;
+    if (keysProbeRefreshTimer) {
+      clearTimeout(keysProbeRefreshTimer);
+      keysProbeRefreshTimer = null;
     }
+    showToast("正在自动保存并探测全部 Key…");
+    const run = async () => {
+      keysSaveInFlight++;
+      try {
+        const r = await apiFetch("/api/express-keys/probe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ all: true, force: true, keys: payload })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (mySeq !== keysMutationSeq) return;
+        if (!r.ok) { showToast(d.error || "探测失败"); return; }
+        const results = d.results || [];
+        const emptyRows = KEYS.filter((item) => !item.key);
+        mergeServerKeys(d.keys || [], emptyRows);
+        results.forEach((res) => {
+          const hit = KEYS.find((x) => x.key === res.key);
+          if (hit) { hit._msg = res.message || ""; hit._msg_ok = Boolean(res.ok); }
+        });
+        renderKeys();
+        showToast(`已完成探测：成功 ${results.filter((x) => x.ok).length} / ${results.length}`);
+      } catch (e) {
+        if (mySeq === keysMutationSeq) showToast("网络请求失败");
+      } finally {
+        keysSaveInFlight--;
+      }
+    };
+    const chained = keysSaveChain.then(run, run);
+    keysSaveChain = chained.catch(() => {});
+    return chained;
   };
 
   /* =====================================================================
@@ -1590,16 +1727,17 @@
     scheduleLabInspect();
   };
 
-  window.testKeyDirect = async function (i) {
+  window.testKeyDirect = async function (uid) {
     syncKeysFromDom();
-    const rec = KEYS[i];
+    const idx = findKeyIndexByUid(uid);
+    const rec = idx >= 0 ? KEYS[idx] : null;
     if (!rec || !rec.key) {
       showToast("请先在该行填入 Express API Key");
       return;
     }
     let fp = rec.key_fp;
     if (!fp) {
-      await autoSaveExpressKeys("已自动保存 Key，正在跳转实测");
+      await autoSaveExpressKeys("已自动保存 Key，正在跳转实测", { skipSync: true });
       const saved = KEYS.find((x) => x.key === rec.key);
       fp = saved && saved.key_fp;
     }
@@ -1615,7 +1753,8 @@
     }
     scheduleLabInspect();
     window.scrollTo({ top: 0, behavior: "smooth" });
-    showToast(`已锁定 Express Key #${i + 1}（单发直测模式），点击「发送实测」即可验证`);
+    const finalIdx = KEYS.findIndex((x) => x.key === rec.key);
+    showToast(`已锁定 Express Key #${(finalIdx >= 0 ? finalIdx : idx) + 1}（单发直测模式），点击「发送实测」即可验证`);
   };
 
   window.testCookieDirect = function () {

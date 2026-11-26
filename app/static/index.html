@@ -405,11 +405,11 @@
                   <span>Google Cookie（支持 Header 字符串或 Cookie-Editor JSON 自动解析）</span>
                   <span class="pill" id="cookieStatePill">未配置</span>
                 </label>
-                <textarea id="cookieInput" class="field-textarea mono" style="min-height:76px;font-size:12px;" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Header 字符串或 Cookie-Editor JSON）"></textarea>
+                <textarea id="cookieInput" class="field-textarea mono" style="min-height:76px;font-size:12px;" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" placeholder="粘贴 console.cloud.google.com 的完整 Cookie（支持 Header 字符串或 Cookie-Editor JSON）"></textarea>
               </div>
               <div class="field-group">
                 <label class="field-label" for="cookieProj">Google Cloud Project ID（支持粘贴控制台 URL 自动提取）</label>
-                <input id="cookieProj" class="field-input mono" placeholder="例如：my-gcp-project-123456（或含 ?project=xxx 的链接）" />
+                <input id="cookieProj" type="text" class="field-input mono" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" placeholder="例如：my-gcp-project-123456（或含 ?project=xxx 的链接）" />
               </div>
               <div class="field-group" style="justify-content:flex-end;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -1235,7 +1235,7 @@
           <div class="glass-card" id="logsSubTerminal" style="display:none;">
             <div class="log-toolbar">
               <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1;">
-                <input class="field-input" id="termSearch" placeholder="按关键字过滤日志（点击任意单行可复制）…" style="max-width:320px;padding:7px 11px;font-size:12.5px;" oninput="renderTerminal()" />
+                <input class="field-input" id="termSearch" type="search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" placeholder="按关键字过滤日志（点击任意单行可复制）…" style="max-width:320px;padding:7px 11px;font-size:12.5px;" oninput="renderTerminal()" />
                 <button class="btn btn-ghost btn-sm" id="termPauseBtn" onclick="toggleTermPause()">自动置底：开</button>
               </div>
               <div style="display:flex;gap:8px;">
