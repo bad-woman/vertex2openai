@@ -5,17 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="color-scheme" content="light dark" />
   <title>agentplatform2api · 控制台</title>
-  <link rel="icon" type="image/webp" href="/avatar.webp" />
+  <link rel="icon" type="image/webp" href="/static/avatar.webp" />
   <script>
     (function () {
-      var valid = { "sky-day": 1, "sky-night": 1, "sakura-day": 1, "sakura-night": 1 };
+      var valid = { "sky-day": 1, "paper-day": 1, "pop-day": 1, "vinyl-night": 1, "hud-night": 1, "star-night": 1 };
+      var migrate = { "sakura-day": "paper-day", "sky-night": "star-night", "sakura-night": "vinyl-night" };
       var saved = "";
       try { saved = localStorage.getItem("ap2a_theme") || ""; } catch (e) {}
+      if (migrate[saved]) saved = migrate[saved];
       if (!valid[saved]) {
         try {
           var legacy = localStorage.getItem("ap_theme");
-          if (legacy === "dark") saved = "sakura-night";
-          else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) saved = "sky-night";
+          if (legacy === "dark") saved = "vinyl-night";
+          else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) saved = "star-night";
           else saved = "sky-day";
         } catch (e) { saved = "sky-day"; }
       }
@@ -24,11 +26,15 @@
   </script>
   <link rel="stylesheet" href="/static/app.css" />
 </head>
-<body>
+<body data-avatar-mood="idle">
+  <div class="theme-fx-bg" id="themeFxBg" aria-hidden="true"></div>
+  <div class="theme-fx" id="themeFx" aria-hidden="true"></div>
   <!-- MOBILE TOPBAR (<768px) -->
   <header class="mobile-topbar">
     <div class="mobile-brand">
-      <img class="mobile-avatar" src="/avatar.webp" alt="429 娘" />
+      <span class="avatar-ring mobile-ring" title="429 娘 · 实时状态呼吸环">
+        <img class="mobile-avatar" src="/static/avatar.webp" alt="429 娘" />
+      </span>
       <div class="truncate">
         <div class="brand-title">agentplatform2api <span class="sparkle">✦</span></div>
       </div>
@@ -62,7 +68,9 @@
     <!-- Desktop Left Sidebar -->
     <aside class="sidebar">
       <div class="brand-box">
-        <img class="brand-avatar" src="/avatar.webp" alt="429 娘" />
+        <span class="avatar-ring" title="429 娘 · 实时状态呼吸环">
+          <img class="brand-avatar" src="/static/avatar.webp" alt="429 娘" />
+        </span>
         <div class="brand-meta">
           <div class="brand-title">agentplatform2api <span class="sparkle">✦</span></div>
           <div class="brand-status">

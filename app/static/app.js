@@ -8,10 +8,12 @@
   let currentTab = "overview";
 
   const THEMES = [
-    { id: "sky-day", name: "晴空汽水", swatch: "swatch-sky-day" },
-    { id: "sky-night", name: "星海夏夜", swatch: "swatch-sky-night" },
-    { id: "sakura-day", name: "初樱薄荷", swatch: "swatch-sakura-day" },
-    { id: "sakura-night", name: "月影星樱", swatch: "swatch-sakura-night" }
+    { id: "sky-day", name: "晴空汽水", swatch: "swatch-sky-day", mode: "day" },
+    { id: "paper-day", name: "宣纸茶寮", swatch: "swatch-paper-day", mode: "day" },
+    { id: "pop-day", name: "潮玩波普", swatch: "swatch-pop-day", mode: "day" },
+    { id: "vinyl-night", name: "午夜黑胶", swatch: "swatch-vinyl-night", mode: "night" },
+    { id: "hud-night", name: "战术终端", swatch: "swatch-hud-night", mode: "night" },
+    { id: "star-night", name: "极夜星图", swatch: "swatch-star-night", mode: "night" }
   ];
 
   const COMMON_ARS = [
@@ -86,34 +88,230 @@
   }
 
   /* =====================================================================
-     1. THEME SYSTEM
+     1. THEME SYSTEM (6 ART SKINS + CLICK-ORIGIN RIPPLE VIEW TRANSITION)
      ===================================================================== */
+  const LEGACY_THEME_MAP = {
+    "sakura-day": "paper-day",
+    "sky-night": "star-night",
+    "sakura-night": "vinyl-night"
+  };
   let currentTheme = document.documentElement.getAttribute("data-theme") || "sky-day";
+  if (LEGACY_THEME_MAP[currentTheme]) currentTheme = LEGACY_THEME_MAP[currentTheme];
   if (!THEMES.some((t) => t.id === currentTheme)) currentTheme = "sky-day";
+  document.documentElement.setAttribute("data-theme", currentTheme);
+
+  function renderThemeFx(id) {
+    const bg = $("themeFxBg");
+    const fg = $("themeFx");
+    if (!bg || !fg) return;
+    if (id === "sky-day") {
+      bg.innerHTML = `
+        <div class="fx-sunbeam"></div>
+        <svg class="fx-bg-svg fx-clouds" viewBox="0 0 1200 260" preserveAspectRatio="xMidYMax slice" fill="none">
+          <path d="M0 260V172C95 140 165 148 238 175C310 112 435 110 518 164C595 118 710 122 790 166C872 102 1010 98 1105 152C1148 134 1180 138 1200 148V260H0Z" fill="rgba(255,255,255,0.68)"/>
+          <path d="M0 260V206C120 176 235 182 325 212C430 162 560 166 668 208C775 158 925 162 1040 202C1105 186 1160 190 1200 202V260H0Z" fill="rgba(186,230,253,0.42)"/>
+          <circle cx="980" cy="84" r="52" stroke="rgba(14,165,233,0.16)" stroke-width="1.5"/>
+          <circle cx="980" cy="84" r="78" stroke="rgba(14,201,160,0.12)" stroke-width="1" stroke-dasharray="4 6"/>
+        </svg>
+      `;
+      fg.innerHTML = `
+        <span class="fx-bubble" style="--bx:8%;--bs:24px;--bd:11.5s;--bdelay:-1.5s;--bdrift:16px"></span>
+        <span class="fx-bubble" style="--bx:22%;--bs:14px;--bd:9.2s;--bdelay:-5.4s;--bdrift:-12px"></span>
+        <span class="fx-bubble" style="--bx:44%;--bs:18px;--bd:12.4s;--bdelay:-8.2s;--bdrift:14px"></span>
+        <span class="fx-bubble" style="--bx:66%;--bs:22px;--bd:10.6s;--bdelay:-3.1s;--bdrift:-15px"></span>
+        <span class="fx-bubble" style="--bx:82%;--bs:15px;--bd:8.8s;--bdelay:-6.8s;--bdrift:12px"></span>
+        <span class="fx-bubble" style="--bx:92%;--bs:28px;--bd:13.2s;--bdelay:-2.2s;--bdrift:-18px"></span>
+      `;
+    } else if (id === "paper-day") {
+      bg.innerHTML = `
+        <div class="fx-seal"><span>茶</span><span>寮</span></div>
+        <svg class="fx-bg-svg fx-bamboo" viewBox="0 0 320 320" fill="none">
+          <path d="M24 -10 C42 86, 54 176, 36 290" stroke="rgba(45,122,99,0.16)" stroke-width="3.2" stroke-linecap="round"/>
+          <path d="M38 72 C84 56, 126 52, 166 64" stroke="rgba(45,122,99,0.13)" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M44 138 C98 118, 146 116, 198 134" stroke="rgba(45,122,99,0.12)" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M96 58 Q126 32 154 46 Q126 62 96 58Z" fill="rgba(45,122,99,0.16)"/>
+          <path d="M128 60 Q162 44 188 64 Q158 72 128 60Z" fill="rgba(45,122,99,0.14)"/>
+          <path d="M114 124 Q150 98 182 114 Q148 130 114 124Z" fill="rgba(45,122,99,0.15)"/>
+          <path d="M150 128 Q186 116 214 138 Q180 144 150 128Z" fill="rgba(196,134,40,0.14)"/>
+        </svg>
+        <svg class="fx-bg-svg fx-mountains" viewBox="0 0 1200 260" preserveAspectRatio="xMidYMax slice" fill="none">
+          <path d="M0 260V168 Q160 72 340 148 T720 132 T1060 112 L1200 148 V260Z" fill="rgba(124,104,82,0.10)"/>
+          <path d="M0 260V196 Q210 122 430 184 T860 166 T1200 184 V260Z" fill="rgba(45,122,99,0.10)"/>
+          <path d="M0 260V226 Q280 176 580 218 T1200 208 V260Z" fill="rgba(124,88,54,0.08)"/>
+        </svg>
+      `;
+      fg.innerHTML = `
+        <span class="fx-leaf" style="--lx:22%;--ls:16px;--ld:14s;--ldelay:-2s"></span>
+        <span class="fx-leaf" style="--lx:58%;--ls:13px;--ld:17s;--ldelay:-8s"></span>
+        <span class="fx-leaf" style="--lx:86%;--ls:15px;--ld:15s;--ldelay:-12s"></span>
+      `;
+    } else if (id === "pop-day") {
+      bg.innerHTML = `
+        <svg class="fx-bg-svg fx-pop-art" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice" fill="none">
+          <circle cx="1110" cy="90" r="95" fill="rgba(255,212,59,0.30)" stroke="rgba(28,25,43,0.18)" stroke-width="3"/>
+          <circle cx="1096" cy="104" r="95" stroke="rgba(28,25,43,0.14)" stroke-width="2.5" stroke-dasharray="10 8"/>
+          <path d="M-20 690 L48 648 L112 690 L176 648 L240 690 L304 648 L368 690" stroke="rgba(59,108,255,0.22)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M840 740 L895 704 L950 740 L1005 704 L1060 740 L1115 704 L1170 740" stroke="rgba(255,84,120,0.22)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="64" y="130" width="54" height="54" rx="10" transform="rotate(-14 64 130)" fill="rgba(21,196,126,0.18)" stroke="rgba(28,25,43,0.18)" stroke-width="2.5"/>
+          <polygon points="1030,520 1056,574 1004,574" transform="rotate(18 1030 550)" fill="rgba(255,212,59,0.34)" stroke="rgba(28,25,43,0.18)" stroke-width="2.5"/>
+        </svg>
+      `;
+      fg.innerHTML = `
+        <span class="fx-pop-badge fx-pop-b1">✦ POP</span>
+        <span class="fx-pop-badge fx-pop-b2">★ 429</span>
+      `;
+    } else if (id === "vinyl-night") {
+      bg.innerHTML = `
+        <div class="fx-vinyl-disc"></div>
+        <svg class="fx-bg-svg fx-vinyl-wave" viewBox="0 0 1200 200" preserveAspectRatio="xMidYMax slice" fill="none">
+          <path d="M0 132 Q120 72 240 124 T480 116 T720 128 T960 96 T1200 124" stroke="rgba(229,169,60,0.22)" stroke-width="1.8"/>
+          <path d="M0 152 Q150 96 300 144 T600 132 T900 150 T1200 136" stroke="rgba(88,184,159,0.18)" stroke-width="1.4"/>
+          <path d="M0 170 Q180 134 360 166 T720 156 T1080 172 T1200 162" stroke="rgba(222,107,83,0.16)" stroke-width="1.2" stroke-dasharray="4 6"/>
+        </svg>
+      `;
+      fg.innerHTML = "";
+    } else if (id === "hud-night") {
+      bg.innerHTML = `
+        <svg class="fx-bg-svg fx-hud-topo" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice" fill="none">
+          <path d="M-40 620 C160 540 310 660 520 590 C740 515 920 640 1240 540" stroke="rgba(0,229,160,0.12)" stroke-width="1.2"/>
+          <path d="M-40 660 C180 580 340 700 560 630 C780 555 950 680 1240 585" stroke="rgba(0,229,160,0.09)" stroke-width="1"/>
+          <path d="M-40 705 C210 630 390 740 610 675 C830 605 980 720 1240 635" stroke="rgba(255,107,43,0.10)" stroke-width="1" stroke-dasharray="6 6"/>
+          <circle cx="1090" cy="110" r="145" stroke="rgba(0,229,160,0.13)" stroke-width="1" stroke-dasharray="4 8"/>
+          <circle cx="1090" cy="110" r="96" stroke="rgba(255,107,43,0.12)" stroke-width="1"/>
+          <line x1="930" y1="110" x2="1200" y2="110" stroke="rgba(0,229,160,0.10)" stroke-width="1"/>
+          <line x1="1090" y1="0" x2="1090" y2="270" stroke="rgba(0,229,160,0.10)" stroke-width="1"/>
+        </svg>
+      `;
+      fg.innerHTML = `<div class="fx-hud-scan"></div>`;
+    } else if (id === "star-night") {
+      bg.innerHTML = `
+        <div class="fx-aurora-veil"></div>
+        <svg class="fx-bg-svg fx-astrolabe" viewBox="0 0 360 360" fill="none">
+          <circle cx="180" cy="180" r="166" stroke="#e8d1a0" stroke-width="1" stroke-dasharray="3 6"/>
+          <circle cx="180" cy="180" r="132" stroke="#7cc4fa" stroke-width="1" stroke-opacity="0.78"/>
+          <circle cx="180" cy="180" r="94" stroke="#e8d1a0" stroke-width="0.9" stroke-dasharray="1.5 5"/>
+          <circle cx="180" cy="180" r="54" stroke="#7cc4fa" stroke-width="0.8" stroke-opacity="0.65"/>
+          <line x1="180" y1="8" x2="180" y2="352" stroke="#e8d1a0" stroke-width="0.6" stroke-opacity="0.48"/>
+          <line x1="8" y1="180" x2="352" y2="180" stroke="#7cc4fa" stroke-width="0.6" stroke-opacity="0.48"/>
+          <line x1="58" y1="58" x2="302" y2="302" stroke="#e8d1a0" stroke-width="0.5" stroke-opacity="0.34"/>
+          <line x1="302" y1="58" x2="58" y2="302" stroke="#7cc4fa" stroke-width="0.5" stroke-opacity="0.34"/>
+        </svg>
+        <svg class="fx-bg-svg fx-constellation" viewBox="0 0 540 260" fill="none">
+          <polyline points="42,210 118,158 206,174 282,116 374,132 458,72" stroke="rgba(232,209,160,0.30)" stroke-width="1.1" stroke-dasharray="3 4"/>
+          <polyline points="206,174 246,226 352,206" stroke="rgba(124,196,250,0.24)" stroke-width="1" stroke-dasharray="2 4"/>
+          <circle cx="42" cy="210" r="2.8" fill="#e8d1a0" fill-opacity="0.72"/>
+          <circle cx="118" cy="158" r="3.2" fill="#7cc4fa" fill-opacity="0.78"/>
+          <circle cx="206" cy="174" r="3.6" fill="#e8d1a0" fill-opacity="0.82"/>
+          <circle cx="282" cy="116" r="3" fill="#7cc4fa" fill-opacity="0.76"/>
+          <circle cx="374" cy="132" r="2.8" fill="#e8d1a0" fill-opacity="0.72"/>
+          <circle cx="458" cy="72" r="3.8" fill="#e8d1a0" fill-opacity="0.86"/>
+          <circle cx="246" cy="226" r="2.2" fill="#7cc4fa" fill-opacity="0.62"/>
+          <circle cx="352" cy="206" r="2.4" fill="#e8d1a0" fill-opacity="0.65"/>
+        </svg>
+      `;
+      fg.innerHTML = `
+        <span class="fx-meteor" style="--my:11%;--mx:-8%;--md:7.2s;--mdelay:0.6s"></span>
+        <span class="fx-meteor" style="--my:28%;--mx:-12%;--md:10.4s;--mdelay:4.2s"></span>
+        <span class="fx-star" style="--sx:11%;--sy:16%;--ss:12px;--sc:#e8d1a0;--sd:3.2s;--sdelay:-0.8s">✦</span>
+        <span class="fx-star" style="--sx:86%;--sy:14%;--ss:10px;--sc:#7cc4fa;--sd:3.8s;--sdelay:-2.1s">✦</span>
+        <span class="fx-star" style="--sx:91%;--sy:44%;--ss:13px;--sc:#e8d1a0;--sd:4.2s;--sdelay:-1.4s">✦</span>
+        <span class="fx-star" style="--sx:7%;--sy:62%;--ss:10px;--sc:#7cc4fa;--sd:3.6s;--sdelay:-2.9s">✦</span>
+        <span class="fx-star" style="--sx:82%;--sy:78%;--ss:11px;--sc:#e8d1a0;--sd:3.4s;--sdelay:-0.4s">✦</span>
+      `;
+    } else {
+      bg.innerHTML = "";
+      fg.innerHTML = "";
+    }
+  }
 
   function renderThemePickers() {
-    const html = THEMES.map((t) => `
-      <button class="theme-chip ${t.id === currentTheme ? "active" : ""}" onclick="setTheme('${t.id}')">
+    const chip = (t) => `
+      <button class="theme-chip ${t.id === currentTheme ? "active" : ""}" onclick="setTheme('${t.id}', event)">
         <span class="swatch ${t.swatch}"></span>
         <span class="truncate">${t.name}</span>
       </button>
-    `).join("");
+    `;
+    const dayChips = THEMES.filter((t) => t.mode === "day").map(chip).join("");
+    const nightChips = THEMES.filter((t) => t.mode === "night").map(chip).join("");
+    const dayIcon = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41"/></svg>`;
+    const nightIcon = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`;
+    const html = `
+      <div class="theme-col">
+        <div class="theme-col-head">${dayIcon}<span>白天</span></div>
+        ${dayChips}
+      </div>
+      <div class="theme-col">
+        <div class="theme-col-head">${nightIcon}<span>黑夜</span></div>
+        ${nightChips}
+      </div>
+    `;
     ["sideThemeGrid", "mobThemeGrid"].forEach((id) => {
       const el = $(id);
       if (el) el.innerHTML = html;
     });
     const active = THEMES.find((t) => t.id === currentTheme);
     if ($("mobThemeName") && active) $("mobThemeName").textContent = active.name;
+    renderThemeFx(currentTheme);
   }
 
-  window.setTheme = function (id) {
-    currentTheme = id;
-    document.documentElement.setAttribute("data-theme", id);
-    try { localStorage.setItem("ap2a_theme", id); } catch (e) {}
-    renderThemePickers();
-    if (lastStatsPayload) renderOverview(lastStatsPayload);
-    const pop = $("mobileThemePopover");
-    if (pop) pop.classList.remove("open");
+  window.setTheme = function (id, ev) {
+    if (LEGACY_THEME_MAP[id]) id = LEGACY_THEME_MAP[id];
+    const applyTheme = () => {
+      currentTheme = id;
+      document.documentElement.setAttribute("data-theme", id);
+      try { localStorage.setItem("ap2a_theme", id); } catch (e) {}
+      renderThemePickers();
+      if (lastStatsPayload) renderOverview(lastStatsPayload);
+      const pop = $("mobileThemePopover");
+      if (pop) pop.classList.remove("open");
+    };
+
+    const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let x = window.innerWidth / 2;
+    let y = window.innerHeight / 2;
+    if (ev && typeof ev.clientX === "number" && (ev.clientX || ev.clientY)) {
+      x = ev.clientX;
+      y = ev.clientY;
+    } else if (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect) {
+      const rect = ev.currentTarget.getBoundingClientRect();
+      x = rect.left + rect.width / 2;
+      y = rect.top + rect.height / 2;
+    }
+
+    if (document.startViewTransition && !reduceMotion && currentTheme !== id) {
+      const endRadius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+      try {
+        const transition = document.startViewTransition(() => {
+          applyTheme();
+        });
+        transition.ready.then(() => {
+          document.documentElement.animate(
+            {
+              clipPath: [
+                `circle(0px at ${x}px ${y}px)`,
+                `circle(${endRadius}px at ${x}px ${y}px)`
+              ]
+            },
+            {
+              duration: 440,
+              easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+              pseudoElement: "::view-transition-new(root)"
+            }
+          );
+        }).catch(() => {});
+        return;
+      } catch (e) {}
+    }
+
+    applyTheme();
+    if (!reduceMotion) {
+      const wave = document.createElement("div");
+      wave.className = "theme-ripple-fallback";
+      wave.style.setProperty("--vt-x", `${x}px`);
+      wave.style.setProperty("--vt-y", `${y}px`);
+      document.body.appendChild(wave);
+      setTimeout(() => wave.remove(), 500);
+    }
   };
 
   if ($("mobThemeBtn")) {
@@ -459,12 +657,34 @@
   }
 
   /* ── Real Live Stream X-Ray Polling & Abort (with 30s post-finish linger) ── */
+  function updateAvatarMood(activeList) {
+    const list = Array.isArray(activeList) ? activeList : [];
+    const hasWarnOrErr = list.some((it) => (Number(it.retries || 0) > 0) || it.status === "error" || it.status === "trunc");
+    const hasRunning = list.some((it) => !it.finished);
+    let mood = "idle";
+    let label = "429 娘 · 待命守护中";
+    if (hasWarnOrErr) {
+      mood = "warn";
+      label = "429 娘 · 检测到重试或异常波动";
+    } else if (hasRunning) {
+      mood = "streaming";
+      label = "429 娘 · 正在实时流式推理中";
+    }
+    if (document.body) {
+      document.body.setAttribute("data-avatar-mood", mood);
+    }
+    document.querySelectorAll(".avatar-ring").forEach((el) => {
+      el.setAttribute("title", label);
+    });
+  }
+
   async function fetchLive() {
     try {
       const r = await apiFetch("/api/live");
       if (!r.ok) return;
       const d = await r.json();
       const active = Array.isArray(d.active) ? d.active : [];
+      updateAvatarMood(active);
       renderLivePulse(active);
       const runningNow = active.filter((it) => !it.finished).length;
       if (lastLiveCount > 0 && runningNow === 0) {
