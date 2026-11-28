@@ -11,9 +11,9 @@
     { id: "sky-day", name: "晴空汽水", swatch: "swatch-sky-day", mode: "day" },
     { id: "paper-day", name: "宣纸茶寮", swatch: "swatch-paper-day", mode: "day" },
     { id: "pop-day", name: "潮玩波普", swatch: "swatch-pop-day", mode: "day" },
-    { id: "vinyl-night", name: "午夜黑胶", swatch: "swatch-vinyl-night", mode: "night" },
-    { id: "hud-night", name: "战术终端", swatch: "swatch-hud-night", mode: "night" },
-    { id: "star-night", name: "极夜星图", swatch: "swatch-star-night", mode: "night" }
+    { id: "star-night", name: "极夜星图", swatch: "swatch-star-night", mode: "night" },
+    { id: "lacquer-night", name: "黑漆绯金", swatch: "swatch-lacquer-night", mode: "night" },
+    { id: "vinyl-night", name: "午夜黑胶", swatch: "swatch-vinyl-night", mode: "night" }
   ];
 
   const COMMON_ARS = [
@@ -93,7 +93,8 @@
   const LEGACY_THEME_MAP = {
     "sakura-day": "paper-day",
     "sky-night": "star-night",
-    "sakura-night": "vinyl-night"
+    "sakura-night": "lacquer-night",
+    "hud-night": "lacquer-night"
   };
   let currentTheme = document.documentElement.getAttribute("data-theme") || "sky-day";
   if (LEGACY_THEME_MAP[currentTheme]) currentTheme = LEGACY_THEME_MAP[currentTheme];
@@ -107,11 +108,36 @@
     if (id === "sky-day") {
       bg.innerHTML = `
         <div class="fx-sunbeam"></div>
-        <svg class="fx-bg-svg fx-clouds" viewBox="0 0 1200 260" preserveAspectRatio="xMidYMax slice" fill="none">
-          <path d="M0 260V172C95 140 165 148 238 175C310 112 435 110 518 164C595 118 710 122 790 166C872 102 1010 98 1105 152C1148 134 1180 138 1200 148V260H0Z" fill="rgba(255,255,255,0.68)"/>
-          <path d="M0 260V206C120 176 235 182 325 212C430 162 560 166 668 208C775 158 925 162 1040 202C1105 186 1160 190 1200 202V260H0Z" fill="rgba(186,230,253,0.42)"/>
-          <circle cx="980" cy="84" r="52" stroke="rgba(14,165,233,0.16)" stroke-width="1.5"/>
-          <circle cx="980" cy="84" r="78" stroke="rgba(14,201,160,0.12)" stroke-width="1" stroke-dasharray="4 6"/>
+        <svg class="fx-bg-svg fx-clouds" viewBox="0 0 1200 280" preserveAspectRatio="xMidYMax slice" fill="none">
+          <defs>
+            <linearGradient id="skyCloudHi" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#ffffff" stop-opacity="0.88"/>
+              <stop offset="68%" stop-color="#e0f4ff" stop-opacity="0.58"/>
+              <stop offset="100%" stop-color="#bae6fd" stop-opacity="0.18"/>
+            </linearGradient>
+            <linearGradient id="skyCloudMid" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#ffffff" stop-opacity="0.72"/>
+              <stop offset="100%" stop-color="#7dd3fc" stop-opacity="0.34"/>
+            </linearGradient>
+            <radialGradient id="ramuneOrb" cx="34%" cy="30%" r="68%">
+              <stop offset="0%" stop-color="#ffffff" stop-opacity="0.72"/>
+              <stop offset="48%" stop-color="#38bdf8" stop-opacity="0.16"/>
+              <stop offset="100%" stop-color="#0db896" stop-opacity="0.24"/>
+            </radialGradient>
+          </defs>
+          <!-- Distant anime cumulus peaks -->
+          <path d="M0 280V176C48 150 96 154 134 176C174 118 258 110 318 158C354 108 432 94 494 146C548 116 616 120 662 162C718 106 814 96 882 148C930 104 1022 98 1088 148C1132 126 1174 132 1200 148V280H0Z" fill="url(#skyCloudHi)"/>
+          <!-- Mid-layer cloud shadow belly -->
+          <path d="M0 280V212C82 184 164 188 232 216C312 162 426 160 510 206C596 168 708 170 792 210C886 160 1002 162 1094 202C1138 184 1176 188 1200 200V280H0Z" fill="url(#skyCloudMid)"/>
+          <!-- Soft sunlit rim stroke -->
+          <path d="M134 176C174 118 258 110 318 158C354 108 432 94 494 146" stroke="rgba(255,255,255,0.85)" stroke-width="2" stroke-linecap="round"/>
+          <path d="M662 162C718 106 814 96 882 148C930 104 1022 98 1088 148" stroke="rgba(255,255,255,0.80)" stroke-width="2" stroke-linecap="round"/>
+          <!-- Ramune glass marble crest -->
+          <circle cx="984" cy="84" r="46" fill="url(#ramuneOrb)" stroke="rgba(0,119,204,0.22)" stroke-width="1.5"/>
+          <circle cx="984" cy="84" r="66" stroke="rgba(13,184,150,0.18)" stroke-width="1.2" stroke-dasharray="4 7"/>
+          <path d="M962 66 A28 28 0 0 1 996 56" stroke="rgba(255,255,255,0.88)" stroke-width="3" stroke-linecap="round"/>
+          <path d="M910 54 L913 62 L921 65 L913 68 L910 76 L907 68 L899 65 L907 62 Z" fill="rgba(0,159,227,0.34)"/>
+          <path d="M1060 36 L1062 42 L1068 44 L1062 46 L1060 52 L1058 46 L1052 44 L1058 42 Z" fill="rgba(13,184,150,0.36)"/>
         </svg>
       `;
       fg.innerHTML = `
@@ -125,19 +151,51 @@
     } else if (id === "paper-day") {
       bg.innerHTML = `
         <div class="fx-seal"><span>茶</span><span>寮</span></div>
-        <svg class="fx-bg-svg fx-bamboo" viewBox="0 0 320 320" fill="none">
-          <path d="M24 -10 C42 86, 54 176, 36 290" stroke="rgba(45,122,99,0.16)" stroke-width="3.2" stroke-linecap="round"/>
-          <path d="M38 72 C84 56, 126 52, 166 64" stroke="rgba(45,122,99,0.13)" stroke-width="1.8" stroke-linecap="round"/>
-          <path d="M44 138 C98 118, 146 116, 198 134" stroke="rgba(45,122,99,0.12)" stroke-width="1.6" stroke-linecap="round"/>
-          <path d="M96 58 Q126 32 154 46 Q126 62 96 58Z" fill="rgba(45,122,99,0.16)"/>
-          <path d="M128 60 Q162 44 188 64 Q158 72 128 60Z" fill="rgba(45,122,99,0.14)"/>
-          <path d="M114 124 Q150 98 182 114 Q148 130 114 124Z" fill="rgba(45,122,99,0.15)"/>
-          <path d="M150 128 Q186 116 214 138 Q180 144 150 128Z" fill="rgba(196,134,40,0.14)"/>
+        <svg class="fx-bg-svg fx-bamboo" viewBox="0 0 340 340" fill="none">
+          <!-- Primary & secondary bamboo stalks with authentic nodes (竹节) -->
+          <path d="M26 -8 C40 72, 48 158, 34 308" stroke="rgba(39,115,92,0.20)" stroke-width="3.6" stroke-linecap="round"/>
+          <path d="M58 -12 C68 62, 72 138, 60 250" stroke="rgba(110,96,80,0.13)" stroke-width="2.2" stroke-linecap="round"/>
+          <line x1="29" y1="68" x2="43" y2="66" stroke="rgba(39,115,92,0.32)" stroke-width="2.4" stroke-linecap="round"/>
+          <line x1="36" y1="142" x2="50" y2="140" stroke="rgba(39,115,92,0.30)" stroke-width="2.4" stroke-linecap="round"/>
+          <line x1="34" y1="218" x2="47" y2="216" stroke="rgba(39,115,92,0.26)" stroke-width="2.2" stroke-linecap="round"/>
+          <line x1="60" y1="98" x2="71" y2="96" stroke="rgba(110,96,80,0.24)" stroke-width="1.8" stroke-linecap="round"/>
+          <!-- Fine side twigs -->
+          <path d="M37 68 C84 52, 134 48, 184 62" stroke="rgba(39,115,92,0.16)" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M43 141 C98 118, 152 116, 212 136" stroke="rgba(39,115,92,0.15)" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M66 98 C104 82, 136 80, 168 92" stroke="rgba(184,124,34,0.16)" stroke-width="1.2" stroke-linecap="round"/>
+          <!-- Calligraphic 个/介 bamboo leaf sprays -->
+          <path d="M98 56 Q132 24 166 42 Q132 58 98 56Z" fill="rgba(39,115,92,0.20)"/>
+          <path d="M126 57 Q166 38 202 60 Q164 68 126 57Z" fill="rgba(39,115,92,0.16)"/>
+          <path d="M108 58 Q138 68 164 88 Q130 78 108 58Z" fill="rgba(39,115,92,0.14)"/>
+          <path d="M114 126 Q154 94 192 112 Q152 130 114 126Z" fill="rgba(39,115,92,0.18)"/>
+          <path d="M150 128 Q194 112 228 138 Q188 144 150 128Z" fill="rgba(184,124,34,0.17)"/>
+          <path d="M132 132 Q162 146 186 168 Q154 156 132 132Z" fill="rgba(39,115,92,0.13)"/>
+          <path d="M122 86 Q152 68 178 82 Q150 92 122 86Z" fill="rgba(184,72,36,0.12)"/>
         </svg>
-        <svg class="fx-bg-svg fx-mountains" viewBox="0 0 1200 260" preserveAspectRatio="xMidYMax slice" fill="none">
-          <path d="M0 260V168 Q160 72 340 148 T720 132 T1060 112 L1200 148 V260Z" fill="rgba(124,104,82,0.10)"/>
-          <path d="M0 260V196 Q210 122 430 184 T860 166 T1200 184 V260Z" fill="rgba(45,122,99,0.10)"/>
-          <path d="M0 260V226 Q280 176 580 218 T1200 208 V260Z" fill="rgba(124,88,54,0.08)"/>
+        <svg class="fx-bg-svg fx-mountains" viewBox="0 0 1200 280" preserveAspectRatio="xMidYMax slice" fill="none">
+          <defs>
+            <linearGradient id="inkFar" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#6e6050" stop-opacity="0.16"/>
+              <stop offset="78%" stop-color="#6e6050" stop-opacity="0.04"/>
+              <stop offset="100%" stop-color="#f5efe4" stop-opacity="0"/>
+            </linearGradient>
+            <linearGradient id="inkMid" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#27735c" stop-opacity="0.16"/>
+              <stop offset="82%" stop-color="#27735c" stop-opacity="0.04"/>
+              <stop offset="100%" stop-color="#f5efe4" stop-opacity="0"/>
+            </linearGradient>
+            <linearGradient id="inkNear" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#7c5836" stop-opacity="0.13"/>
+              <stop offset="85%" stop-color="#7c5836" stop-opacity="0.03"/>
+              <stop offset="100%" stop-color="#f5efe4" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <!-- 墨分五色 misty ink-wash ridges -->
+          <path d="M0 280V172 C120 112 220 74 340 138 C460 202 580 96 730 132 C870 166 970 86 1090 126 C1140 142 1176 146 1200 156 V280Z" fill="url(#inkFar)"/>
+          <!-- Floating valley mist veil -->
+          <path d="M0 204 Q280 182 560 198 T1200 186 V226 Q900 236 600 220 T0 232 Z" fill="rgba(248,243,233,0.48)"/>
+          <path d="M0 280V202 C160 138 290 132 430 188 C580 248 730 144 890 176 C1020 202 1120 166 1200 188 V280Z" fill="url(#inkMid)"/>
+          <path d="M0 280V234 C220 184 410 196 620 228 C820 258 1010 202 1200 224 V280Z" fill="url(#inkNear)"/>
         </svg>
       `;
       fg.innerHTML = `
@@ -148,65 +206,132 @@
     } else if (id === "pop-day") {
       bg.innerHTML = `
         <svg class="fx-bg-svg fx-pop-art" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice" fill="none">
-          <circle cx="1110" cy="90" r="95" fill="rgba(255,212,59,0.30)" stroke="rgba(28,25,43,0.18)" stroke-width="3"/>
-          <circle cx="1096" cy="104" r="95" stroke="rgba(28,25,43,0.14)" stroke-width="2.5" stroke-dasharray="10 8"/>
-          <path d="M-20 690 L48 648 L112 690 L176 648 L240 690 L304 648 L368 690" stroke="rgba(59,108,255,0.22)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M840 740 L895 704 L950 740 L1005 704 L1060 740 L1115 704 L1170 740" stroke="rgba(255,84,120,0.22)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-          <rect x="64" y="130" width="54" height="54" rx="10" transform="rotate(-14 64 130)" fill="rgba(21,196,126,0.18)" stroke="rgba(28,25,43,0.18)" stroke-width="2.5"/>
-          <polygon points="1030,520 1056,574 1004,574" transform="rotate(18 1030 550)" fill="rgba(255,212,59,0.34)" stroke="rgba(28,25,43,0.18)" stroke-width="2.5"/>
+          <!-- Top-right Comic Starburst & Offset Sun Disc -->
+          <polygon points="1116,12 1134,56 1180,44 1152,82 1192,108 1144,114 1152,162 1114,132 1084,168 1084,120 1038,122 1072,88 1042,50 1090,62" fill="rgba(255,212,59,0.34)" stroke="rgba(28,25,43,0.22)" stroke-width="2.5" stroke-linejoin="round"/>
+          <circle cx="1104" cy="96" r="88" stroke="rgba(28,25,43,0.16)" stroke-width="2.2" stroke-dasharray="10 8"/>
+          <!-- Edge-anchored Memphis Offset Zigzag Ribbons (shadow + vibrant ink) -->
+          <path d="M-16 704 L52 662 L116 704 L180 662 L244 704 L308 662 L372 704" stroke="rgba(28,25,43,0.14)" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M-20 698 L48 656 L112 698 L176 656 L240 698 L304 656 L368 698" stroke="rgba(45,92,242,0.26)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M846 748 L901 712 L956 748 L1011 712 L1066 748 L1121 712 L1176 748" stroke="rgba(28,25,43,0.14)" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M840 742 L895 706 L950 742 L1005 706 L1060 742 L1115 706 L1170 742" stroke="rgba(255,71,108,0.26)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+          <!-- Left-edge Pop Candy Capsule with comic offset shadow -->
+          <rect x="44" y="128" width="54" height="54" rx="12" transform="rotate(-14 44 128)" fill="rgba(28,25,43,0.12)"/>
+          <rect x="40" y="124" width="54" height="54" rx="12" transform="rotate(-14 40 124)" fill="rgba(18,184,116,0.20)" stroke="rgba(28,25,43,0.22)" stroke-width="2.5"/>
+          <!-- Right-margin Isometric Triangle & 4-point Spark -->
+          <polygon points="1116,520 1144,572 1088,572" transform="rotate(16 1116 548)" fill="rgba(255,212,59,0.36)" stroke="rgba(28,25,43,0.20)" stroke-width="2.5" stroke-linejoin="round"/>
+          <path d="M98 468 L104 484 L120 490 L104 496 L98 512 L92 496 L76 490 L92 484 Z" fill="rgba(255,71,108,0.24)" stroke="rgba(28,25,43,0.18)" stroke-width="1.8" stroke-linejoin="round"/>
         </svg>
-      `;
-      fg.innerHTML = `
         <span class="fx-pop-badge fx-pop-b1">✦ POP</span>
         <span class="fx-pop-badge fx-pop-b2">★ 429</span>
       `;
+      fg.innerHTML = "";
     } else if (id === "vinyl-night") {
       bg.innerHTML = `
         <div class="fx-vinyl-disc"></div>
-        <svg class="fx-bg-svg fx-vinyl-wave" viewBox="0 0 1200 200" preserveAspectRatio="xMidYMax slice" fill="none">
-          <path d="M0 132 Q120 72 240 124 T480 116 T720 128 T960 96 T1200 124" stroke="rgba(229,169,60,0.22)" stroke-width="1.8"/>
-          <path d="M0 152 Q150 96 300 144 T600 132 T900 150 T1200 136" stroke="rgba(88,184,159,0.18)" stroke-width="1.4"/>
-          <path d="M0 170 Q180 134 360 166 T720 156 T1080 172 T1200 162" stroke="rgba(222,107,83,0.16)" stroke-width="1.2" stroke-dasharray="4 6"/>
+        <svg class="fx-bg-svg fx-vinyl-arm" viewBox="0 0 160 160" fill="none">
+          <!-- Hi-Fi Turntable Gimbal Pivot & Counterweight -->
+          <circle cx="128" cy="24" r="16" fill="#1a1714" stroke="rgba(229,169,60,0.48)" stroke-width="1.6"/>
+          <circle cx="128" cy="24" r="7" fill="rgba(229,169,60,0.34)" stroke="rgba(245,202,118,0.65)" stroke-width="1.2"/>
+          <rect x="133" y="4" width="12" height="14" rx="3" transform="rotate(32 133 4)" fill="#2a241d" stroke="rgba(229,169,60,0.42)" stroke-width="1.2"/>
+          <!-- S-Curve Brushed Brass Tonearm Tube -->
+          <path d="M124 34 C112 66, 98 84, 72 108 L56 122" stroke="rgba(245,202,118,0.62)" stroke-width="3.2" stroke-linecap="round"/>
+          <path d="M124 34 C112 66, 98 84, 72 108 L56 122" stroke="rgba(255,244,214,0.28)" stroke-width="1" stroke-linecap="round"/>
+          <!-- Angled Headshell & Glowing Amber Stylus Cartridge -->
+          <rect x="40" y="118" width="22" height="10" rx="2.5" transform="rotate(-38 40 118)" fill="#29231c" stroke="rgba(229,169,60,0.68)" stroke-width="1.4"/>
+          <circle cx="44" cy="130" r="2.6" fill="#de6b53"/>
+          <circle cx="44" cy="130" r="6" fill="rgba(222,107,83,0.24)"/>
+        </svg>
+        <svg class="fx-bg-svg fx-vinyl-wave" viewBox="0 0 1200 210" preserveAspectRatio="xMidYMax slice" fill="none">
+          <!-- Analog dB Reference Scale -->
+          <line x1="0" y1="142" x2="1200" y2="142" stroke="rgba(229,169,60,0.10)" stroke-width="1" stroke-dasharray="2 10"/>
+          <line x1="0" y1="172" x2="1200" y2="172" stroke="rgba(88,184,159,0.09)" stroke-width="1" stroke-dasharray="2 14"/>
+          <!-- Warm Tube Harmonic Waves -->
+          <path d="M0 132 Q120 68 240 126 T480 116 T720 130 T960 92 T1200 124" stroke="rgba(229,169,60,0.26)" stroke-width="1.8"/>
+          <path d="M0 152 Q150 96 300 144 T600 132 T900 150 T1200 136" stroke="rgba(88,184,159,0.20)" stroke-width="1.4"/>
+          <path d="M0 172 Q180 136 360 168 T720 156 T1080 174 T1200 162" stroke="rgba(222,107,83,0.18)" stroke-width="1.2" stroke-dasharray="4 6"/>
         </svg>
       `;
       fg.innerHTML = "";
-    } else if (id === "hud-night") {
+    } else if (id === "lacquer-night") {
       bg.innerHTML = `
-        <svg class="fx-bg-svg fx-hud-topo" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice" fill="none">
-          <path d="M-40 620 C160 540 310 660 520 590 C740 515 920 640 1240 540" stroke="rgba(0,229,160,0.12)" stroke-width="1.2"/>
-          <path d="M-40 660 C180 580 340 700 560 630 C780 555 950 680 1240 585" stroke="rgba(0,229,160,0.09)" stroke-width="1"/>
-          <path d="M-40 705 C210 630 390 740 610 675 C830 605 980 720 1240 635" stroke="rgba(255,107,43,0.10)" stroke-width="1" stroke-dasharray="6 6"/>
-          <circle cx="1090" cy="110" r="145" stroke="rgba(0,229,160,0.13)" stroke-width="1" stroke-dasharray="4 8"/>
-          <circle cx="1090" cy="110" r="96" stroke="rgba(255,107,43,0.12)" stroke-width="1"/>
-          <line x1="930" y1="110" x2="1200" y2="110" stroke="rgba(0,229,160,0.10)" stroke-width="1"/>
-          <line x1="1090" y1="0" x2="1090" y2="270" stroke="rgba(0,229,160,0.10)" stroke-width="1"/>
+        <div class="fx-lacquer-seal"><span>漆</span><span>绘</span></div>
+        <svg class="fx-bg-svg fx-lacquer-branch" viewBox="0 0 360 340" fill="none">
+          <!-- Nocturnal Urushi Maki-e Ume Branch & Scattered Kinpaku Gold Dust -->
+          <path d="M-10 18 C72 62, 134 88, 224 92" stroke="rgba(204,168,110,0.24)" stroke-width="2.6" stroke-linecap="round"/>
+          <path d="M92 66 C134 36, 178 24, 232 34" stroke="rgba(204,168,110,0.18)" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M138 82 C176 106, 210 124, 254 128" stroke="rgba(204,168,110,0.14)" stroke-width="1.2" stroke-linecap="round"/>
+          <!-- Delicate 5-petal dusty crimson ume blossoms -->
+          <g fill="rgba(217,104,122,0.26)">
+            <circle cx="152" cy="40" r="4.5"/><circle cx="159" cy="44" r="4.5"/><circle cx="156" cy="51" r="4.5"/><circle cx="148" cy="51" r="4.5"/><circle cx="145" cy="44" r="4.5"/>
+            <circle cx="204" cy="84" r="5"/><circle cx="212" cy="89" r="5"/><circle cx="209" cy="97" r="5"/><circle cx="199" cy="97" r="5"/><circle cx="196" cy="89" r="5"/>
+          </g>
+          <circle cx="152" cy="46" r="2.2" fill="rgba(204,168,110,0.68)"/>
+          <circle cx="204" cy="91" r="2.5" fill="rgba(204,168,110,0.72)"/>
+          <circle cx="232" cy="36" r="4" fill="rgba(217,104,122,0.24)"/>
+          <circle cx="252" cy="126" r="3.5" fill="rgba(204,168,110,0.34)"/>
+          <rect x="266" y="48" width="5" height="3.5" rx="0.8" transform="rotate(24 266 48)" fill="rgba(204,168,110,0.36)"/>
+          <rect x="292" y="88" width="4" height="4" rx="0.6" transform="rotate(-18 292 88)" fill="rgba(217,104,122,0.32)"/>
+        </svg>
+        <svg class="fx-bg-svg fx-seigaiha" viewBox="0 0 640 280" preserveAspectRatio="xMaxYMax slice" fill="none">
+          <!-- Traditional Seigaiha (青海波) Lacquer Filigree Waves -->
+          <g stroke="rgba(204,168,110,0.20)" stroke-width="1.15">
+            <path d="M240 280 A90 90 0 0 1 420 280"/><path d="M268 280 A62 62 0 0 1 392 280"/><path d="M296 280 A34 34 0 0 1 364 280"/>
+            <path d="M390 280 A90 90 0 0 1 570 280"/><path d="M418 280 A62 62 0 0 1 542 280"/><path d="M446 280 A34 34 0 0 1 514 280"/>
+            <path d="M510 280 A90 90 0 0 1 690 280"/><path d="M538 280 A62 62 0 0 1 662 280"/>
+            <path d="M315 218 A90 90 0 0 1 495 218"/><path d="M343 218 A62 62 0 0 1 467 218"/><path d="M371 218 A34 34 0 0 1 439 218"/>
+            <path d="M465 218 A90 90 0 0 1 645 218"/><path d="M493 218 A62 62 0 0 1 617 218"/>
+          </g>
+          <g stroke="rgba(217,104,122,0.17)" stroke-width="1">
+            <path d="M90 280 A90 90 0 0 1 270 280"/><path d="M118 280 A62 62 0 0 1 242 280"/><path d="M146 280 A34 34 0 0 1 214 280"/>
+            <path d="M165 218 A90 90 0 0 1 345 218"/><path d="M193 218 A62 62 0 0 1 317 218"/>
+          </g>
         </svg>
       `;
-      fg.innerHTML = `<div class="fx-hud-scan"></div>`;
+      fg.innerHTML = `
+        <span class="fx-gold-fleck" style="--gx:14%;--gs:6px;--gd:15s;--gdelay:-2s"></span>
+        <span class="fx-gold-fleck" style="--gx:34%;--gs:4.5px;--gd:18s;--gdelay:-9s"></span>
+        <span class="fx-gold-fleck" style="--gx:58%;--gs:5.5px;--gd:16s;--gdelay:-5s"></span>
+        <span class="fx-gold-fleck" style="--gx:76%;--gs:7px;--gd:14s;--gdelay:-11s"></span>
+        <span class="fx-gold-fleck" style="--gx:90%;--gs:5px;--gd:17s;--gdelay:-3.5s"></span>
+      `;
     } else if (id === "star-night") {
       bg.innerHTML = `
         <div class="fx-aurora-veil"></div>
         <svg class="fx-bg-svg fx-astrolabe" viewBox="0 0 360 360" fill="none">
-          <circle cx="180" cy="180" r="166" stroke="#e8d1a0" stroke-width="1" stroke-dasharray="3 6"/>
-          <circle cx="180" cy="180" r="132" stroke="#7cc4fa" stroke-width="1" stroke-opacity="0.78"/>
+          <!-- Outer Graduated Brass Degree Ring -->
+          <circle cx="180" cy="180" r="168" stroke="#e8d1a0" stroke-width="1.1" stroke-dasharray="2 7"/>
+          <circle cx="180" cy="180" r="158" stroke="#e8d1a0" stroke-width="0.6" stroke-opacity="0.45"/>
+          <circle cx="180" cy="180" r="132" stroke="#7cc4fa" stroke-width="1.1" stroke-opacity="0.78"/>
           <circle cx="180" cy="180" r="94" stroke="#e8d1a0" stroke-width="0.9" stroke-dasharray="1.5 5"/>
           <circle cx="180" cy="180" r="54" stroke="#7cc4fa" stroke-width="0.8" stroke-opacity="0.65"/>
+          <!-- Tilted Ecliptic & Meridian Armillary Rings -->
+          <ellipse cx="180" cy="180" rx="158" ry="62" transform="rotate(-26 180 180)" stroke="#e8d1a0" stroke-width="0.9" stroke-opacity="0.62"/>
+          <ellipse cx="180" cy="180" rx="132" ry="44" transform="rotate(34 180 180)" stroke="#7cc4fa" stroke-width="0.8" stroke-opacity="0.48" stroke-dasharray="4 4"/>
+          <!-- Celestial Axes & Cardinal Compass Rose -->
           <line x1="180" y1="8" x2="180" y2="352" stroke="#e8d1a0" stroke-width="0.6" stroke-opacity="0.48"/>
           <line x1="8" y1="180" x2="352" y2="180" stroke="#7cc4fa" stroke-width="0.6" stroke-opacity="0.48"/>
-          <line x1="58" y1="58" x2="302" y2="302" stroke="#e8d1a0" stroke-width="0.5" stroke-opacity="0.34"/>
-          <line x1="302" y1="58" x2="58" y2="302" stroke="#7cc4fa" stroke-width="0.5" stroke-opacity="0.34"/>
+          <line x1="58" y1="58" x2="302" y2="302" stroke="#e8d1a0" stroke-width="0.5" stroke-opacity="0.32"/>
+          <line x1="302" y1="58" x2="58" y2="302" stroke="#7cc4fa" stroke-width="0.5" stroke-opacity="0.32"/>
+          <path d="M180 156 L186 174 L204 180 L186 186 L180 204 L174 186 L156 180 L174 174 Z" fill="rgba(232,209,160,0.42)" stroke="#e8d1a0" stroke-width="0.8"/>
+          <!-- Crescent Orbit Marker -->
+          <path d="M276 86 A9 9 0 1 1 264 98 A7 7 0 1 0 276 86 Z" fill="#e8d1a0" fill-opacity="0.72"/>
         </svg>
-        <svg class="fx-bg-svg fx-constellation" viewBox="0 0 540 260" fill="none">
-          <polyline points="42,210 118,158 206,174 282,116 374,132 458,72" stroke="rgba(232,209,160,0.30)" stroke-width="1.1" stroke-dasharray="3 4"/>
-          <polyline points="206,174 246,226 352,206" stroke="rgba(124,196,250,0.24)" stroke-width="1" stroke-dasharray="2 4"/>
-          <circle cx="42" cy="210" r="2.8" fill="#e8d1a0" fill-opacity="0.72"/>
-          <circle cx="118" cy="158" r="3.2" fill="#7cc4fa" fill-opacity="0.78"/>
-          <circle cx="206" cy="174" r="3.6" fill="#e8d1a0" fill-opacity="0.82"/>
-          <circle cx="282" cy="116" r="3" fill="#7cc4fa" fill-opacity="0.76"/>
-          <circle cx="374" cy="132" r="2.8" fill="#e8d1a0" fill-opacity="0.72"/>
-          <circle cx="458" cy="72" r="3.8" fill="#e8d1a0" fill-opacity="0.86"/>
-          <circle cx="246" cy="226" r="2.2" fill="#7cc4fa" fill-opacity="0.62"/>
-          <circle cx="352" cy="206" r="2.4" fill="#e8d1a0" fill-opacity="0.65"/>
+        <svg class="fx-bg-svg fx-constellation" viewBox="0 0 560 270" fill="none">
+          <!-- Big Dipper & Celestial Arc Constellation -->
+          <polyline points="36,216 114,162 204,176 284,114 378,130 468,68 514,116" stroke="rgba(232,209,160,0.34)" stroke-width="1.1" stroke-dasharray="3 4"/>
+          <polyline points="204,176 248,228 354,208 378,130" stroke="rgba(124,196,250,0.26)" stroke-width="1" stroke-dasharray="2 4"/>
+          <!-- Double-halo Glowing Star Nodes -->
+          <circle cx="36" cy="216" r="6" fill="rgba(232,209,160,0.16)"/><circle cx="36" cy="216" r="2.6" fill="#e8d1a0" fill-opacity="0.82"/>
+          <circle cx="114" cy="162" r="7" fill="rgba(124,196,250,0.18)"/><circle cx="114" cy="162" r="3" fill="#7cc4fa" fill-opacity="0.86"/>
+          <circle cx="204" cy="176" r="9" fill="rgba(232,209,160,0.20)"/><circle cx="204" cy="176" r="3.4" fill="#e8d1a0" fill-opacity="0.90"/>
+          <path d="M204 166v20M194 176h20" stroke="rgba(232,209,160,0.45)" stroke-width="0.8"/>
+          <circle cx="284" cy="114" r="7" fill="rgba(124,196,250,0.16)"/><circle cx="284" cy="114" r="2.8" fill="#7cc4fa" fill-opacity="0.82"/>
+          <circle cx="378" cy="130" r="6" fill="rgba(232,209,160,0.15)"/><circle cx="378" cy="130" r="2.6" fill="#e8d1a0" fill-opacity="0.78"/>
+          <circle cx="468" cy="68" r="10" fill="rgba(232,209,160,0.22)"/><circle cx="468" cy="68" r="3.6" fill="#e8d1a0" fill-opacity="0.94"/>
+          <path d="M468 56v24M456 68h24" stroke="rgba(232,209,160,0.52)" stroke-width="0.9"/>
+          <circle cx="514" cy="116" r="5" fill="rgba(124,196,250,0.14)"/><circle cx="514" cy="116" r="2.2" fill="#7cc4fa" fill-opacity="0.72"/>
+          <circle cx="248" cy="228" r="2.2" fill="#7cc4fa" fill-opacity="0.68"/>
+          <circle cx="354" cy="208" r="2.4" fill="#e8d1a0" fill-opacity="0.72"/>
         </svg>
       `;
       fg.innerHTML = `
@@ -254,16 +379,191 @@
     renderThemeFx(currentTheme);
   }
 
+  const SUPPORTS_POPOVER = typeof HTMLElement !== "undefined" && Object.hasOwn(HTMLElement.prototype, "popover");
+
+  function closeMobileThemePopover() {
+    const pop = $("mobileThemePopover");
+    if (!pop) return;
+    if (SUPPORTS_POPOVER && typeof pop.hidePopover === "function") {
+      try { if (pop.matches(":popover-open")) pop.hidePopover(); } catch (e) {}
+    }
+    pop.classList.remove("open");
+  }
+
+  const VT_STYLE_MAP = {
+    "sky-day": "ripple",
+    "star-night": "ripple",
+    "paper-day": "scroll",
+    "lacquer-night": "scroll",
+    "pop-day": "slash",
+    "vinyl-night": "iris"
+  };
+
+  /* ── Optional Zero-Asset Web Audio Theme Micro-SFX (Default OFF) ── */
+  let sfxEnabled = false;
+  try { sfxEnabled = localStorage.getItem("ap2a_sfx") === "1"; } catch (e) {}
+  let audioCtx = null;
+
+  function syncSfxUi() {
+    const onIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>`;
+    const offIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>`;
+    const sBtn = $("sideSfxBtn");
+    if (sBtn) {
+      sBtn.classList.toggle("sfx-on", sfxEnabled);
+      sBtn.innerHTML = `${sfxEnabled ? onIcon : offIcon}<span id="sideSfxText">触控音效：${sfxEnabled ? "开" : "关"}</span>`;
+    }
+    const mBtn = $("mobSfxBtn");
+    if (mBtn) {
+      mBtn.classList.toggle("sfx-on", sfxEnabled);
+      mBtn.title = `触控音效：${sfxEnabled ? "开" : "关"}`;
+      mBtn.innerHTML = sfxEnabled ? onIcon : offIcon;
+    }
+  }
+
+  function playThemeSfx(themeId, kind) {
+    if (!sfxEnabled) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      if (!audioCtx) audioCtx = new AC();
+      const emit = () => {
+        const now = audioCtx.currentTime;
+        const th = themeId || currentTheme;
+        const scale = kind === "light" ? 0.72 : 1;
+        const tone = (type, f0, f1, dur, vol, delay) => {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          const t0 = now + (delay || 0);
+          osc.type = type;
+          osc.frequency.setValueAtTime(f0, t0);
+          if (f1 !== f0) osc.frequency.exponentialRampToValueAtTime(Math.max(40, f1), t0 + dur);
+          gain.gain.setValueAtTime(0.0001, t0);
+          gain.gain.linearRampToValueAtTime(vol * scale, t0 + 0.006);
+          gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(t0);
+          osc.stop(t0 + dur + 0.012);
+        };
+        if (th === "sky-day") {
+          tone("sine", 540, 1040, 0.062, 0.055);
+        } else if (th === "star-night") {
+          tone("sine", 880, 880, 0.105, 0.04);
+          tone("sine", 1318.5, 1318.5, 0.115, 0.026, 0.018);
+        } else if (th === "paper-day") {
+          tone("triangle", 360, 195, 0.05, 0.058);
+        } else if (th === "lacquer-night") {
+          tone("triangle", 270, 145, 0.058, 0.055);
+        } else if (th === "pop-day") {
+          tone("square", 660, 260, 0.036, 0.034);
+        } else if (th === "vinyl-night") {
+          tone("triangle", 190, 78, 0.048, 0.062);
+          tone("sine", 1420, 960, 0.018, 0.024, 0.006);
+        }
+      };
+      if (audioCtx.state === "suspended") audioCtx.resume().then(emit).catch(() => {});
+      else emit();
+    } catch (e) {}
+  }
+
+  window.toggleSfx = function () {
+    sfxEnabled = !sfxEnabled;
+    try { localStorage.setItem("ap2a_sfx", sfxEnabled ? "1" : "0"); } catch (e) {}
+    syncSfxUi();
+    if (sfxEnabled) {
+      playThemeSfx(currentTheme, "main");
+      showToast("已开启主题触控音效（纯前端离线合成）");
+    } else {
+      showToast("已静音触控音效");
+    }
+  };
+
+  /* ── Theme-Tailored Click Particle Micro-Burst (Zero Persistent Overhead) ── */
+  let burstHost = null;
+  function spawnThemeBurst(x, y, themeId) {
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    if (typeof x !== "number" || typeof y !== "number" || (!x && !y)) return;
+    if (!burstHost) {
+      burstHost = document.createElement("div");
+      burstHost.className = "fx-burst-host";
+      burstHost.setAttribute("aria-hidden", "true");
+      document.body.appendChild(burstHost);
+    }
+    const th = themeId || currentTheme;
+    const count = 5;
+    for (let i = 0; i < count; i++) {
+      const el = document.createElement("span");
+      const angle = ((Math.PI * 2) / count) * i + (Math.random() * 0.55 - 0.27);
+      const dist = 18 + Math.random() * 20;
+      const dx = Math.cos(angle) * dist;
+      const dy = Math.sin(angle) * dist - 6;
+      if (th === "sky-day") {
+        el.className = "fx-burst-p dot-p";
+        el.style.setProperty("--bc", i % 2 ? "#0db896" : "#38bdf8");
+        el.style.setProperty("--bs", (5 + Math.random() * 4).toFixed(1) + "px");
+      } else if (th === "star-night") {
+        el.className = "fx-burst-p";
+        el.textContent = "✦";
+        el.style.setProperty("--bc", i % 2 ? "#7cc4fa" : "#e8d1a0");
+        el.style.setProperty("--bs", (9 + Math.random() * 4).toFixed(1) + "px");
+      } else if (th === "paper-day") {
+        el.className = "fx-burst-p leaf-p";
+        el.style.setProperty("--bc", i % 2 ? "#b84824" : "#27735c");
+        el.style.setProperty("--bs", (8 + Math.random() * 4).toFixed(1) + "px");
+      } else if (th === "lacquer-night") {
+        el.className = "fx-burst-p fleck-p";
+        el.style.setProperty("--bc", i % 2 ? "#d9687a" : "#cca86e");
+        el.style.setProperty("--bs", (6 + Math.random() * 3.5).toFixed(1) + "px");
+      } else if (th === "pop-day") {
+        el.className = "fx-burst-p";
+        el.textContent = i % 2 ? "★" : "✦";
+        el.style.setProperty("--bc", i % 3 === 0 ? "#ffd43b" : (i % 3 === 1 ? "#ff476c" : "#2d5cf2"));
+        el.style.setProperty("--bs", (10 + Math.random() * 4).toFixed(1) + "px");
+      } else {
+        el.className = "fx-burst-p dot-p";
+        el.style.setProperty("--bc", i % 2 ? "#58b89f" : "#e5a93c");
+        el.style.setProperty("--bs", (5 + Math.random() * 3).toFixed(1) + "px");
+      }
+      el.style.setProperty("--bx0", x.toFixed(1) + "px");
+      el.style.setProperty("--by0", y.toFixed(1) + "px");
+      el.style.setProperty("--bdx", dx.toFixed(1) + "px");
+      el.style.setProperty("--bdy", dy.toFixed(1) + "px");
+      el.style.setProperty("--brot", Math.round((Math.random() - 0.5) * 180) + "deg");
+      burstHost.appendChild(el);
+      setTimeout(() => el.remove(), 480);
+    }
+  }
+
+  const SFX_CLICK_SEL = "button, summary.record-head, .channel-choice, .log-line, [role='button'], [role='tab']";
+  document.addEventListener("click", (e) => {
+    const el = e.target && e.target.closest ? e.target.closest(SFX_CLICK_SEL) : null;
+    if (!el || el.disabled) return;
+    if (el.id === "sideSfxBtn" || el.id === "mobSfxBtn" || el.classList.contains("theme-chip")) return;
+    const isPrimary = el.classList.contains("btn-primary");
+    if (isPrimary) spawnThemeBurst(e.clientX, e.clientY, currentTheme);
+    playThemeSfx(currentTheme, isPrimary ? "main" : "light");
+  });
+  document.addEventListener("change", (e) => {
+    if (e.target && e.target.matches && e.target.matches(".switch input[type='checkbox'], select.field-select")) {
+      playThemeSfx(currentTheme, "light");
+    }
+  });
+
+  let activeThemeVT = null;
+
   window.setTheme = function (id, ev) {
     if (LEGACY_THEME_MAP[id]) id = LEGACY_THEME_MAP[id];
+    if (id === currentTheme && document.documentElement.getAttribute("data-theme") === id) {
+      closeMobileThemePopover();
+      return;
+    }
     const applyTheme = () => {
       currentTheme = id;
       document.documentElement.setAttribute("data-theme", id);
       try { localStorage.setItem("ap2a_theme", id); } catch (e) {}
       renderThemePickers();
       if (lastStatsPayload) renderOverview(lastStatsPayload);
-      const pop = $("mobileThemePopover");
-      if (pop) pop.classList.remove("open");
+      closeMobileThemePopover();
     };
 
     const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -278,32 +578,39 @@
       y = rect.top + rect.height / 2;
     }
 
-    if (document.startViewTransition && !reduceMotion && currentTheme !== id) {
+    playThemeSfx(id);
+    if (document.startViewTransition && !reduceMotion) {
       const endRadius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+      const root = document.documentElement;
+      if (activeThemeVT) {
+        try { activeThemeVT.skipTransition(); } catch (e) {}
+        activeThemeVT = null;
+      }
+      root.style.setProperty("--vt-x", `${x}px`);
+      root.style.setProperty("--vt-y", `${y}px`);
+      root.style.setProperty("--vt-r", `${endRadius}px`);
+      root.setAttribute("data-vt-style", VT_STYLE_MAP[id] || "ripple");
+      root.classList.add("theme-vt-active");
       try {
-        const transition = document.startViewTransition(() => {
+        const vt = document.startViewTransition(() => {
           applyTheme();
         });
-        transition.ready.then(() => {
-          document.documentElement.animate(
-            {
-              clipPath: [
-                `circle(0px at ${x}px ${y}px)`,
-                `circle(${endRadius}px at ${x}px ${y}px)`
-              ]
-            },
-            {
-              duration: 440,
-              easing: "cubic-bezier(0.22, 1, 0.36, 1)",
-              pseudoElement: "::view-transition-new(root)"
-            }
-          );
+        activeThemeVT = vt;
+        vt.finished.finally(() => {
+          if (activeThemeVT === vt) activeThemeVT = null;
+          root.classList.remove("theme-vt-active");
+          root.removeAttribute("data-vt-style");
+          spawnThemeBurst(x, y, id);
         }).catch(() => {});
         return;
-      } catch (e) {}
+      } catch (e) {
+        root.classList.remove("theme-vt-active");
+        root.removeAttribute("data-vt-style");
+      }
     }
 
     applyTheme();
+    spawnThemeBurst(x, y, id);
     if (!reduceMotion) {
       const wave = document.createElement("div");
       wave.className = "theme-ripple-fallback";
@@ -314,19 +621,22 @@
     }
   };
 
-  if ($("mobThemeBtn")) {
-    $("mobThemeBtn").addEventListener("click", (e) => {
-      e.stopPropagation();
-      $("mobileThemePopover").classList.toggle("open");
+  // Fallback click/light-dismiss handler ONLY when native Popover API is unavailable
+  if (!SUPPORTS_POPOVER) {
+    if ($("mobThemeBtn")) {
+      $("mobThemeBtn").addEventListener("click", (e) => {
+        e.stopPropagation();
+        $("mobileThemePopover").classList.toggle("open");
+      });
+    }
+    document.addEventListener("click", (e) => {
+      const pop = $("mobileThemePopover");
+      const btn = $("mobThemeBtn");
+      if (pop && pop.classList.contains("open") && !pop.contains(e.target) && (!btn || !btn.contains(e.target))) {
+        pop.classList.remove("open");
+      }
     });
   }
-  document.addEventListener("click", (e) => {
-    const pop = $("mobileThemePopover");
-    const btn = $("mobThemeBtn");
-    if (pop && pop.classList.contains("open") && !pop.contains(e.target) && (!btn || !btn.contains(e.target))) {
-      pop.classList.remove("open");
-    }
-  });
 
   /* =====================================================================
      2. OVERVIEW & LIVE STREAM X-RAY PULSE
@@ -447,10 +757,46 @@
       }).join("");
     }
 
+    let donutDecor = `<circle cx="${cx}" cy="${cy}" r="39.5" fill="none" stroke="var(--border)" stroke-width="1" stroke-dasharray="2.5 3.5" opacity="0.75"/>`;
+    let donutOuter = "";
+    if (currentTheme === "star-night") {
+      donutDecor = `
+        <circle cx="${cx}" cy="${cy}" r="60" fill="none" stroke="rgba(232,209,160,0.42)" stroke-width="1" stroke-dasharray="2 5"/>
+        <path d="M64 1v5M64 122v5M1 64h5M122 64h5" stroke="#e8d1a0" stroke-width="1.2" opacity="0.72"/>
+        <circle cx="${cx}" cy="${cy}" r="39" fill="none" stroke="rgba(124,196,250,0.4)" stroke-width="0.9" stroke-dasharray="1.5 4"/>
+      `;
+    } else if (currentTheme === "pop-day") {
+      donutOuter = `
+        <circle cx="${cx}" cy="${cy}" r="56" fill="none" stroke="#1c192b" stroke-width="2"/>
+        <circle cx="${cx}" cy="${cy}" r="44" fill="none" stroke="#1c192b" stroke-width="2"/>
+      `;
+      donutDecor = "";
+    } else if (currentTheme === "vinyl-night") {
+      donutDecor = `
+        <circle cx="${cx}" cy="${cy}" r="59" fill="none" stroke="rgba(229,169,60,0.28)" stroke-width="1"/>
+        <circle cx="${cx}" cy="${cy}" r="56.5" fill="none" stroke="rgba(229,169,60,0.14)" stroke-width="0.8"/>
+        <circle cx="${cx}" cy="${cy}" r="41" fill="none" stroke="rgba(229,169,60,0.22)" stroke-width="0.9"/>
+        <circle cx="${cx}" cy="${cy}" r="38" fill="none" stroke="rgba(229,169,60,0.34)" stroke-width="0.8" stroke-dasharray="2 3"/>
+      `;
+    } else if (currentTheme === "paper-day" || currentTheme === "lacquer-night") {
+      const ringCol = currentTheme === "lacquer-night" ? "rgba(204,168,110,0.45)" : "rgba(184,72,36,0.35)";
+      donutDecor = `
+        <circle cx="${cx}" cy="${cy}" r="58.5" fill="none" stroke="${ringCol}" stroke-width="1"/>
+        <circle cx="${cx}" cy="${cy}" r="39.5" fill="none" stroke="${ringCol}" stroke-width="1"/>
+        <circle cx="${cx}" cy="${cy}" r="36.5" fill="none" stroke="${ringCol}" stroke-width="0.6" stroke-dasharray="2 4"/>
+      `;
+    } else if (currentTheme === "sky-day") {
+      donutDecor = `
+        <circle cx="${cx}" cy="${cy}" r="58" fill="none" stroke="rgba(56,189,248,0.26)" stroke-width="1.5"/>
+        <circle cx="${cx}" cy="${cy}" r="39.5" fill="none" stroke="rgba(0,119,204,0.22)" stroke-width="1" stroke-dasharray="3 4"/>
+      `;
+    }
+
     $("healthDonutSvg").innerHTML = `
       <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--track-bg)" stroke-width="10.5"/>
-      <circle cx="${cx}" cy="${cy}" r="39.5" fill="none" stroke="var(--border)" stroke-width="1" stroke-dasharray="2.5 3.5" opacity="0.75"/>
+      ${donutDecor}
       ${arcsHtml}
+      ${donutOuter}
     `;
 
     const hp = $("healthStatusPill");
@@ -522,25 +868,101 @@
     const linePath = smoothPath(coords);
     const areaPath = `${linePath} L${coords[coords.length - 1][0].toFixed(1)},${h - 2} L${coords[0][0].toFixed(1)},${h - 2} Z`;
     $("sparkSummary").textContent = `峰值 ${fmtNum(peak)} / 日`;
-    $("sparkSvg").innerHTML = `
-      <defs>
-        <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="var(--primary)" stop-opacity="0.28"/>
-          <stop offset="100%" stop-color="var(--primary)" stop-opacity="0.01"/>
-        </linearGradient>
-      </defs>
-      <line x1="${padX}" y1="${(h / 2).toFixed(1)}" x2="${w - padX}" y2="${(h / 2).toFixed(1)}" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 4"/>
-      <path d="${areaPath}" fill="url(#sparkGrad)"/>
-      <path d="${linePath}" fill="none" stroke="var(--primary)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-      ${coords.map((p, i) => {
-        const isLast = i === coords.length - 1;
-        const title = `${escHtml(spArr[i].label || "")}：${fmtNum(pts[i])} 次请求`;
-        return isLast
-          ? `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="6" fill="var(--primary)" opacity="0.22"/>
-             <circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.4" fill="var(--primary)" stroke="var(--surface-strong)" stroke-width="1.8"><title>${title}</title></circle>`
-          : `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="2.6" fill="var(--surface-strong)" stroke="var(--primary)" stroke-width="1.7"><title>${title}</title></circle>`;
-      }).join("")}
-    `;
+    if (currentTheme === "vinyl-night") {
+      // Hi-Fi Analog Equalizer LED Brick Columns
+      const colW = 24, gapX = (w - padX * 2 - colW * pts.length) / (pts.length - 1);
+      const maxBricks = 9, brickH = 4.2, brickGap = 1.8;
+      let eqSvg = `<line x1="${padX}" y1="${h - 4}" x2="${w - padX}" y2="${h - 4}" stroke="rgba(229,169,60,0.24)" stroke-width="1"/>`;
+      pts.forEach((v, i) => {
+        const bx = padX + i * (colW + gapX);
+        const lit = peak > 0 ? Math.max(1, Math.round((v / peak) * maxBricks)) : 0;
+        const title = `${escHtml(spArr[i].label || "")}：${fmtNum(v)} 次请求`;
+        eqSvg += `<g><title>${title}</title>`;
+        for (let b = 0; b < maxBricks; b++) {
+          const by = h - 6 - (b + 1) * (brickH + brickGap);
+          const isLit = b < lit;
+          const fill = !isLit ? "rgba(229,169,60,0.08)" : (b >= maxBricks - 2 ? "#de6b53" : (i === pts.length - 1 ? "#f4c15d" : "#e5a93c"));
+          eqSvg += `<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${colW}" height="${brickH}" rx="1.2" fill="${fill}"/>`;
+        }
+        eqSvg += `</g>`;
+      });
+      $("sparkSvg").innerHTML = eqSvg;
+    } else if (currentTheme === "pop-day") {
+      // Comic Hard-Outline Bar Chart with Offset Shadow
+      const barW = 22, gapX = (w - padX * 2 - barW * pts.length) / (pts.length - 1);
+      let popSvg = `<line x1="${padX}" y1="${h - 5}" x2="${w - padX}" y2="${h - 5}" stroke="#1c192b" stroke-width="2"/>`;
+      pts.forEach((v, i) => {
+        const bx = padX + i * (barW + gapX);
+        const bh = peak > 0 ? Math.max(9, (v / peak) * (h - 16)) : 7;
+        const by = h - 5 - bh;
+        const isLast = i === pts.length - 1;
+        const fill = isLast ? "#ffd43b" : (i % 2 === 0 ? "#2d5cf2" : "#12b874");
+        const title = `${escHtml(spArr[i].label || "")}：${fmtNum(v)} 次请求`;
+        popSvg += `<g><title>${title}</title>
+          <rect x="${(bx + 2.5).toFixed(1)}" y="${(by + 2).toFixed(1)}" width="${barW}" height="${bh.toFixed(1)}" rx="4" fill="#1c192b"/>
+          <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${barW}" height="${bh.toFixed(1)}" rx="4" fill="${fill}" stroke="#1c192b" stroke-width="2"/>
+        </g>`;
+      });
+      $("sparkSvg").innerHTML = popSvg;
+    } else if (currentTheme === "paper-day" || currentTheme === "lacquer-night") {
+      // Bamboo-Slip / Kinpaku Scroll Vertical Pillars
+      const barW = 14, gapX = (w - padX * 2 - barW * pts.length) / (pts.length - 1);
+      const isLacq = currentTheme === "lacquer-night";
+      const capCol = isLacq ? "#cca86e" : "#b84824";
+      let scSvg = `<defs><linearGradient id="slipGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--primary)" stop-opacity="0.88"/><stop offset="100%" stop-color="var(--primary)" stop-opacity="0.22"/></linearGradient></defs>
+        <line x1="${padX}" y1="${h - 5}" x2="${w - padX}" y2="${h - 5}" stroke="var(--border-strong)" stroke-width="1"/>`;
+      pts.forEach((v, i) => {
+        const bx = padX + i * (barW + gapX);
+        const bh = peak > 0 ? Math.max(8, (v / peak) * (h - 15)) : 6;
+        const by = h - 5 - bh;
+        const title = `${escHtml(spArr[i].label || "")}：${fmtNum(v)} 次请求`;
+        scSvg += `<g><title>${title}</title>
+          <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${barW}" height="${bh.toFixed(1)}" rx="2.5" fill="url(#slipGrad)"/>
+          <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${barW}" height="3" rx="1.5" fill="${i === pts.length - 1 ? capCol : "var(--accent)"}"/>
+        </g>`;
+      });
+      $("sparkSvg").innerHTML = scSvg;
+    } else if (currentTheme === "star-night") {
+      // Celestial Constellation Star-Chart Polyline
+      const polyPts = coords.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
+      $("sparkSvg").innerHTML = `
+        <line x1="${padX}" y1="${(h / 2).toFixed(1)}" x2="${w - padX}" y2="${(h / 2).toFixed(1)}" stroke="rgba(232,209,160,0.14)" stroke-width="1" stroke-dasharray="2 5"/>
+        <polyline points="${polyPts}" fill="none" stroke="#e8d1a0" stroke-width="1.4" stroke-dasharray="3 3" opacity="0.72"/>
+        ${coords.map((p, i) => {
+          const isLast = i === coords.length - 1;
+          const title = `${escHtml(spArr[i].label || "")}：${fmtNum(pts[i])} 次请求`;
+          const col = i % 2 ? "#7cc4fa" : "#e8d1a0";
+          return isLast
+            ? `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="8" fill="rgba(232,209,160,0.22)"/>
+               <path d="M${p[0].toFixed(1)} ${(p[1] - 7).toFixed(1)}v14M${(p[0] - 7).toFixed(1)} ${p[1].toFixed(1)}h14" stroke="#e8d1a0" stroke-width="1.1"/>
+               <circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.2" fill="#fff7e0"><title>${title}</title></circle>`
+            : `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="5" fill="${col}" opacity="0.16"/>
+               <circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="2.5" fill="${col}"><title>${title}</title></circle>`;
+        }).join("")}
+      `;
+    } else {
+      // Sky-day: Glossy Soda Wave + Specular Bubble Nodes
+      $("sparkSvg").innerHTML = `
+        <defs>
+          <linearGradient id="sparkGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#009fe3" stop-opacity="0.32"/>
+            <stop offset="100%" stop-color="#0db896" stop-opacity="0.02"/>
+          </linearGradient>
+        </defs>
+        <line x1="${padX}" y1="${(h / 2).toFixed(1)}" x2="${w - padX}" y2="${(h / 2).toFixed(1)}" stroke="var(--border)" stroke-width="1" stroke-dasharray="3 4"/>
+        <path d="${areaPath}" fill="url(#sparkGrad)"/>
+        <path d="${linePath}" fill="none" stroke="var(--primary)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        ${coords.map((p, i) => {
+          const isLast = i === coords.length - 1;
+          const title = `${escHtml(spArr[i].label || "")}：${fmtNum(pts[i])} 次请求`;
+          return isLast
+            ? `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="6.5" fill="rgba(0,159,227,0.22)"/>
+               <circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.8" fill="#0077cc" stroke="#ffffff" stroke-width="1.6"><title>${title}</title></circle>
+               <circle cx="${(p[0] - 1.2).toFixed(1)}" cy="${(p[1] - 1.2).toFixed(1)}" r="1" fill="#ffffff"/>`
+            : `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="3.2" fill="#e6f7ff" stroke="#0077cc" stroke-width="1.6"><title>${title}</title></circle>`;
+        }).join("")}
+      `;
+    }
 
     // Token & Implicit Prefix Cache Radar
     const promptTk = Number(d.prompt_tokens || 0);
@@ -1045,7 +1467,7 @@
             <div class="key-main-group">
               <span class="pill primary num" style="min-width:34px;justify-content:center;">#${i + 1}</span>
               <div class="key-input-wrap">
-                <input class="field-input k-key${useCssMask ? " k-key-masked" : ""}" type="text" name="ap2a_ek_${uid}" ${antiFillAttrs} value="${escHtml(keyDisplayVal)}"${useFallbackMask ? ` readonly data-masked="1" onclick="revealAndEditKey(${uid})" title="点击明文显示并编辑此 Key"` : ""} placeholder="粘贴 Express API Key（移开焦点或回车自动保存）" onchange="onKeyFieldChange(${uid})" onkeydown="if(event.key==='Enter'){this.blur();}" />
+                <input class="field-input k-key${useCssMask ? " k-key-masked" : ""}" type="text" name="ap2a_ek_${uid}" ${antiFillAttrs} value="${escHtml(keyDisplayVal)}"${useFallbackMask ? ` readonly data-masked="1" onclick="revealAndEditKey(${uid})" title="点击明文显示并编辑此 Key"` : ""} placeholder="粘贴 Express API Key（移开焦点或回车自动保存）" onchange="onKeyFieldChange(${uid})" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229){event.preventDefault();this.blur();}" />
                 <button class="key-eye" type="button" onclick="toggleKeyVis(${uid})" aria-label="显示或隐藏 Key">
                   <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                 </button>
@@ -1072,7 +1494,7 @@
           <div class="key-row-bottom">
             <div class="key-main-group">
               <span style="font-size:12px;color:var(--text-muted);font-weight:600;white-space:nowrap;">Project ID</span>
-              <input class="field-input mono k-project" type="text" name="ap2a_ep_${uid}" ${antiFillAttrs} style="padding:6px 10px;font-size:12.5px;" value="${escHtml(rec.project_id || "")}" placeholder="留空 = 自动探测获取" onchange="onKeyFieldChange(${uid})" onkeydown="if(event.key==='Enter'){this.blur();}" />
+              <input class="field-input mono k-project" type="text" name="ap2a_ep_${uid}" ${antiFillAttrs} style="padding:6px 10px;font-size:12.5px;" value="${escHtml(rec.project_id || "")}" placeholder="留空 = 自动探测获取" onchange="onKeyFieldChange(${uid})" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229){event.preventDefault();this.blur();}" />
             </div>
             <div class="key-actions-group">
               ${keySrcPill(rec)}
@@ -1808,11 +2230,21 @@
     $("paramsSubGlobal").style.display = sub === "global" ? "block" : "none";
   };
 
+  function openDirtyModal() {
+    const dlg = $("dirtyModal");
+    if (!dlg) return;
+    if (typeof dlg.showModal === "function") {
+      if (!dlg.open) dlg.showModal();
+    } else {
+      dlg.classList.add("open");
+    }
+  }
+
   window.handleScopeChange = function (newScope) {
     if (countModelDirty() > 0) {
       $("scopeSelect").value = currentScope;
       pendingAction = () => applyScopeToForm(newScope);
-      $("dirtyModal").classList.add("open");
+      openDirtyModal();
     } else {
       applyScopeToForm(newScope);
     }
@@ -1820,8 +2252,19 @@
 
   window.closeDirtyModal = function () {
     pendingAction = null;
-    $("dirtyModal").classList.remove("open");
+    const dlg = $("dirtyModal");
+    if (!dlg) return;
+    if (typeof dlg.close === "function") {
+      if (dlg.open) dlg.close();
+    }
+    dlg.classList.remove("open");
   };
+
+  if ($("dirtyModal")) {
+    $("dirtyModal").addEventListener("close", () => {
+      pendingAction = null;
+    });
+  }
 
   window.confirmDirtyAction = async function (shouldSave) {
     if (shouldSave) {
@@ -1841,6 +2284,7 @@
     if (!drawer) return;
     const open = drawer.classList.toggle("open");
     btn.classList.toggle("open", open);
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
   };
 
   async function loadParamsAndCaps() {
@@ -2003,7 +2447,7 @@
     };
     if (currentTab === "params" && countDirtyDiffs() > 0) {
       pendingAction = go;
-      $("dirtyModal").classList.add("open");
+      openDirtyModal();
       return;
     }
     go();
@@ -2476,32 +2920,9 @@
       const bodyT = Number(r.body_time != null ? r.body_time : Math.max(0.01, totalT - connT - thinkT));
       const tSum = Math.max(0.01, connT + thinkT + bodyT);
 
-      const detailHtml = isOpen ? `
-        <div class="record-detail">
-          <div class="timing-box" style="margin-top:10px;">
-            <div class="timing-head">
-              <span>${escHtml(r.full_time || r.time || "")} · ${escHtml(r.mode || "")} · 思考 ${escHtml(r.thinking || "—")}</span>
-              <span class="num">${r.tps ? `${r.tps_approx ? "≈" : ""}${Number(r.tps).toFixed(1)} tok/s` : `总耗时 ${totalT.toFixed(2)}s`}</span>
-            </div>
-            <div class="timing-bar">
-              <div class="t-conn" style="width:${((connT / tSum) * 100).toFixed(1)}%"></div>
-              ${thinkT > 0 ? `<div class="t-think" style="width:${((thinkT / tSum) * 100).toFixed(1)}%"></div>` : ""}
-              ${bodyT > 0 ? `<div class="t-gen" style="width:${((bodyT / tSum) * 100).toFixed(1)}%"></div>` : ""}
-            </div>
-            <div class="timing-legend num">
-              <span><i class="dot" style="background:var(--warning)"></i> 连接/首字 ${connT.toFixed(2)}s</span>
-              <span><i class="dot" style="background:var(--think)"></i> 思考 ${thinkT.toFixed(2)}s</span>
-              <span><i class="dot" style="background:var(--accent)"></i> 吐字 ${bodyT.toFixed(2)}s</span>
-              ${r.has_usage ? `<span style="margin-left:auto;">入 ${fmtNum(pTk)}${cachedTk > 0 ? ` (缓 ${fmtNum(cachedTk)})` : ""} · 思 ${fmtNum(thTk)} · 正 ${fmtNum(outTk)}</span>` : ""}
-            </div>
-          </div>
-          ${r.detail ? `<div class="record-detail-text">${r.detail}</div>` : ""}
-        </div>
-      ` : "";
-
       return `
-        <div class="record-item ${isOpen ? "open" : ""}">
-          <button class="record-head" onclick="toggleRecordOpen(${rid})">
+        <details class="record-item" ${isOpen ? "open" : ""} ontoggle="onRecordToggle(${rid}, this.open)">
+          <summary class="record-head">
             <div class="record-left">
               <span class="dot" style="background:${dotColor}"></span>
               <span class="mono" style="font-size:12px;color:var(--text-muted);" title="${escHtml(r.full_time || "")}">${escHtml(r.time || "")}</span>
@@ -2514,14 +2935,38 @@
             <div class="record-right num">
               <span>${totalT.toFixed(2)}s</span>
               <span>${totTk > 0 ? fmtTok(totTk) + " tk" : (r.out_chars > 0 ? fmtNum(r.out_chars) + " 字" : "—")}</span>
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="transform:${isOpen ? "rotate(180deg)" : "none"};transition:transform .16s;"><polyline points="6 9 12 15 18 9"/></svg>
+              <svg class="record-chevron" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
             </div>
-          </button>
-          ${detailHtml}
-        </div>
+          </summary>
+          <div class="record-detail">
+            <div class="timing-box" style="margin-top:10px;">
+              <div class="timing-head">
+                <span>${escHtml(r.full_time || r.time || "")} · ${escHtml(r.mode || "")} · 思考 ${escHtml(r.thinking || "—")}</span>
+                <span class="num">${r.tps ? `${r.tps_approx ? "≈" : ""}${Number(r.tps).toFixed(1)} tok/s` : `总耗时 ${totalT.toFixed(2)}s`}</span>
+              </div>
+              <div class="timing-bar">
+                <div class="t-conn" style="width:${((connT / tSum) * 100).toFixed(1)}%"></div>
+                ${thinkT > 0 ? `<div class="t-think" style="width:${((thinkT / tSum) * 100).toFixed(1)}%"></div>` : ""}
+                ${bodyT > 0 ? `<div class="t-gen" style="width:${((bodyT / tSum) * 100).toFixed(1)}%"></div>` : ""}
+              </div>
+              <div class="timing-legend num">
+                <span><i class="dot" style="background:var(--warning)"></i> 连接/首字 ${connT.toFixed(2)}s</span>
+                <span><i class="dot" style="background:var(--think)"></i> 思考 ${thinkT.toFixed(2)}s</span>
+                <span><i class="dot" style="background:var(--accent)"></i> 吐字 ${bodyT.toFixed(2)}s</span>
+                ${r.has_usage ? `<span style="margin-left:auto;">入 ${fmtNum(pTk)}${cachedTk > 0 ? ` (缓 ${fmtNum(cachedTk)})` : ""} · 思 ${fmtNum(thTk)} · 正 ${fmtNum(outTk)}</span>` : ""}
+              </div>
+            </div>
+            ${r.detail ? `<div class="record-detail-text">${r.detail}</div>` : ""}
+          </div>
+        </details>
       `;
     }).join("");
   }
+
+  window.onRecordToggle = function (rid, isOpen) {
+    if (isOpen) openRecIds[rid] = true;
+    else delete openRecIds[rid];
+  };
 
   async function fetchRecords() {
     try {
@@ -2599,6 +3044,33 @@
     return "info";
   }
 
+  function highlightTerminalMatches(box, query) {
+    if (typeof CSS === "undefined" || !CSS.highlights || typeof Highlight !== "function") return;
+    CSS.highlights.delete("term-match");
+    if (!query || !box) return;
+    const ranges = [];
+    const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+    const qLen = query.length;
+    let node = walker.nextNode();
+    while (node && ranges.length < 400) {
+      const text = (node.nodeValue || "").toLowerCase();
+      let pos = 0;
+      while (pos < text.length && ranges.length < 400) {
+        const idx = text.indexOf(query, pos);
+        if (idx === -1) break;
+        const r = new Range();
+        r.setStart(node, idx);
+        r.setEnd(node, idx + qLen);
+        ranges.push(r);
+        pos = idx + qLen;
+      }
+      node = walker.nextNode();
+    }
+    if (ranges.length) {
+      CSS.highlights.set("term-match", new Highlight(...ranges));
+    }
+  }
+
   window.renderTerminal = function () {
     const box = $("terminalBox");
     if (!box) return;
@@ -2608,6 +3080,7 @@
       if (!q || raw.toLowerCase().includes(q)) filtered.push({ raw, idx });
     });
     if (!filtered.length) {
+      if (typeof CSS !== "undefined" && CSS.highlights) CSS.highlights.delete("term-match");
       box.innerHTML = `<div style="color:var(--terminal-muted);padding:12px;">${LOG_RAW_LINES.length ? "没有匹配的日志行。" : "等待实时日志流接入…"}</div>`;
       return;
     }
@@ -2615,12 +3088,13 @@
       const lv = classifyLogLevel(raw);
       const m = raw.match(/^(\[\d{2}:\d{2}:\d{2}\])\s*([\s\S]*)$/);
       const ts = m ? m[1] : "";
-      const body = m ? m[2] : raw;
+      const body = (m ? m[2] : raw).replace(/\r?\n+$/, "");
       return `<div class="log-line" onclick="copySingleLog(${idx})" title="点击复制本条日志">`
         + (ts ? `<span class="log-ts">${escHtml(ts)}</span>` : "")
         + `<span class="log-lv-${lv}">${lv.toUpperCase()}</span>`
         + `<span>${escHtml(body)}</span></div>`;
     }).join("");
+    highlightTerminalMatches(box, q);
     if (termAutoscroll && $("logsSubTerminal").style.display !== "none") scrollTerminalBottom();
   };
 
@@ -2682,11 +3156,20 @@
   /* =====================================================================
      7. NAVIGATION, COPY /V1, LOGOUT & POLLING LOOP
      ===================================================================== */
+  const TAB_ORDER = { overview: 0, channel: 1, params: 2, logs: 3 };
 
   function applyTab(tab) {
+    const prevTab = currentTab;
+    const dirCls = (TAB_ORDER[tab] || 0) >= (TAB_ORDER[prevTab] || 0) ? "tab-enter-forward" : "tab-enter-backward";
     currentTab = tab;
-    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-    $("panel-" + tab).classList.add("active");
+    document.querySelectorAll(".tab-panel").forEach((p) => {
+      p.classList.remove("active", "tab-enter-forward", "tab-enter-backward");
+    });
+    const nextPanel = $("panel-" + tab);
+    if (nextPanel) {
+      nextPanel.classList.add("active");
+      if (prevTab !== tab) nextPanel.classList.add(dirCls);
+    }
     document.querySelectorAll("[data-tab]").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
     refreshDirtyState();
     syncMobileTermLock();
@@ -2709,11 +3192,37 @@
     window.scrollTo({ top: 0, behavior: "instant" });
   }
 
+  /* ── Desktop Dark-Theme Pointer Spotlight Sheen (rAF throttled, touch-free) ── */
+  if (window.matchMedia && window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
+    let spotRaf = 0;
+    let spotCard = null;
+    let spotX = 0;
+    let spotY = 0;
+    document.addEventListener("pointermove", (e) => {
+      if (currentTheme !== "vinyl-night" && currentTheme !== "lacquer-night" && currentTheme !== "star-night") return;
+      const card = e.target && e.target.closest ? e.target.closest(".glass-card") : null;
+      if (!card) return;
+      const rect = card.getBoundingClientRect();
+      spotCard = card;
+      spotX = e.clientX - rect.left;
+      spotY = e.clientY - rect.top;
+      if (!spotRaf) {
+        spotRaf = requestAnimationFrame(() => {
+          spotRaf = 0;
+          if (spotCard) {
+            spotCard.style.setProperty("--mx", spotX.toFixed(1) + "px");
+            spotCard.style.setProperty("--my", spotY.toFixed(1) + "px");
+          }
+        });
+      }
+    }, { passive: true });
+  }
+
   function switchTab(tab) {
     if (tab === currentTab) return;
     if (currentTab === "params" && countDirtyDiffs() > 0) {
       pendingAction = () => applyTab(tab);
-      $("dirtyModal").classList.add("open");
+      openDirtyModal();
       return;
     }
     applyTab(tab);
@@ -2741,6 +3250,7 @@
   };
 
   /* ── Bootstrap ── */
+  syncSfxUi();
   renderThemePickers();
   fetchStats();
   fetchLive();
