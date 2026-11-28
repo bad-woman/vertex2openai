@@ -8,8 +8,8 @@
   <link rel="icon" type="image/webp" href="/static/avatar.webp" />
   <script>
     (function () {
-      var valid = { "sky-day": 1, "paper-day": 1, "pop-day": 1, "vinyl-night": 1, "hud-night": 1, "star-night": 1 };
-      var migrate = { "sakura-day": "paper-day", "sky-night": "star-night", "sakura-night": "vinyl-night" };
+      var valid = { "sky-day": 1, "paper-day": 1, "pop-day": 1, "star-night": 1, "lacquer-night": 1, "vinyl-night": 1 };
+      var migrate = { "sakura-day": "paper-day", "sky-night": "star-night", "sakura-night": "lacquer-night", "hud-night": "lacquer-night" };
       var saved = "";
       try { saved = localStorage.getItem("ap2a_theme") || ""; } catch (e) {}
       if (migrate[saved]) saved = migrate[saved];
@@ -41,17 +41,20 @@
       <span class="live-dot" title="服务在线"></span>
     </div>
     <div class="mobile-top-actions">
-      <button class="btn-icon" id="mobThemeBtn" aria-label="切换主题" title="切换主题">
+      <button class="btn-icon" id="mobSfxBtn" type="button" onclick="toggleSfx()" aria-label="切换触控音效" title="触控音效：关">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+      </button>
+      <button class="btn-icon" id="mobThemeBtn" type="button" popovertarget="mobileThemePopover" aria-label="切换主题" title="切换主题">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41"/></svg>
       </button>
-      <button class="btn-icon" id="mobCopyBtn" aria-label="复制 /v1 地址" title="复制 /v1 地址">
+      <button class="btn-icon" id="mobCopyBtn" type="button" aria-label="复制 /v1 地址" title="复制 /v1 地址">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
       </button>
     </div>
   </header>
 
-  <!-- Mobile Theme Popover -->
-  <div class="mobile-popover" id="mobileThemePopover">
+  <!-- Mobile Theme Popover (Native Popover API Top Layer + fallback) -->
+  <div class="mobile-popover" id="mobileThemePopover" popover="auto">
     <div class="sidebar-label" style="margin-bottom:10px;">
       <span>主题配色 <span class="sparkle">✦</span></span>
       <span id="mobThemeName" style="color:var(--primary-text);">晴空汽水</span>
@@ -70,6 +73,7 @@
       <div class="brand-box">
         <span class="avatar-ring" title="429 娘 · 实时状态呼吸环">
           <img class="brand-avatar" src="/static/avatar.webp" alt="429 娘" />
+          <span class="avatar-tag" aria-hidden="true">429</span>
         </span>
         <div class="brand-meta">
           <div class="brand-title">agentplatform2api <span class="sparkle">✦</span></div>
@@ -111,6 +115,10 @@
 
       <div class="sidebar-actions">
         <div style="font-size:11.5px;color:var(--text-muted);padding:0 10px 2px;" id="sideUptimeText">已运行 0.0 h</div>
+        <button class="side-btn" id="sideSfxBtn" onclick="toggleSfx()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+          <span id="sideSfxText">触控音效：关</span>
+        </button>
         <button class="side-btn" id="sideCopyBtn">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           复制 /v1 接口地址
@@ -1251,6 +1259,10 @@
                 <button class="btn btn-danger-soft btn-sm" onclick="clearTerminal()">清空面板</button>
               </div>
             </div>
+            <div class="term-chrome" aria-hidden="true">
+              <span class="term-chrome-dots"><i></i><i></i><i></i></span>
+              <span class="term-chrome-label"></span>
+            </div>
             <div class="terminal-box" id="terminalBox"></div>
           </div>
         </section>
@@ -1293,18 +1305,18 @@
     </div>
   </div>
 
-  <!-- UNSAVED GUARD MODAL -->
-  <div class="overlay" id="dirtyModal">
+  <!-- UNSAVED GUARD MODAL (Native <dialog> Top Layer with Esc / Back-gesture & scroll lock) -->
+  <dialog class="native-modal" id="dirtyModal" aria-labelledby="dirtyModalTitle" closedby="any">
     <div class="glass-card modal-card">
-      <h3 style="margin:0 0 6px;font-size:16px;">有未保存的参数修改</h3>
+      <h3 id="dirtyModalTitle" style="margin:0 0 6px;font-size:16px;">有未保存的参数修改</h3>
       <p style="margin:0;font-size:13px;color:var(--text-secondary);">当前模型参数页还有尚未保存的改动，是否先保存再离开？</p>
       <div class="modal-actions">
-        <button class="btn btn-ghost btn-sm" onclick="closeDirtyModal()">留在此页</button>
-        <button class="btn btn-danger-soft btn-sm" onclick="confirmDirtyAction(false)">放弃并切换</button>
-        <button class="btn btn-primary btn-sm" onclick="confirmDirtyAction(true)">保存并切换</button>
+        <button type="button" class="btn btn-ghost btn-sm" autofocus onclick="closeDirtyModal()">留在此页</button>
+        <button type="button" class="btn btn-danger-soft btn-sm" onclick="confirmDirtyAction(false)">放弃并切换</button>
+        <button type="button" class="btn btn-primary btn-sm" onclick="confirmDirtyAction(true)">保存并切换</button>
       </div>
     </div>
-  </div>
+  </dialog>
 
   <!-- Toast Host -->
   <div class="toast-host" id="toastHost"></div>
